@@ -122,6 +122,14 @@ pub struct Config {
     pub sync_auto: bool,
     pub sync_hours: u32,
     pub last_sync: i64,
+    /// 닫을 때 마지막 동기화 이후 바뀐 것이 있으면 한 번 올린다(자동 동기화가 켜져 있을 때)
+    pub sync_on_close: bool,
+    /// 마지막 동기화 시도의 결과(성공/실패 한 줄)와 그 시각
+    pub sync_result: String,
+    pub sync_result_at: i64,
+    pub sync_failed: bool,
+    /// 자동 동기화를 건너뛴 이유(비어 있으면 정상). 다음에 올리거나 불러오면 지워진다.
+    pub sync_skip: String,
     // --- 자동 업데이트(GitHub 릴리스) ---
     pub update_check: bool,
     pub update_auto: bool,
@@ -171,6 +179,11 @@ impl Default for Config {
             sync_auto: false,
             sync_hours: 24,
             last_sync: 0,
+            sync_on_close: true,
+            sync_result: String::new(),
+            sync_result_at: 0,
+            sync_failed: false,
+            sync_skip: String::new(),
             update_check: true,
             update_auto: true,
             update_last: 0,
@@ -1991,6 +2004,7 @@ impl eframe::App for App {
                 let _ = self.db.delete_empty(c);
             }
             self.merge_now();
+            self.sync_on_close();
             self.cfg.save();
             self.update_on_close();
         }

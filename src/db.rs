@@ -718,6 +718,27 @@ COMMIT;"
         self.conn.execute_batch(&format!("VACUUM INTO '{d}'")).map_err(e)
     }
 
+    /// 문서가 마지막으로 바뀌거나 휴지통에 들어간 시각(동기화할 변경이 있는지 판단용).
+    pub fn latest_change(&self) -> i64 {
+        self.conn
+            .query_row("SELECT MAX(COALESCE((SELECT MAX(updated) FROM docs),0), COALESCE((SELECT MAX(trashed_at) FROM docs),0))", [], |r| r.get(0))
+            .unwrap_or(0)
+    }
+
+    /// 이미 저장된 DB 파일(WAL 포함)을 읽기 전용 연결로 열어 스냅숏을 만든다. 화면 스레드 밖에서 쓸 수 있다.
+    pub fn snapshot_file(src: &Path, dest: &Path) -> Res<()> {
+        if dest.exists() {
+            std::fs::remove_file(dest).map_err(e)?;
+        }
+        if let Some(p) = dest.parent() {
+            std::fs::create_dir_all(p).map_err(e)?;
+        }
+        let conn = Connection::open_with_flags(src, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(e)?;
+        conn.execute_batch("PRAGMA busy_timeout=3000;").map_err(e)?;
+        let d = dest.to_string_lossy().replace('\'', "''");
+        conn.execute_batch(&format!("VACUUM INTO '{d}'")).map_err(e)
+    }
+
     /// 하루 한 번 자동 백업. 새로 만들었으면 경로를 돌려준다.
     pub fn daily_backup(&self, keep: usize) -> Res<Option<PathBuf>> {
         let dir = self.path.parent().unwrap_or(Path::new(".")).join("backup");

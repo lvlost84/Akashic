@@ -4,7 +4,7 @@ KnowVault(WPF)를 Rust + eframe/egui 0.37 + rusqlite로 다시 만드는 프로�
 작업을 끝낼 때마다 아래 "기록" 맨 위에 항목을 추가합니다(날짜 · 무엇을 · 왜/어떻게 · 확인한 것 · 남은 것).
 
 - 빌드: `cargo build --release` → `out\Akashic.exe` (실행 중이라 잠기면 `Akashic-new.exe`)
-- 시험: `cargo test --release` (현재 87건 통과, 성능 2건은 ignored)
+- 시험: `cargo test --release` (현재 88건 통과, 성능·실측 3건은 ignored)
 - 격리 실행: `AKASHIC_DATA=<폴더>`, `--seed`. 개발용 환경변수: `AKASHIC_OPEN_HELP/GRAPH/TITLE/OPT`, `AKASHIC_RENDERER`, `AKASHIC_DIAG`
 - 스냅숏(커밋 대신): `snapshots\<날짜>-<번호>-<이름>\` (src, Cargo.toml, build.rs, .cargo, assets)
 - 오픈소스 고지: 빌드할 때 `LICENSE.md`가 자동 생성됨(build.rs)
@@ -13,12 +13,18 @@ KnowVault(WPF)를 Rust + eframe/egui 0.37 + rusqlite로 다시 만드는 프로�
 ## 현재 상태 (2026-11-16)
 - 직접 의존성 9개 + 빌드 의존성 1개(serde_json). Windows 대상 전체 크레이트 197개.
 - 이 PC에서 확인하지 못한 것: 사무실 PC(인텔 내장 그래픽)의 Vulkan 충돌 복구, 밝은 Windows 모드의 시작 시 글자 깨짐.
-- 보류: 동기화 개선([7]) — 동기화 전 로그 병합 1회, 마지막 동기화 결과를 상태바 툴팁에 표시.
 - 정리 필요: 프로젝트 폴더 바로 아래의 `app.rs`(0바이트), `md.rs`는 `src\` 밖에 있는 불필요한 파일로 보임(지우기 전 확인).
 
 ## 기록
 
 ### 2026-11-16
+- **동기화 개선 (v2.0.2)**:
+  1. 불러오기 뒤 `last_sync`를 불러온 저장본의 시각으로 맞춤(전에는 불러온 직후에도 "다른 기기가 올린 새 내용"으로 보여 자동 동기화가 멈추고 수동은 매번 덮어쓰기 확인이 떴음). `restore_from_dir`이 (백업 경로, saved_at)을 돌려줌.
+  2. 결과 저장·표시: 설정에 `sync_result/sync_result_at/sync_failed/sync_skip` 추가. 옵션에 마지막 결과, 상태바에 "동기화 보류"(다른 기기 내용 때문)·"동기화 실패"를 주의색으로 표시하고 툴팁에 마지막 결과를 보임.
+  3. 증분 실측(`measure_chunk_churn`, ignored 시험, 20MB·3000문서 DB, 문서 하나 수정): 2MB 조각은 10개 중 4~6개(약 6~12MB)가 바뀜, 512KB 조각은 38개 중 4~5개(약 2.5MB), 128KB는 149개 중 8~20개. `VACUUM INTO`와 페이지 그대로 복사(backup API)는 차이가 없어 방식은 유지하고 **조각 크기를 512KB로** 낮춤. 기존 동기화 폴더는 첫 올리기 때 한 번 전체가 다시 올라감.
+  4. 닫을 때 동기화: 자동 동기화가 켜져 있고 마지막 동기화 이후 바뀐 문서(`db.latest_change`)가 있으면 닫기 직전에 한 번 올림(옵션 `sync_on_close`, 기본 켜짐). 다른 기기 내용이 더 새로우면 올리지 않고 "보류"로 표시.
+  5. 스냅숏을 화면 스레드가 아니라 올리는 스레드에서 읽기 전용 연결(`Db::snapshot_file`)로 만듦.
+  시험 1건 추가(88건 통과, 성능·실측 3건 ignored). 화면에서 닫을 때 동기화·상태바 표시를 직접 눌러 확인하지는 못함. 보류했던 "동기화 전 로그 병합"은 `VACUUM INTO`가 병합 안 된 변경도 포함해 효과가 없어 하지 않음.
 - **GitHub 연동 + 자동 업데이트**: `update.rs`(조회·해시 확인·교체, 새 크레이트 없이 Windows 기본 curl.exe + 기존 sha2), `app/update_ui.rs`(백그라운드 작업), 옵션 > 정보의 업데이트 영역(시작 때 하루 한 번 확인 / 자동 설치 켜고 끄기 / 지금 확인 / 지금 다시 시작). 릴리스의 `Akashic.exe`와 `SHA256SUMS`를 받아 해시가 맞을 때만 실행 중인 exe를 `.old`로 바꾸고 새 파일을 놓는다(다시 시작하면 적용, 개발 빌드 `target\`는 건드리지 않음). `.github/workflows/release.yml`(태그 `v*` → 시험·빌드·릴리스), `.gitignore`, `README.md` 추가, `git init`만 함(커밋·push 전). 저장소 주소는 빌드 때 환경변수 `AKASHIC_REPO`(사용자/저장소)로 넣는다. 시험 4건 추가(87건). 실제 GitHub 릴리스로 내려받아 교체하는 흐름은 저장소를 만든 뒤에야 확인 가능.
 - **외부 링크·각주 표기 제외**: `[[http://…]]`, `[[C:\…]]`, `[[^1]]`은 그래프·링크 목록·Ctrl+클릭에서 문서 링크로 보지 않음(`md::is_external_target`).
 - **각주 기능**: `[^1]` 참조는 기호를 숨기고 작은 윗첨자 번호(링크색)로, `[^1]: 설명` 줄은 머리 번호만 윗첨자로 보임(커서 줄에서는 기호가 흐리게 나타남). Ctrl+클릭으로 참조 ↔ 정의 줄 이동(코드 블록 안은 제외). `md::footnote_def/footnote_jump`, 시험 3건 추가(83건 통과). 화면에서 직접 확인은 못 함.

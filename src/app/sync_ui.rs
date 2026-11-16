@@ -2,7 +2,7 @@
 use super::*;
 use crate::{db, sync};
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
 
 type JobResult = Result<sync::WriteStats, String>;
@@ -46,52 +46,83 @@ impl App {
         Ok(p)
     }
 
-    /// 스냅숏을 만들고(UI 스레드) 조각 쓰기는 별도 스레드로 넘긴다. `Ok(true)` 시작됨, `Ok(false)` 충돌로 건너뜀.
+    /// 올리기 전 충돌 확인. `Ok(true)` 진행, `Ok(false)` 사용자가 취소, `Err` 자동 동기화 보류(빈 글이면 알리지 않음).
+    fn sync_conflict(&mut self, dir: &Path, dev: &str, auto: bool) -> Result<bool, String> {
+        let Ok(Some(m)) = sync::read_manifest(dir) else { return Ok(true) };
+        if !sync::foreign_newer(&m, dev, self.cfg.last_sync) {
+            return Ok(true);
+        }
+        if auto {
+            let first = ST.with(|s| {
+                let mut s = s.borrow_mut();
+                let first = s.skipped_for != m.saved_at;
+                s.skipped_for = m.saved_at;
+                first
+            });
+            let note = format!("다른 기기({})가 {}에 올린 내용이 있어 자동 동기화를 보류했습니다", m.device, fmt_ts(m.saved_at));
+            if self.cfg.sync_skip != note {
+                self.cfg.sync_skip = note;
+                self.cfg.save();
+            }
+            return Err(if first { format!("다른 기기({})가 올린 내용이 있어 자동 동기화를 건너뜁니다", m.device) } else { String::new() });
+        }
+        let ask = rfd::MessageDialog::new()
+            .set_title("동기화")
+            .set_description(format!(
+                "다른 곳에서 바뀐 것 같습니다 ({}, {}).\n지금 올리면 그 내용을 덮어씁니다. 그래도 올릴까요?",
+                m.device,
+                fmt_ts(m.saved_at)
+            ))
+            .set_buttons(rfd::MessageButtons::YesNo)
+            .show();
+        Ok(ask == rfd::MessageDialogResult::Yes)
+    }
+
+    /// 스냅숏(읽기 전용 연결)을 만들고 조각을 쓴다. 화면 스레드가 아니어도 된다.
+    fn sync_job(src: &Path, dir: &Path, dev: &str, now: i64) -> JobResult {
+        let snap = std::env::temp_dir().join(format!("akashic-sync-{}.db", std::process::id()));
+        let r = db::Db::snapshot_file(src, &snap)
+            .map_err(|x| format!("스냅숏 실패: {x}"))
+            .and_then(|_| sync::push_file(&snap, dir, dev, now, sync::CHUNK));
+        let _ = std::fs::remove_file(&snap);
+        r
+    }
+
+    /// 마지막 동기화 결과를 설정에 남긴다(상태바 툴팁·옵션에서 다시 볼 수 있게).
+    fn sync_record(&mut self, r: &JobResult) {
+        self.cfg.sync_result_at = db::now();
+        match r {
+            Ok(st) => {
+                self.cfg.last_sync = st.saved_at;
+                self.cfg.sync_failed = false;
+                self.cfg.sync_skip.clear();
+                self.cfg.sync_result = format!("올리기 완료 · 조각 {}개 중 {}개 갱신", st.total, st.written);
+            }
+            Err(x) => {
+                self.cfg.sync_failed = true;
+                self.cfg.sync_result = format!("올리기 실패 · {x}");
+            }
+        }
+        self.cfg.save();
+    }
+
+    /// 충돌을 확인하고 쓰기를 별도 스레드로 넘긴다(스냅숏도 그 스레드에서 만든다). `Ok(true)` 시작됨, `Ok(false)` 취소.
     fn sync_start(&mut self, auto: bool) -> Result<bool, String> {
         if self.sync_busy() {
             return Err("이미 동기화 중입니다".into());
         }
         let dir = self.sync_dir_path()?;
         let dev = sync::device_id();
-        if let Ok(Some(m)) = sync::read_manifest(&dir) {
-            if sync::foreign_newer(&m, &dev, self.cfg.last_sync) {
-                if auto {
-                    let first = ST.with(|s| {
-                        let mut s = s.borrow_mut();
-                        let first = s.skipped_for != m.saved_at;
-                        s.skipped_for = m.saved_at;
-                        first
-                    });
-                    return Err(if first {
-                        format!("다른 기기({})가 올린 내용이 있어 자동 동기화를 건너뜁니다", m.device)
-                    } else {
-                        String::new()
-                    });
-                }
-                let ask = rfd::MessageDialog::new()
-                    .set_title("동기화")
-                    .set_description(format!(
-                        "다른 곳에서 바뀐 것 같습니다 ({}, {}).\n지금 올리면 그 내용을 덮어씁니다. 그래도 올릴까요?",
-                        m.device,
-                        fmt_ts(m.saved_at)
-                    ))
-                    .set_buttons(rfd::MessageButtons::YesNo)
-                    .show();
-                if ask != rfd::MessageDialogResult::Yes {
-                    return Ok(false);
-                }
-            }
+        if !self.sync_conflict(&dir, &dev, auto)? {
+            return Ok(false);
         }
         self.flush();
-        let snap = std::env::temp_dir().join(format!("akashic-sync-{}.db", std::process::id()));
-        self.db.snapshot_to(&snap).map_err(|x| format!("스냅숏 실패: {x}"))?;
+        let src = self.db.path.clone();
         let (tx, rx) = channel();
         let ctx = ST.with(|s| s.borrow().ctx.clone());
         let now = db::now();
         std::thread::spawn(move || {
-            let r = sync::push_file(&snap, &dir, &dev, now, sync::CHUNK);
-            let _ = std::fs::remove_file(&snap);
-            let _ = tx.send(r);
+            let _ = tx.send(Self::sync_job(&src, &dir, &dev, now));
             if let Some(c) = ctx {
                 c.request_repaint();
             }
@@ -100,13 +131,35 @@ impl App {
         Ok(true)
     }
 
+    /// 닫을 때: 마지막 동기화 이후 바뀐 것이 있으면 바로 올린다(바뀐 조각만 쓰므로 짧다). 충돌이면 올리지 않는다.
+    pub(super) fn sync_on_close(&mut self) {
+        if !(self.cfg.sync_auto && self.cfg.sync_on_close) || self.sync_busy() || self.db.latest_change() <= self.cfg.last_sync {
+            return;
+        }
+        let Ok(dir) = self.sync_dir_path() else { return };
+        let dev = sync::device_id();
+        if !matches!(self.sync_conflict(&dir, &dev, true), Ok(true)) {
+            return;
+        }
+        let src = self.db.path.clone();
+        let r = Self::sync_job(&src, &dir, &dev, db::now());
+        self.sync_record(&r);
+    }
+
     fn sync_restore(&mut self) -> Result<PathBuf, String> {
         if self.sync_busy() {
             return Err("동기화 중입니다. 잠시 뒤에 다시 시도하세요".into());
         }
         let dir = self.sync_dir_path()?;
         self.flush();
-        let bak = sync::restore_from_dir(&mut self.db, &dir)?;
+        let (bak, at) = sync::restore_from_dir(&mut self.db, &dir)?;
+        // 방금 불러온 저장본을 기준으로 삼아야 다음 올리기를 "다른 기기가 올린 새 내용"으로 오해하지 않는다.
+        self.cfg.last_sync = at;
+        self.cfg.sync_skip.clear();
+        self.cfg.sync_failed = false;
+        self.cfg.sync_result = "불러오기 완료".into();
+        self.cfg.sync_result_at = db::now();
+        self.cfg.save();
         self.list_dirty = true;
         self.graph_stale = true;
         // 현재 문서를 다시 연다(없어졌으면 비움)
@@ -189,6 +242,11 @@ impl App {
         if ui.checkbox(&mut self.cfg.sync_auto, "자동 동기화").changed() {
             self.cfg.save();
         }
+        ui.add_enabled_ui(self.cfg.sync_auto, |ui| {
+            if ui.checkbox(&mut self.cfg.sync_on_close, "닫을 때 바뀐 것이 있으면 한 번 더 올리기").changed() {
+                self.cfg.save();
+            }
+        });
         ui.horizontal(|ui| {
             ui.label("주기");
             let cur = self.cfg.sync_hours;
@@ -206,6 +264,13 @@ impl App {
         // 폴더의 저장본 정보는 백그라운드에서 읽어 둔 값을 쓴다.
         let remote = self.storage.remote.as_ref().map(|(at, dev)| format!(" · 폴더의 저장본: {} ({})", fmt_ts(*at), dev)).unwrap_or_default();
         ui.label(format!("마지막 저장: {}{}", fmt_ts(self.cfg.last_sync), remote));
+        if !self.cfg.sync_result.is_empty() {
+            let c = if self.cfg.sync_failed { self.theme.code_fg } else { self.theme.dim };
+            ui.label(egui::RichText::new(format!("마지막 결과 ({}): {}", fmt_ts(self.cfg.sync_result_at), self.cfg.sync_result)).color(c));
+        }
+        if !self.cfg.sync_skip.is_empty() {
+            ui.label(egui::RichText::new(&self.cfg.sync_skip).color(self.theme.code_fg));
+        }
     }
 
     fn sync_due(&self) -> bool {
@@ -243,6 +308,13 @@ impl App {
             return ("동기화 폴더 없음".into(), format!("접근할 수 없습니다: {}\n클릭: 옵션 > 백업·동기화", self.cfg.sync_dir), true);
         }
         let last = self.cfg.last_sync;
+        let result = if self.cfg.sync_result.is_empty() { String::new() } else { format!("\n마지막 결과 ({}): {}", fmt_ts(self.cfg.sync_result_at), self.cfg.sync_result) };
+        if !self.cfg.sync_skip.is_empty() {
+            return ("동기화 보류".into(), format!("{}\n옵션 > 백업·동기화에서 '이 폴더에서 불러오기'로 먼저 받거나, '지금 동기화'로 덮어쓸지 정하세요{result}", self.cfg.sync_skip), true);
+        }
+        if self.cfg.sync_failed {
+            return ("동기화 실패".into(), format!("{}\n클릭: 옵션 > 백업·동기화", self.cfg.sync_result), true);
+        }
         let hours = self.cfg.sync_hours.max(1) as i64;
         let next_short = if !self.cfg.sync_auto {
             "수동".to_string()
@@ -260,11 +332,12 @@ impl App {
         };
         let short = if last > 0 { format!("동기화 {} · {}", hhmm(last), next_short) } else { format!("동기화 안 함 · {next_short}") };
         let tip = format!(
-            "폴더: {}\n마지막 저장: {}\n자동 동기화: {}{}\n\n클릭: 옵션 > 백업·동기화",
+            "폴더: {}\n마지막 저장: {}\n자동 동기화: {}{}{}\n\n클릭: 옵션 > 백업·동기화",
             self.cfg.sync_dir,
             fmt_ts(last),
             if self.cfg.sync_auto { "켜짐" } else { "꺼짐" },
-            if self.cfg.sync_auto { format!(" ({hours}시간마다)") } else { String::new() }
+            if self.cfg.sync_auto { format!(" ({hours}시간마다)") } else { String::new() },
+            result
         );
         (short, tip, false)
     }
@@ -292,15 +365,13 @@ impl App {
             }
         });
         match res {
-            Some(Ok(st)) => {
-                self.cfg.last_sync = st.saved_at;
-                self.cfg.save();
+            Some(r) => {
+                self.sync_record(&r);
                 self.fs_invalidate(true);
-                self.say(&format!("동기화 완료: 조각 {}개 중 {}개 갱신", st.total, st.written));
-            }
-            Some(Err(x)) => {
-                self.say(&format!("동기화 실패: {x}"));
-                self.fs_invalidate(true);
+                match r {
+                    Ok(st) => self.say(&format!("동기화 완료: 조각 {}개 중 {}개 갱신", st.total, st.written)),
+                    Err(x) => self.say(&format!("동기화 실패: {x}")),
+                }
             }
             None => {}
         }

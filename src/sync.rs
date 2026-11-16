@@ -1,4 +1,4 @@
-//! 동기화 저장소: DB 스냅숏을 2MB 조각으로 나눠 폴더에 두고(manifest + 조각), 다시 불러온다.
+//! 동기화 저장소: DB 스냅숏을 512KB 조각으로 나눠 폴더에 두고(manifest + 조각), 다시 불러온다.
 //! UI와 무관한 순수 로직.
 use crate::db::{Db, SCHEMA_VERSION};
 use rusqlite::{Connection, OpenFlags};
@@ -9,7 +9,8 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-pub const CHUNK: usize = 2 * 1024 * 1024;
+/// 조각 크기. 실측(20MB DB, 문서 하나 수정): 2MB 조각은 약 6~12MB, 512KB 조각은 약 2.5MB만 다시 올라간다.
+pub const CHUNK: usize = 512 * 1024;
 pub const MANIFEST: &str = "sync-vault.manifest.json";
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -231,7 +232,9 @@ pub fn check_db_file(path: &Path) -> Result<(), String> {
 }
 
 /// 폴더의 스냅숏을 검증해 현재 DB 에 반영. 반영 전 현재 DB 를 backup\before-restore-*.db 로 보관하고 그 경로를 돌려준다.
-pub fn restore_from_dir(db: &mut Db, dir: &Path) -> Result<PathBuf, String> {
+/// 두 번째 값은 불러온 저장본의 시각(saved_at): 호출한 쪽이 이 값을 마지막 동기화 시각으로 기록해야
+/// 방금 불러온 내용을 "다른 기기가 올린 새 내용"으로 다시 오해하지 않는다.
+pub fn restore_from_dir(db: &mut Db, dir: &Path) -> Result<(PathBuf, i64), String> {
     let m = read_manifest(dir)?.ok_or_else(|| "그 폴더에 동기화 데이터(manifest)가 없습니다".to_string())?;
     let base = db.path.parent().unwrap_or(Path::new(".")).to_path_buf();
     fs::create_dir_all(&base).map_err(|x| x.to_string())?;
@@ -245,7 +248,7 @@ pub fn restore_from_dir(db: &mut Db, dir: &Path) -> Result<PathBuf, String> {
         db.conn
             .restore(rusqlite::MAIN_DB, &tmp, None::<fn(rusqlite::backup::Progress)>)
             .map_err(|x| format!("불러오기 실패: {x}"))?;
-        Ok(bak)
+        Ok((bak, m.saved_at))
     })();
     let _ = fs::remove_file(&tmp);
     res
@@ -259,6 +262,9 @@ pub fn foreign_newer(m: &Manifest, my_device: &str, last_sync: i64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 시험 전용 조각 크기(실제 값과 무관하게 같은 시험이 되도록 고정)
+    const TC: usize = 2 * 1024 * 1024;
 
     fn tmpdir(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("akashic-sync-test-{}-{tag}", std::process::id()));
@@ -284,7 +290,7 @@ mod tests {
         let data = pseudo(5 * 1024 * 1024 + 123, 1);
         fs::write(&src, &data).unwrap();
         let dir = t.join("sync");
-        let st = push_file(&src, &dir, "PC-A", 100, CHUNK).unwrap();
+        let st = push_file(&src, &dir, "PC-A", 100, TC).unwrap();
         assert_eq!(st.total, 3);
         assert_eq!(st.written, 3);
         let m = read_manifest(&dir).unwrap().unwrap();
@@ -303,12 +309,12 @@ mod tests {
         let mut data = pseudo(5 * 1024 * 1024, 2);
         fs::write(&src, &data).unwrap();
         let dir = t.join("sync");
-        push_file(&src, &dir, "A", 1, CHUNK).unwrap();
-        let st = push_file(&src, &dir, "A", 2, CHUNK).unwrap();
+        push_file(&src, &dir, "A", 1, TC).unwrap();
+        let st = push_file(&src, &dir, "A", 2, TC).unwrap();
         assert_eq!((st.written, st.skipped), (0, 3));
-        data[CHUNK + 5] ^= 0xFF; // 두 번째 조각만 변경
+        data[TC + 5] ^= 0xFF; // 두 번째 조각만 변경
         fs::write(&src, &data).unwrap();
-        let st = push_file(&src, &dir, "A", 3, CHUNK).unwrap();
+        let st = push_file(&src, &dir, "A", 3, TC).unwrap();
         assert_eq!((st.written, st.skipped), (1, 2));
         let m = read_manifest(&dir).unwrap().unwrap();
         let out = t.join("o");
@@ -323,7 +329,7 @@ mod tests {
         let src = t.join("snap.bin");
         fs::write(&src, pseudo(5 * 1024 * 1024, 3)).unwrap();
         let dir = t.join("sync");
-        push_file(&src, &dir, "A", 1, CHUNK).unwrap();
+        push_file(&src, &dir, "A", 1, TC).unwrap();
         let m = read_manifest(&dir).unwrap().unwrap();
         let out = t.join("o");
         // 손상
@@ -346,7 +352,7 @@ mod tests {
         // 옛 조각 정리 + 다른 파일 보존
         fs::write(dir.join("other.txt"), "keep").unwrap();
         fs::write(&src, pseudo(1000, 4)).unwrap();
-        let st = push_file(&src, &dir, "A", 5, CHUNK).unwrap();
+        let st = push_file(&src, &dir, "A", 5, TC).unwrap();
         assert_eq!(st.total, 1);
         assert!(dir.join(part_name(0)).exists());
         assert!(!dir.join(part_name(1)).exists() && !dir.join(part_name(2)).exists());
@@ -380,8 +386,11 @@ mod tests {
         let mut db2 = Db::open(&t.join("b").join("vault.db")).unwrap();
         let id = db2.new_doc(None).unwrap();
         db2.save_doc(id, "다른 것", "x").unwrap();
-        let bak = restore_from_dir(&mut db2, &dir).unwrap();
+        let (bak, at) = restore_from_dir(&mut db2, &dir).unwrap();
         assert!(bak.exists());
+        // 불러온 직후에는 같은 저장본을 "다른 기기의 새 내용"으로 보지 않는다
+        assert_eq!(at, 1);
+        assert!(!foreign_newer(&read_manifest(&dir).unwrap().unwrap(), "B", at));
         assert_eq!(db2.all_docs().unwrap().len(), 3);
         assert!(db2.find_by_title("문서1").unwrap().is_some());
         assert!(db2.find_by_title("다른 것").unwrap().is_none());
@@ -389,6 +398,67 @@ mod tests {
         // 이전 DB 는 백업에 남아 있다
         let old = Db::open(&bak).unwrap();
         assert!(old.find_by_title("다른 것").unwrap().is_some());
+        let _ = fs::remove_dir_all(&t);
+    }
+
+    /// 실측: 실제 DB에서 문서 한 줄을 고쳤을 때 2MB 조각이 몇 개 바뀌는가(VACUUM INTO vs 페이지 그대로 복사).
+    /// `cargo test --release measure_chunk_churn -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn measure_chunk_churn() {
+        let t = tmpdir("churn");
+        let db = Db::open(&t.join("a").join("vault.db")).unwrap();
+        let mut ids = Vec::new();
+        for i in 0..3000 {
+            let id = db.new_doc(None).unwrap();
+            let body: String = (0..40).map(|k| format!("문서 {i} 줄 {k}: 가나다라마바사 abcdefg 0123456789\n")).collect();
+            db.save_doc(id, &format!("문서 {i}"), &body).unwrap();
+            ids.push(id);
+        }
+        db.checkpoint().unwrap();
+        let src = t.join("a").join("vault.db");
+        let copy_pages = |dst: &Path| {
+            let _ = fs::remove_file(dst);
+            let c = Connection::open_with_flags(&src, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+            let mut d = Connection::open(dst).unwrap();
+            let b = rusqlite::backup::Backup::new(&c, &mut d).unwrap();
+            b.run_to_completion(1000, std::time::Duration::from_millis(0), None).unwrap();
+        };
+        for (label, kind, chunk) in [("VACUUM INTO 2MB", 0usize, TC), ("VACUUM INTO 512KB", 0, 512 * 1024), ("VACUUM INTO 128KB", 0, 128 * 1024), ("페이지 복사 128KB", 1, 128 * 1024)] {
+            let dir = t.join(format!("sync{label}").replace(" ", "_"));
+            let snap = t.join(format!("snap{kind}.db"));
+            let take = |snap: &Path| if kind == 0 { Db::snapshot_file(&src, snap).unwrap() } else { copy_pages(snap) };
+            take(&snap);
+            let first = push_file(&snap, &dir, "A", 1, chunk).unwrap();
+            // 1) 다른 문서 줄 하나를 같은 길이로 고침
+            let mid = ids[1500];
+            db.save_doc(mid, "문서 1500", &format!("{}", format!("{label}").repeat(300))).unwrap();
+            db.checkpoint().unwrap();
+            take(&snap);
+            let a = push_file(&snap, &dir, "A", 2, chunk).unwrap();
+            // 2) 문서 하나를 새로 만듦
+            let id = db.new_doc(None).unwrap();
+            db.save_doc(id, "새 문서", "새로 쓴 내용").unwrap();
+            db.checkpoint().unwrap();
+            take(&snap);
+            let b = push_file(&snap, &dir, "A", 3, chunk).unwrap();
+            println!("[{label}] 총 {}조각 · 문서 고침: {}개 갱신 · 새 문서: {}개 갱신 (첫 올리기 {}개)", first.total, a.written, b.written, first.written);
+        }
+        let _ = fs::remove_dir_all(&t);
+    }
+
+    #[test]
+    fn snapshot_file_sees_unmerged_log_and_change_time() {
+        let t = tmpdir("snapfile");
+        let p = t.join("a").join("vault.db");
+        let db = Db::open(&p).unwrap();
+        let id = db.new_doc(None).unwrap();
+        db.save_doc(id, "병합 전 문서", "본문").unwrap(); // 체크포인트 없음(WAL에만 있음)
+        assert!(db.latest_change() > 0);
+        let snap = t.join("snap.db");
+        Db::snapshot_file(&p, &snap).unwrap(); // 다른 연결(읽기 전용)로 만든다
+        let copy = Db::open(&snap).unwrap();
+        assert!(copy.find_by_title("병합 전 문서").unwrap().is_some());
         let _ = fs::remove_dir_all(&t);
     }
 
@@ -400,7 +470,7 @@ mod tests {
         let snap = t.join("snap.db");
         db1.snapshot_to(&snap).unwrap();
         let dir = t.join("sync");
-        push_file(&snap, &dir, "A", 1, CHUNK).unwrap();
+        push_file(&snap, &dir, "A", 1, TC).unwrap();
         let mut db2 = Db::open(&t.join("b").join("vault.db")).unwrap();
         let e = restore_from_dir(&mut db2, &dir).unwrap_err();
         assert!(e.contains("새로운 버전"), "{e}");
