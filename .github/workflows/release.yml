@@ -5,6 +5,8 @@ name: release
 on:
   push:
     branches: [main]
+    # 문서(.md)만 바뀐 푸시는 빌드하지 않는다. 태그 푸시에는 경로 조건이 적용되지 않아 릴리스는 항상 돈다.
+    paths-ignore: ["**.md"]
     tags: ["v*"]
 permissions:
   contents: write
