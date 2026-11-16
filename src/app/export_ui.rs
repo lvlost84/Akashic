@@ -57,6 +57,7 @@ impl App {
 
     /// 매 프레임 호출: 끝난 내보내기 결과를 상태바에 알린다.
     pub(super) fn poll_export(&mut self) {
+        let mut crashed = false;
         let res = {
             let Ok(mut g) = RUNNING.lock() else { return };
             let Some(rx) = g.as_ref() else { return };
@@ -68,13 +69,20 @@ impl App {
                 Err(TryRecvError::Empty) => None,
                 Err(TryRecvError::Disconnected) => {
                     *g = None;
+                    crashed = true; // 작업 스레드가 도중에 죽었다
                     None
                 }
             }
         };
+        if crashed {
+            self.say("내보내기 실패: 내부 오류로 작업이 중단되었습니다");
+        }
         if let Some(r) = res {
-            if let Ok(mut l) = LAST_DIR.lock() {
-                *l = Some(r.dir.clone());
+            // 하나도 쓰지 못했다면(폴더 생성 실패 등) "마지막 내보내기 폴더"로 기억하지 않는다.
+            if r.ok > 0 {
+                if let Ok(mut l) = LAST_DIR.lock() {
+                    *l = Some(r.dir.clone());
+                }
             }
             let msg = if r.failed == 0 {
                 format!("내보내기 완료: {}개 → {}", r.ok, r.dir.display())

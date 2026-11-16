@@ -14,7 +14,18 @@ struct St {
     /// 충돌로 자동 동기화를 건너뛴 manifest 의 saved_at (같은 알림 반복 방지)
     skipped_for: i64,
     ctx: Option<egui::Context>,
+    /// 지금 진행 중인 올리기를 시작할 때의 변경 카운터(성공하면 cfg.sync_rev로 기록)
+    pending_rev: i64,
+    /// 올리기를 시작한 시각(너무 오래 끝나지 않으면 멈춘 것으로 보고 포기)
+    started: Option<Instant>,
+    /// 자동 동기화가 실패했을 때 이 시각까지는 다시 시도하지 않는다
+    retry_after: Option<Instant>,
 }
+
+/// 올리기가 이 시간 안에 끝나지 않으면(네트워크 폴더가 멈춘 경우 등) 멈춘 것으로 본다.
+const STUCK: Duration = Duration::from_secs(15 * 60);
+/// 자동 동기화 실패 뒤 재시도 간격
+const RETRY: Duration = Duration::from_secs(10 * 60);
 
 thread_local! {
     static ST: RefCell<St> = RefCell::new(St::default());
@@ -48,7 +59,12 @@ impl App {
 
     /// 올리기 전 충돌 확인. `Ok(true)` 진행, `Ok(false)` 사용자가 취소, `Err` 자동 동기화 보류(빈 글이면 알리지 않음).
     fn sync_conflict(&mut self, dir: &Path, dev: &str, auto: bool) -> Result<bool, String> {
-        let Ok(Some(m)) = sync::read_manifest(dir) else { return Ok(true) };
+        let m = match sync::read_manifest(dir) {
+            Ok(None) => return Ok(true), // 폴더에 저장본이 아직 없음
+            Ok(Some(m)) => m,
+            // 읽지 못한 것을 "충돌 없음"으로 보면 다른 기기의 내용을 덮어쓸 수 있으므로 올리지 않는다.
+            Err(x) => return Err(format!("동기화 폴더의 저장본을 읽을 수 없어 올리지 않았습니다: {x}")),
+        };
         if !sync::foreign_newer(&m, dev, self.cfg.last_sync) {
             return Ok(true);
         }
@@ -89,11 +105,12 @@ impl App {
     }
 
     /// 마지막 동기화 결과를 설정에 남긴다(상태바 툴팁·옵션에서 다시 볼 수 있게).
-    fn sync_record(&mut self, r: &JobResult) {
+    fn sync_record(&mut self, r: &JobResult, rev: i64) {
         self.cfg.sync_result_at = db::now();
         match r {
             Ok(st) => {
                 self.cfg.last_sync = st.saved_at;
+                self.cfg.sync_rev = rev;
                 self.cfg.sync_failed = false;
                 self.cfg.sync_skip.clear();
                 self.cfg.sync_result = format!("올리기 완료 · 조각 {}개 중 {}개 갱신", st.total, st.written);
@@ -117,6 +134,7 @@ impl App {
             return Ok(false);
         }
         self.flush();
+        let rev = self.db.rev();
         let src = self.db.path.clone();
         let (tx, rx) = channel();
         let ctx = ST.with(|s| s.borrow().ctx.clone());
@@ -127,13 +145,18 @@ impl App {
                 c.request_repaint();
             }
         });
-        ST.with(|s| s.borrow_mut().rx = Some(rx));
+        ST.with(|s| {
+            let mut s = s.borrow_mut();
+            s.rx = Some(rx);
+            s.pending_rev = rev;
+            s.started = Some(Instant::now());
+        });
         Ok(true)
     }
 
     /// 닫을 때: 마지막 동기화 이후 바뀐 것이 있으면 바로 올린다(바뀐 조각만 쓰므로 짧다). 충돌이면 올리지 않는다.
     pub(super) fn sync_on_close(&mut self) {
-        if !(self.cfg.sync_auto && self.cfg.sync_on_close) || self.sync_busy() || self.db.latest_change() <= self.cfg.last_sync {
+        if !(self.cfg.sync_auto && self.cfg.sync_on_close) || self.sync_busy() || self.db.rev() == self.cfg.sync_rev {
             return;
         }
         let Ok(dir) = self.sync_dir_path() else { return };
@@ -142,8 +165,9 @@ impl App {
             return;
         }
         let src = self.db.path.clone();
+        let rev = self.db.rev();
         let r = Self::sync_job(&src, &dir, &dev, db::now());
-        self.sync_record(&r);
+        self.sync_record(&r, rev);
     }
 
     fn sync_restore(&mut self) -> Result<PathBuf, String> {
@@ -155,6 +179,7 @@ impl App {
         let (bak, at) = sync::restore_from_dir(&mut self.db, &dir)?;
         // 방금 불러온 저장본을 기준으로 삼아야 다음 올리기를 "다른 기기가 올린 새 내용"으로 오해하지 않는다.
         self.cfg.last_sync = at;
+        self.cfg.sync_rev = self.db.rev(); // 불러온 내용은 이미 폴더에 있는 것이므로 "바뀐 것 없음"으로 시작한다
         self.cfg.sync_skip.clear();
         self.cfg.sync_failed = false;
         self.cfg.sync_result = "불러오기 완료".into();
@@ -162,6 +187,7 @@ impl App {
         self.cfg.save();
         self.list_dirty = true;
         self.graph_stale = true;
+        self.fs_invalidate(true); // 상태바의 DB 크기·저장본 정보를 다시 읽는다
         // 현재 문서를 다시 연다(없어졌으면 비움)
         if let Some(id) = self.cur {
             self.last_edit = None;
@@ -169,6 +195,7 @@ impl App {
                 self.open_doc(id, false);
             } else {
                 self.cur = None;
+                self.cur_trashed = false;
                 self.title.clear();
                 self.body.clear();
             }
@@ -200,6 +227,12 @@ impl App {
             if crate::icons::btn(ui, crate::icons::Icon::Folder, "폴더 선택…").clicked() {
                 if let Some(d) = rfd::FileDialog::new().pick_folder() {
                     self.cfg.sync_dir = d.to_string_lossy().into_owned();
+                    // 이전 폴더 기준의 시각·결과로 새 폴더를 판단하면 충돌을 놓친다 → 처음부터 다시 시작
+                    self.cfg.last_sync = 0;
+                    self.cfg.sync_rev = 0;
+                    self.cfg.sync_skip.clear();
+                    self.cfg.sync_result.clear();
+                    self.cfg.sync_failed = false;
                     self.cfg.save();
                     self.fs_invalidate(true);
                     notes.push(format!("동기화 폴더: {}", self.cfg.sync_dir));
@@ -283,10 +316,22 @@ impl App {
         if !self.sync_due() || self.sync_busy() {
             return;
         }
+        if ST.with(|s| s.borrow().retry_after.map_or(false, |t| Instant::now() < t)) {
+            return; // 방금 실패했으므로 한동안 쉰다(1분마다 같은 오류·설정 저장이 반복되지 않도록)
+        }
         match self.sync_start(true) {
             Ok(_) => self.say("자동 동기화를 시작했습니다"),
-            Err(x) if x.is_empty() => {}
-            Err(x) => self.say(&x),
+            Err(x) => {
+                ST.with(|s| s.borrow_mut().retry_after = Some(Instant::now() + RETRY));
+                if !x.is_empty() {
+                    // 충돌로 보류한 경우는 sync_skip이 따로 표시하므로 "실패"로 칠하지 않는다.
+                    self.cfg.sync_failed = self.cfg.sync_skip.is_empty();
+                    self.cfg.sync_result = format!("자동 동기화 못 함 · {x}");
+                    self.cfg.sync_result_at = db::now();
+                    self.cfg.save();
+                    self.say(&x);
+                }
+            }
         }
     }
 
@@ -343,8 +388,13 @@ impl App {
     }
 
     /// 프로그램 시작 직후 한 번 호출된다.
-    pub(super) fn sync_on_start(&mut self) {
-        ST.with(|s| s.borrow_mut().last_check = Some(Instant::now()));
+    pub(super) fn sync_on_start(&mut self, ctx: &egui::Context) {
+        // 옵션 창을 한 번도 열지 않아도 백그라운드 결과가 바로 화면에 반영되도록 처음부터 보관한다.
+        ST.with(|s| {
+            let mut s = s.borrow_mut();
+            s.ctx = Some(ctx.clone());
+            s.last_check = Some(Instant::now());
+        });
         self.sync_auto_try();
     }
 
@@ -364,9 +414,21 @@ impl App {
                 _ => None,
             }
         });
+        // 너무 오래 끝나지 않는 올리기(멈춘 네트워크 폴더 등)는 포기해서 이후 동기화가 막히지 않게 한다.
+        let stuck = ST.with(|s| {
+            let mut s = s.borrow_mut();
+            let stuck = s.rx.is_some() && s.started.map_or(false, |t| t.elapsed() > STUCK);
+            if stuck {
+                s.rx = None;
+                s.retry_after = Some(Instant::now() + RETRY);
+            }
+            stuck
+        });
+        let res = if stuck { Some(Err("올리기가 15분 넘게 끝나지 않아 중단했습니다(폴더 접근을 확인하세요)".to_string())) } else { res };
+        let rev = ST.with(|s| s.borrow().pending_rev);
         match res {
             Some(r) => {
-                self.sync_record(&r);
+                self.sync_record(&r, rev);
                 self.fs_invalidate(true);
                 match r {
                     Ok(st) => self.say(&format!("동기화 완료: 조각 {}개 중 {}개 갱신", st.total, st.written)),

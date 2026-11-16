@@ -122,6 +122,10 @@ pub struct Config {
     pub sync_auto: bool,
     pub sync_hours: u32,
     pub last_sync: i64,
+    /// 마지막으로 열었던 문서 id(다시 시작할 때 그 문서를 연다)
+    pub last_doc: i64,
+    /// 마지막으로 동기화 폴더에 올렸을 때의 DB 변경 카운터(지금 값과 같으면 올릴 것이 없다)
+    pub sync_rev: i64,
     /// 닫을 때 마지막 동기화 이후 바뀐 것이 있으면 한 번 올린다(자동 동기화가 켜져 있을 때)
     pub sync_on_close: bool,
     /// 마지막 동기화 시도의 결과(성공/실패 한 줄)와 그 시각
@@ -179,6 +183,8 @@ impl Default for Config {
             sync_auto: false,
             sync_hours: 24,
             last_sync: 0,
+            last_doc: 0,
+            sync_rev: 0,
             sync_on_close: true,
             sync_result: String::new(),
             sync_result_at: 0,
@@ -206,16 +212,26 @@ pub fn app_dir() -> PathBuf {
 pub fn default_db_path() -> PathBuf {
     app_dir().join("vault.db")
 }
+/// 설정 파일을 읽지 못해 기본값으로 시작했는지(시작 알림용)
+pub static CONFIG_RESET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 fn config_path() -> PathBuf {
     app_dir().join("config.json")
 }
 impl Config {
     pub fn load() -> Config {
+        let path = config_path();
+        let Ok(raw) = std::fs::read_to_string(&path) else { return Config::default() };
         // 메모장 등으로 저장한 BOM 있는 파일도 읽는다.
-        std::fs::read_to_string(config_path())
-            .ok()
-            .and_then(|s| serde_json::from_str(s.trim_start_matches('\u{feff}')).ok())
-            .unwrap_or_default()
+        match serde_json::from_str(raw.trim_start_matches('\u{feff}')) {
+            Ok(c) => c,
+            Err(_) => {
+                // 손상되었거나 알 수 없는 형식: 기본값으로 시작하되, 이후 저장이 원본을 덮어쓰기 전에 사본을 남긴다
+                // (옮겨 둔 DB 위치·동기화 폴더 같은 설정을 사용자가 되살릴 수 있도록).
+                let _ = std::fs::copy(&path, path.with_extension("bad.json"));
+                CONFIG_RESET.store(true, std::sync::atomic::Ordering::Relaxed);
+                Config::default()
+            }
+        }
     }
     pub fn save(&self) {
         let _ = std::fs::create_dir_all(app_dir());
@@ -446,7 +462,7 @@ impl App {
         }
         a.db.set_cache_mb(a.cfg.cache_mb);
         a.refresh();
-        a.sync_on_start();
+        a.sync_on_start(&cc.egui_ctx);
         a.update_on_start(&cc.egui_ctx);
         // 개발용: 도움말 창을 시작 때 열고(AKASHIC_OPEN_HELP=항목번호) 해당 항목을 고른다.
         if let Some(v) = std::env::var_os("AKASHIC_OPEN_HELP") {
@@ -463,7 +479,13 @@ impl App {
         }
         let want = std::env::var("AKASHIC_OPEN_TITLE").ok(); // 개발용: 제목에 이 글자가 있는 문서를 연다
         let pick = want.and_then(|w| a.rows.iter().find(|r| r.title.contains(&w)).map(|r| r.id));
-        if let Some(first) = pick.or_else(|| a.rows.first().map(|r| r.id)) {
+        // 마지막으로 열었던 문서(있고 휴지통이 아니면) → 없으면 목록의 첫 문서
+        let last = (a.cfg.last_doc > 0)
+            .then(|| a.db.get_doc(a.cfg.last_doc).ok().flatten())
+            .flatten()
+            .filter(|d| !d.trashed)
+            .map(|d| d.id);
+        if let Some(first) = pick.or(last).or_else(|| a.rows.first().map(|r| r.id)) {
             a.open_doc(first, false);
         }
         a
@@ -515,10 +537,13 @@ impl App {
     }
 
     // ------------------------------------------------------------ 문서
-    fn flush(&mut self) {
+    /// 편집 중인 문서를 저장한다. 저장하지 못했으면 `false`: 편집 내용과 "수정됨" 표시를 지우지 않으므로
+    /// 호출한 쪽은 다른 문서를 여는 등 내용을 덮어쓰는 동작을 멈춰야 한다.
+    fn flush(&mut self) -> bool {
         if let Some(id) = self.cur {
             if self.cur_trashed {
-                return;
+                self.last_edit = None;
+                return true;
             }
             match self.db.save_doc(id, &self.title, &self.body) {
                 Ok(true) => {
@@ -526,10 +551,14 @@ impl App {
                     self.last_saved_ts = now();
                 }
                 Ok(false) => {}
-                Err(x) => self.say(&format!("저장 실패: {x}")),
+                Err(x) => {
+                    self.say(&format!("저장 실패: {x} (편집 내용은 그대로 두었습니다)"));
+                    return false;
+                }
             }
         }
         self.last_edit = None;
+        true
     }
 
     /// 쓰기 로그(WAL)를 본 파일에 병합할 때가 되었는지 확인한다(병합 주기 경과 또는 로그가 64MB 초과).
@@ -553,7 +582,9 @@ impl App {
     }
 
     fn open_doc(&mut self, id: i64, record: bool) {
-        self.flush();
+        if !self.flush() {
+            return; // 저장하지 못한 채 다른 문서로 가면 편집 내용이 사라진다
+        }
         if let Some(old) = self.cur {
             if old != id {
                 let _ = self.db.delete_empty(old); // 쓰다 만 빈 문서 정리
@@ -571,6 +602,7 @@ impl App {
                     self.fwd.clear();
                 }
                 self.cur = Some(d.id);
+                self.cfg.last_doc = d.id; // 다음에 시작할 때 이 문서를 다시 연다(설정은 닫을 때 저장)
                 self.title = d.title;
                 self.body = d.body;
                 self.cur_trashed = d.trashed;
@@ -666,7 +698,7 @@ impl App {
     fn import_paths(&mut self, paths: Vec<PathBuf>) {
         self.flush();
         let cat = match self.filter.view { View::Category(c) => Some(c), _ => None };
-        let (mut ok, mut cp) = (0, 0);
+        let (mut ok, mut cp, mut failed) = (0, 0, 0);
         let mut last = None;
         for p in paths {
             let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
@@ -677,10 +709,19 @@ impl App {
                 let (text, was_cp949) = decode_text(&b);
                 let title = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
                 if let Ok(id) = self.db.new_doc(cat) {
-                    let _ = self.db.save_doc(id, &title, &text);
-                    ok += 1;
-                    cp += was_cp949 as usize;
-                    last = Some(id);
+                    match self.db.save_doc(id, &title, &text) {
+                        Ok(_) => {
+                            ok += 1;
+                            cp += was_cp949 as usize;
+                            last = Some(id);
+                        }
+                        Err(_) => {
+                            failed += 1;
+                            let _ = self.db.delete_empty(id); // 내용 없이 남은 빈 문서를 치운다
+                        }
+                    }
+                } else {
+                    failed += 1;
                 }
             }
         }
@@ -689,7 +730,11 @@ impl App {
         if let Some(id) = last {
             self.open_doc(id, true);
         }
-        self.say(&format!("{ok}개 가져옴{}", if cp > 0 { format!(" (CP949 {cp}개는 UTF-8로 변환)") } else { String::new() }));
+        self.say(&format!(
+            "{ok}개 가져옴{}{}",
+            if cp > 0 { format!(" (CP949 {cp}개는 UTF-8로 변환)") } else { String::new() },
+            if failed > 0 { format!(" · {failed}개는 저장하지 못했습니다") } else { String::new() }
+        ));
     }
 
     // ------------------------------------------------------------ 동작 처리
@@ -729,7 +774,10 @@ impl App {
                 }
                 Act::Pin(id) => {
                     let v = self.db.get_doc(id).ok().flatten().map_or(false, |d| !d.pinned);
-                    let _ = self.db.set_pinned(id, v);
+                    if let Err(x) = self.db.set_pinned(id, v) {
+                        self.say(&format!("고정하지 못했습니다: {x}"));
+                        continue;
+                    }
                     if self.cur == Some(id) {
                         self.cur_pinned = v;
                     }
@@ -739,7 +787,10 @@ impl App {
                     if self.cur == Some(id) {
                         self.flush();
                     }
-                    let _ = self.db.trash(id);
+                    if let Err(x) = self.db.trash(id) {
+                        self.say(&format!("휴지통으로 옮기지 못했습니다: {x}"));
+                        continue;
+                    }
                     if self.cur == Some(id) {
                         self.cur_trashed = true;
                     }
@@ -747,43 +798,77 @@ impl App {
                     self.say("휴지통으로 옮겼습니다");self.graph_stale = true;
                 }
                 Act::Restore(id) => {
-                    let _ = self.db.restore(id);self.graph_stale = true;
+                    if let Err(x) = self.db.restore(id) {
+                        self.say(&format!("복원하지 못했습니다: {x}"));
+                        continue;
+                    }
+                    self.graph_stale = true;
                     if self.cur == Some(id) {
                         self.cur_trashed = false;
                     }
                     self.list_dirty = true;
                 }
                 Act::Purge(id) => {
-                    let _ = self.db.purge(id);
+                    if let Err(x) = self.db.purge(id) {
+                        self.say(&format!("영구 삭제하지 못했습니다: {x}"));
+                        continue;
+                    }
                     if self.cur == Some(id) {
                         self.cur = None;
                         self.title.clear();
                         self.body.clear();
+                        self.cur_trashed = false;
+                        self.last_edit = None;
                     }
                     self.list_dirty = true;
                     self.say("영구 삭제했습니다");self.graph_stale = true;
                 }
                 Act::EmptyTrash => {
                     let ids: Vec<i64> = self.db.list_docs(&Filter { view: View::Trash, tags: vec![], query: String::new(), sort: Sort::Updated }).unwrap_or_default().iter().map(|r| r.id).collect();
-                    for id in &ids {
-                        let _ = self.db.purge(*id);
+                    // 화면에는 검색·태그 필터로 일부만 보일 수 있으므로, 실제로 지울 전체 개수를 보여 주고 확인받는다.
+                    let yes = rfd::MessageDialog::new()
+                        .set_title("휴지통 비우기")
+                        .set_description(format!("휴지통의 문서 {}개를 모두 영구 삭제합니다(검색·태그 필터와 상관없이 전체).\n되돌릴 수 없습니다. 계속할까요?", ids.len()))
+                        .set_buttons(rfd::MessageButtons::YesNo)
+                        .show()
+                        == rfd::MessageDialogResult::Yes;
+                    if yes {
+                        let mut failed = 0;
+                        for id in &ids {
+                            if self.db.purge(*id).is_err() {
+                                failed += 1;
+                            }
+                        }
+                        if self.cur.map_or(false, |c| ids.contains(&c)) {
+                            self.cur = None;
+                            self.title.clear();
+                            self.body.clear();
+                            self.cur_trashed = false;
+                            self.last_edit = None;
+                        }
+                        self.list_dirty = true;
+                        if failed == 0 {
+                            self.say(&format!("휴지통을 비웠습니다 ({}개)", ids.len()));
+                        } else {
+                            self.say(&format!("휴지통을 비웠습니다 ({}개 중 {failed}개는 삭제하지 못했습니다)", ids.len()));
+                        }
+                        self.graph_stale = true;
                     }
-                    if self.cur.map_or(false, |c| ids.contains(&c)) {
-                        self.cur = None;
-                    }
-                    self.list_dirty = true;
-                    self.say(&format!("휴지통을 비웠습니다 ({}개)", ids.len()));self.graph_stale = true;
                 }
                 Act::MoveDoc(id, cat) => {
                     if self.cur == Some(id) {
                         self.flush();
                         self.cur_cat = cat;
                     }
-                    let _ = self.db.set_doc_category(id, cat);
+                    if let Err(x) = self.db.set_doc_category(id, cat) {
+                        self.say(&format!("분류를 옮기지 못했습니다: {x}"));
+                    }
                     self.list_dirty = true;
                 }
                 Act::TagDoc(id, t) => {
-                    let _ = self.db.add_tag(id, &t);
+                    if let Err(x) = self.db.add_tag(id, &t) {
+                        self.say(&format!("태그를 달지 못했습니다: {x}"));
+                    }
                     if self.cur == Some(id) {
                         self.doc_tags = self.db.doc_tags(id).unwrap_or_default();
                     }
@@ -864,7 +949,11 @@ impl App {
                     self.flush();
                     let id = match self.db.find_by_title(&title) {
                         Ok(Some(id)) => id,
-                        _ => {
+                        Err(x) => {
+                            self.say(&format!("문서를 찾지 못했습니다: {x}"));
+                            continue;
+                        }
+                        Ok(None) => {
                             let cat = self.cur_cat;
                             match self.db.new_doc(cat) {
                                 Ok(id) => {
@@ -883,6 +972,9 @@ impl App {
                     if let Some(id) = self.cur {
                         let raw = std::mem::take(&mut self.new_tag);
                         for part in raw.split(|c: char| c == ',' || c.is_whitespace()) {
+                            if part.trim().is_empty() {
+                                continue;
+                            }
                             let _ = self.db.add_tag(id, part);
                         }
                         self.doc_tags = self.db.doc_tags(id).unwrap_or_default();
@@ -1320,11 +1412,11 @@ impl App {
         ui.horizontal_wrapped(|ui| {
             ui.label(egui::RichText::new(self.cat_path(self.cur_cat)).size(crate::theme::ui(0.0)).color(t.dim));
             for tag in self.doc_tags.clone() {
-                if ui.button(format!("{tag}  ×")).on_hover_text("태그 지우기").clicked() {
+                if ui.add_enabled(!self.cur_trashed, egui::Button::new(format!("{tag}  ×"))).on_hover_text("태그 지우기").clicked() {
                     acts.push(Act::RemoveTag(tag));
                 }
             }
-            let r = ui.add(egui::TextEdit::singleline(&mut self.new_tag).hint_text("태그 추가").desired_width(90.0));
+            let r = ui.add_enabled(!self.cur_trashed, egui::TextEdit::singleline(&mut self.new_tag).hint_text("태그 추가").desired_width(90.0));
             if r.lost_focus() && ctx.input(|i| i.key_pressed(Key::Enter)) && !self.new_tag.trim().is_empty() {
                 acts.push(Act::AddTag);
                 r.request_focus();
@@ -1869,7 +1961,9 @@ fn prompt_ui(ctx: &egui::Context, p: &mut Prompt) -> Option<bool> {
         }
         ui.horizontal(|ui| {
             let enter_confirm = enter && !composing_before && !p.composing && !p.text.trim().is_empty();
-            if crate::icons::btn(ui, crate::icons::Icon::Check, "확인").clicked() || enter_confirm {
+            let empty = p.text.trim().is_empty();
+            let ok_clicked = ui.add_enabled_ui(!empty, |ui| crate::icons::btn(ui, crate::icons::Icon::Check, "확인").clicked()).inner;
+            if ok_clicked || enter_confirm {
                 done = Some(true);
             }
             if crate::icons::btn(ui, crate::icons::Icon::Cross, "취소").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
@@ -1965,7 +2059,7 @@ impl eframe::App for App {
         }
         if new { acts.push(Act::NewDoc); }
         if find { self.cfg.sidebar = true; self.focus_search = true; }
-        if save { self.flush(); self.say("저장했습니다"); }
+        if save && self.flush() { self.say("저장했습니다"); }
         if opts { self.show_options = true; }
         if side { self.cfg.sidebar = !self.cfg.sidebar; }
         if pin { if let Some(id) = self.cur { acts.push(Act::Pin(id)); } }

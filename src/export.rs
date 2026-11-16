@@ -16,9 +16,10 @@ pub struct ExportResult {
 }
 
 // ---------------------------------------------------------------- 파일 이름
-const RESERVED: [&str; 22] = [
+const RESERVED: [&str; 30] = [
     "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2",
-    "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9", "COM\u{b9}", "COM\u{b2}", "COM\u{b3}", "LPT\u{b9}", "LPT\u{b2}", "LPT\u{b3}",
+    "CONIN$", "CONOUT$",
 ];
 
 fn is_reserved(name: &str) -> bool {
@@ -409,5 +410,18 @@ mod tests {
         let r2 = run_export(&tmp, "20260101-000000", &docs[..1], &cats);
         assert_ne!(r2.dir, r.dir);
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+}
+
+#[cfg(test)]
+mod reserved_extra_tests {
+    use super::*;
+
+    #[test]
+    fn superscript_and_console_names_are_reserved() {
+        for n in ["COM\u{b9}", "lpt\u{b2}.txt", "CONIN$", "conout$"] {
+            assert!(is_reserved(n), "{n}");
+        }
+        assert!(!is_reserved("COM10"));
     }
 }

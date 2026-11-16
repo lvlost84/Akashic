@@ -648,7 +648,24 @@ pub fn is_external_target(t: &str) -> bool {
     b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')
 }
 
-/// 본문에서 `[[제목]]` / `[[제목|글]]`의 제목들을 모은다(코드 블록 안, 외부 주소·경로는 제외).
+/// 한 줄에서 백틱(`)으로 감싼 인라인 코드 구간을 공백으로 바꾼다(화면에서 코드로 그리는 부분은 링크가 아니므로).
+fn blank_code_spans(line: &str) -> String {
+    let mut in_code = false;
+    line.chars()
+        .map(|c| {
+            if c == '`' {
+                in_code = !in_code;
+                ' '
+            } else if in_code {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// 본문에서 `[[제목]]` / `[[제목|글]]`의 제목들을 모은다(코드 블록·인라인 코드 안, 외부 주소·경로는 제외).
 pub fn wiki_links(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut in_fence = false;
@@ -660,7 +677,8 @@ pub fn wiki_links(text: &str) -> Vec<String> {
         if in_fence {
             continue;
         }
-        let mut rest = line;
+        let clean = blank_code_spans(line);
+        let mut rest = clean.as_str();
         while let Some(a) = rest.find("[[") {
             let Some(b) = rest[a + 2..].find("]]") else { break };
             let inner = &rest[a + 2..a + 2 + b];
@@ -1239,4 +1257,14 @@ pub fn apply_hang(g: &eframe::egui::Galley, hangs: &[Option<usize>]) -> eframe::
         }
     }
     g
+}
+#[cfg(test)]
+mod code_span_link_tests {
+    use super::*;
+
+    #[test]
+    fn wiki_links_skip_inline_code() {
+        let t = "본문 [[진짜]] 와 `[[코드]]` 그리고 `a` [[또 진짜|글]]\n```\n[[펜스]]\n```";
+        assert_eq!(wiki_links(t), vec!["진짜".to_string(), "또 진짜".to_string()]);
+    }
 }

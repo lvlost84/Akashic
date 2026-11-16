@@ -177,6 +177,15 @@ impl App {
         theme::resolve(&self.cfg.theme, &self.cfg.custom_theme)
     }
 
+    /// 테마를 화면에 바로 적용하되 설정은 저장하지 않는다(색을 끄는 동안 프레임마다 파일을 쓰지 않도록).
+    fn set_theme_live(&mut self, ctx: &egui::Context) {
+        self.theme = self.resolve_theme();
+        theme::apply(ctx, &self.theme);
+        self.last_theme = self.theme.name.to_string();
+        self.galley_cache = None;
+        self.graph_cfg_dirty = true; // 마우스를 놓으면 app.rs가 한 번만 저장한다
+    }
+
     fn set_theme_now(&mut self, ctx: &egui::Context) {
         self.theme = self.resolve_theme();
         theme::apply(ctx, &self.theme);
@@ -297,7 +306,7 @@ impl App {
         ctx.data_mut(|d| d.insert_temp(editor_open_id(), open));
         if cols != before {
             self.cfg.custom_theme = cols;
-            self.set_theme_now(ctx);
+            self.set_theme_live(ctx);
         }
     }
 }

@@ -232,6 +232,23 @@ pub fn check_db_file(path: &Path) -> Result<(), String> {
 }
 
 /// 폴더의 스냅숏을 검증해 현재 DB 에 반영. 반영 전 현재 DB 를 backup\before-restore-*.db 로 보관하고 그 경로를 돌려준다.
+/// 불러오기 전 백업(before-restore-*.db)은 이 개수만 남긴다(복원할 때마다 DB 크기만큼 쌓이는 것을 막는다).
+const RESTORE_BACKUPS_KEEP: usize = 3;
+
+fn prune_restore_backups(dir: &Path, keep: usize) {
+    let Ok(rd) = fs::read_dir(dir) else { return };
+    let mut names: Vec<String> = rd
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("before-restore-") && n.ends_with(".db"))
+        .collect();
+    names.sort(); // 이름에 시각이 들어 있어 사전순 = 시간순
+    let drop = names.len().saturating_sub(keep);
+    for n in names.into_iter().take(drop) {
+        let _ = fs::remove_file(dir.join(n));
+    }
+}
+
 /// 두 번째 값은 불러온 저장본의 시각(saved_at): 호출한 쪽이 이 값을 마지막 동기화 시각으로 기록해야
 /// 방금 불러온 내용을 "다른 기기가 올린 새 내용"으로 다시 오해하지 않는다.
 pub fn restore_from_dir(db: &mut Db, dir: &Path) -> Result<(PathBuf, i64), String> {
@@ -243,11 +260,15 @@ pub fn restore_from_dir(db: &mut Db, dir: &Path) -> Result<(PathBuf, i64), Strin
     let res = (|| {
         check_db_file(&tmp)?;
         let bdir = base.join("backup");
-        let bak = bdir.join(format!("before-restore-{}.db", chrono::Local::now().format("%Y%m%d-%H%M%S")));
+        // 밀리초까지 넣어 같은 초에 두 번 불러와도 먼저 만든 백업을 지우지 않는다.
+        let bak = bdir.join(format!("before-restore-{}.db", chrono::Local::now().format("%Y%m%d-%H%M%S%3f")));
         db.snapshot_to(&bak).map_err(|x| format!("불러오기 전 백업 실패: {x}"))?;
-        db.conn
-            .restore(rusqlite::MAIN_DB, &tmp, None::<fn(rusqlite::backup::Progress)>)
-            .map_err(|x| format!("불러오기 실패: {x}"))?;
+        if let Err(x) = db.conn.restore(rusqlite::MAIN_DB, &tmp, None::<fn(rusqlite::backup::Progress)>) {
+            return Err(format!("불러오기 실패: {x} (불러오기 전 상태는 {} 에 보관되어 있습니다)", bak.display()));
+        }
+        // 구버전(v1) 저장본이면 지금 실행 중인 연결의 구조를 최신으로 올린다(다시 시작하지 않아도 새 문서·정렬이 동작하도록).
+        db.migrate().map_err(|x| format!("불러온 DB를 최신 구조로 바꾸지 못했습니다: {x} (불러오기 전 상태: {})", bak.display()))?;
+        prune_restore_backups(&bdir, RESTORE_BACKUPS_KEEP);
         Ok((bak, m.saved_at))
     })();
     let _ = fs::remove_file(&tmp);
@@ -448,17 +469,78 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_file_sees_unmerged_log_and_change_time() {
+    fn snapshot_file_sees_unmerged_log_and_rev_counter() {
         let t = tmpdir("snapfile");
         let p = t.join("a").join("vault.db");
         let db = Db::open(&p).unwrap();
         let id = db.new_doc(None).unwrap();
         db.save_doc(id, "병합 전 문서", "본문").unwrap(); // 체크포인트 없음(WAL에만 있음)
-        assert!(db.latest_change() > 0);
+        // 변경 카운터: updated를 건드리지 않는 변경(고정·태그·분류·영구 삭제)도 값을 올린다
+        let r0 = db.rev();
+        assert!(r0 > 0);
+        db.set_pinned(id, true).unwrap();
+        let r1 = db.rev();
+        assert!(r1 > r0, "고정");
+        db.add_tag(id, "시험").unwrap();
+        let r2 = db.rev();
+        assert!(r2 > r1, "태그");
+        let c = db.add_category(None, "분류").unwrap();
+        let r3 = db.rev();
+        assert!(r3 > r2, "분류 추가");
+        db.rename_category(c, "분류2").unwrap();
+        assert!(db.rev() > r3, "분류 이름");
+        // 휴지통이 아닌 문서는 purge로 지워지지 않고, 이미 휴지통인 문서의 시각은 다시 찍히지 않는다
+        db.purge(id).unwrap();
+        assert!(db.get_doc(id).unwrap().is_some());
+        db.trash(id).unwrap();
+        let t1 = db.get_doc(id).unwrap().unwrap();
+        assert!(t1.trashed);
+        db.restore(id).unwrap(); // 아래 스냅숏 확인을 위해 되돌린다
         let snap = t.join("snap.db");
         Db::snapshot_file(&p, &snap).unwrap(); // 다른 연결(읽기 전용)로 만든다
         let copy = Db::open(&snap).unwrap();
         assert!(copy.find_by_title("병합 전 문서").unwrap().is_some());
+        let _ = fs::remove_dir_all(&t);
+    }
+
+    #[test]
+    fn delete_category_refuses_name_clash() {
+        let t = tmpdir("catclash");
+        let db = Db::open(&t.join("a").join("vault.db")).unwrap();
+        let p = db.add_category(None, "P").unwrap();
+        let _a = db.add_category(Some(p), "A").unwrap();
+        let x = db.add_category(Some(p), "X").unwrap();
+        let a2 = db.add_category(Some(x), "a").unwrap(); // 대소문자만 다른 같은 이름
+        let before = db.parent_map().unwrap().len();
+        assert!(db.delete_category(x).is_err());
+        assert_eq!(db.parent_map().unwrap().len(), before, "삭제되지 않아야 한다");
+        // 이름을 바꾸면 삭제할 수 있고 하위 분류는 P 아래로 올라간다
+        db.rename_category(a2, "B").unwrap();
+        db.delete_category(x).unwrap();
+        assert_eq!(db.parent_map().unwrap().get(&a2).copied().flatten(), Some(p));
+        let _ = fs::remove_dir_all(&t);
+    }
+
+    #[test]
+    fn restore_v1_snapshot_is_migrated_in_place() {
+        let t = tmpdir("v1restore");
+        // v1(pos 컬럼 없음) 저장본을 만든다
+        let v1 = t.join("v1.db");
+        {
+            let c = Connection::open(&v1).unwrap();
+            c.execute_batch("CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);").unwrap();
+            c.execute_batch(crate::db::SCHEMA_V1).unwrap();
+            c.execute("INSERT INTO docs(title,body,created,updated) VALUES('옛 문서','x',1,1)", []).unwrap();
+        }
+        let dir = t.join("sync");
+        push_file(&v1, &dir, "A", 5, 4096).unwrap();
+        let mut db = Db::open(&t.join("b").join("vault.db")).unwrap();
+        let (_, at) = restore_from_dir(&mut db, &dir).unwrap();
+        assert_eq!(at, 5);
+        // 다시 시작하지 않아도 새 문서 만들기(pos 사용)가 동작해야 한다
+        let id = db.new_doc(None).unwrap();
+        assert!(id > 0);
+        assert!(db.find_by_title("옛 문서").unwrap().is_some());
         let _ = fs::remove_dir_all(&t);
     }
 

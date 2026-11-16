@@ -110,6 +110,20 @@ fn like_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
 }
 
+/// 변경 카운터: 문서·분류·태그가 바뀔 때마다 meta의 rev가 1씩 오른다(동기화할 변경이 있는지 판단용).
+/// 고정·분류 이동·태그·직접 정렬·영구 삭제처럼 `updated`를 건드리지 않는 변경도 잡기 위해 트리거로 올린다.
+const REV_SQL: &str = "INSERT OR IGNORE INTO meta(key,value) VALUES('rev','0');
+CREATE TRIGGER IF NOT EXISTS rev_docs_i AFTER INSERT ON docs BEGIN UPDATE meta SET value=CAST(value AS INTEGER)+1 WHERE key='rev'; END;
+CREATE TRIGGER IF NOT EXISTS rev_docs_u AFTER UPDATE ON docs BEGIN UPDATE meta SET value=CAST(value AS INTEGER)+1 WHERE key='rev'; END;
+CREATE TRIGGER IF NOT EXISTS rev_docs_d AFTER DELETE ON docs BEGIN UPDATE meta SET value=CAST(value AS INTEGER)+1 WHERE key='rev'; END;
+CREATE TRIGGER IF NOT EXISTS rev_cat_i AFTER INSERT ON categories BEGIN UPDATE meta SET value=CAST(value AS INTEGER)+1 WHERE key='rev'; END;
+CREATE TRIGGER IF NOT EXISTS rev_cat_u AFTER UPDATE ON categories BEGIN UPDATE meta SET value=CAST(value AS INTEGER)+1 WHERE key='rev'; END;
+CREATE TRIGGER IF NOT EXISTS rev_cat_d AFTER DELETE ON categories BEGIN UPDATE meta SET value=CAST(value AS INTEGER)+1 WHERE key='rev'; END;
+CREATE TRIGGER IF NOT EXISTS rev_tag_i AFTER INSERT ON tags BEGIN UPDATE meta SET value=CAST(value AS INTEGER)+1 WHERE key='rev'; END;
+CREATE TRIGGER IF NOT EXISTS rev_tag_d AFTER DELETE ON tags BEGIN UPDATE meta SET value=CAST(value AS INTEGER)+1 WHERE key='rev'; END;
+CREATE TRIGGER IF NOT EXISTS rev_dt_i AFTER INSERT ON doc_tags BEGIN UPDATE meta SET value=CAST(value AS INTEGER)+1 WHERE key='rev'; END;
+CREATE TRIGGER IF NOT EXISTS rev_dt_d AFTER DELETE ON doc_tags BEGIN UPDATE meta SET value=CAST(value AS INTEGER)+1 WHERE key='rev'; END;";
+
 /// 스키마 v1(처음 만들 때와 v1 파일 시험에 쓴다).
 pub const SCHEMA_V1: &str = "BEGIN;
 CREATE TABLE categories(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES categories(id) ON DELETE SET NULL, name TEXT NOT NULL);
@@ -172,7 +186,8 @@ impl Db {
         std::fs::metadata(format!("{}-wal", self.path.display())).map(|m| m.len()).unwrap_or(0)
     }
 
-    fn migrate(&self) -> Res<()> {
+    /// 스키마를 최신으로 맞춘다. DB를 통째로 바꿔 넣은 뒤(불러오기)에도 불러야 한다.
+    pub fn migrate(&self) -> Res<()> {
         self.conn
             .execute_batch("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);")
             .map_err(e)?;
@@ -204,7 +219,13 @@ COMMIT;"
                 ))
                 .map_err(e)?;
         }
+        self.conn.execute_batch(REV_SQL).map_err(e)?;
         Ok(())
+    }
+
+    /// 변경 카운터(위 REV_SQL). 값이 달라졌으면 마지막으로 확인한 뒤 무언가 바뀐 것이다.
+    pub fn rev(&self) -> i64 {
+        self.conn.query_row("SELECT CAST(value AS INTEGER) FROM meta WHERE key='rev'", [], |r| r.get(0)).unwrap_or(0)
     }
 
     // ---------- 직접 정렬 ----------
@@ -382,7 +403,7 @@ COMMIT;"
     }
 
     pub fn trash(&self, id: i64) -> Res<()> {
-        self.conn.execute("UPDATE docs SET trashed_at=? WHERE id=?", params![now(), id]).map_err(e)?;
+        self.conn.execute("UPDATE docs SET trashed_at=? WHERE id=? AND trashed_at IS NULL", params![now(), id]).map_err(e)?;
         Ok(())
     }
 
@@ -392,7 +413,7 @@ COMMIT;"
     }
 
     pub fn purge(&self, id: i64) -> Res<()> {
-        self.conn.execute("DELETE FROM docs WHERE id=?", [id]).map_err(e)?;
+        self.conn.execute("DELETE FROM docs WHERE id=? AND trashed_at IS NOT NULL", [id]).map_err(e)?;
         Ok(())
     }
 
@@ -555,7 +576,7 @@ COMMIT;"
         v.collect::<Result<Vec<_>, _>>().map_err(e)
     }
 
-    fn parent_map(&self) -> Res<HashMap<i64, Option<i64>>> {
+    pub(crate) fn parent_map(&self) -> Res<HashMap<i64, Option<i64>>> {
         Ok(self.categories()?.into_iter().map(|c| (c.id, c.parent)).collect())
     }
 
@@ -644,6 +665,19 @@ COMMIT;"
     /// 삭제 시 하위 분류와 문서는 한 단계 위로 올라간다.
     pub fn delete_category(&self, id: i64) -> Res<()> {
         let parent: Option<i64> = self.conn.query_row("SELECT parent_id FROM categories WHERE id=?", [id], |r| r.get(0)).map_err(e)?;
+        // 하위 분류가 한 단계 위로 올라갈 때 그 자리(같은 부모 아래)의 다른 분류와 이름이 겹치면 같은 이름이 둘 생긴다.
+        let clash: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT c.name FROM categories c WHERE c.parent_id=?1 AND EXISTS(SELECT 1 FROM categories s WHERE s.parent_id IS ?2 AND s.id<>?1 AND s.name=c.name COLLATE NOCASE) LIMIT 1",
+                params![id, parent],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(e)?;
+        if let Some(n) = clash {
+            return Err(format!("하위 분류 \"{n}\"이(가) 위 단계의 같은 이름 분류와 겹쳐 삭제할 수 없습니다. 이름을 바꾼 뒤 다시 시도하세요"));
+        }
         self.conn.execute_batch("BEGIN").map_err(e)?;
         let r = (|| -> Res<()> {
             self.conn.execute("UPDATE categories SET parent_id=? WHERE parent_id=?", params![parent, id]).map_err(e)?;
@@ -716,13 +750,6 @@ COMMIT;"
         }
         let d = dest.to_string_lossy().replace('\'', "''");
         self.conn.execute_batch(&format!("VACUUM INTO '{d}'")).map_err(e)
-    }
-
-    /// 문서가 마지막으로 바뀌거나 휴지통에 들어간 시각(동기화할 변경이 있는지 판단용).
-    pub fn latest_change(&self) -> i64 {
-        self.conn
-            .query_row("SELECT MAX(COALESCE((SELECT MAX(updated) FROM docs),0), COALESCE((SELECT MAX(trashed_at) FROM docs),0))", [], |r| r.get(0))
-            .unwrap_or(0)
     }
 
     /// 이미 저장된 DB 파일(WAL 포함)을 읽기 전용 연결로 열어 스냅숏을 만든다. 화면 스레드 밖에서 쓸 수 있다.

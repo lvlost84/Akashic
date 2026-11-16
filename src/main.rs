@@ -53,14 +53,29 @@ fn main() -> eframe::Result {
         diag::log("안전 모드: 이번 실행만 DirectX 사용");
         *NOTICE.lock().unwrap() = Some("안전 모드: 이번 실행만 DirectX로 시작했습니다".into());
     }
+    if app::CONFIG_RESET.load(std::sync::atomic::Ordering::Relaxed) {
+        let mut n = NOTICE.lock().unwrap();
+        if n.is_none() {
+            *n = Some("설정 파일을 읽을 수 없어 기본값으로 시작했습니다(원본은 config.bad.json으로 보관)".into());
+        }
+    }
     let path = std::path::PathBuf::from(&cfg.db_path);
     let db = match db::Db::open(&path) {
         Ok(d) => d,
         Err(e) => {
+            // 다른 아카식이 쓰는 중이거나 잠긴 것뿐이면 빈 저장소를 새로 만들어 문서가 사라진 것처럼 보이게 하지 않는다.
+            let low = e.to_lowercase();
+            if low.contains("locked") || low.contains("busy") {
+                rfd::MessageDialog::new()
+                    .set_title("아카식")
+                    .set_description(format!("문서 저장소가 다른 곳에서 사용 중이거나 잠겨 있습니다.\n{}\n\n이미 실행 중인 아카식을 닫고 다시 실행하세요.\n\n{e}", path.display()))
+                    .show();
+                return Ok(());
+            }
             let fallback = app::default_db_path();
             let ask = rfd::MessageDialog::new()
                 .set_title("아카식")
-                .set_description(format!("문서 저장소를 열 수 없습니다.\n{}\n\n{e}\n\n기본 위치에 새로 만들까요?\n{}", path.display(), fallback.display()))
+                .set_description(format!("문서 저장소를 열 수 없습니다.\n{}\n\n{e}\n\n기본 위치에 새로 만들고 설정도 그 위치로 바꿀까요?\n(기존 문서 파일은 그대로 남습니다)\n{}", path.display(), fallback.display()))
                 .set_buttons(rfd::MessageButtons::YesNo)
                 .show();
             if ask != rfd::MessageDialogResult::Yes {
