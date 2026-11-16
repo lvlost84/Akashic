@@ -1,0 +1,8 @@
+/target
+/out
+/snapshots
+/전달
+# 빌드할 때 build.rs가 만든다
+/LICENSE.md
+*.old
+*.new

@@ -1,0 +1,41 @@
+# 버전 태그(v2.0.1 등)를 올리면 빌드해서 GitHub Releases에 Akashic.exe + SHA256SUMS를 올린다.
+# 앱의 자동 업데이트는 이 두 파일을 받아 해시를 확인한 뒤 설치한다.
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 태그와 Cargo.toml 버전이 같은지 확인
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}".TrimStart('v')
+          $ver = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          if ($tag -ne $ver) { throw "태그($tag)와 Cargo.toml 버전($ver)이 다릅니다" }
+      - name: 시험
+        run: cargo test --release
+      - name: 빌드
+        env:
+          AKASHIC_REPO: ${{ github.repository }}
+        run: cargo build --release
+      - name: 올릴 파일 만들기
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/akashic.exe dist/Akashic.exe
+          $h = (Get-FileHash dist/Akashic.exe -Algorithm SHA256).Hash.ToLower()
+          "$h  Akashic.exe" | Out-File -Encoding ascii -NoNewline dist/SHA256SUMS
+          if (Test-Path LICENSE.md) { Copy-Item LICENSE.md dist/LICENSE.md }
+      - name: 릴리스 만들기
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $files = @("dist/Akashic.exe", "dist/SHA256SUMS")
+          if (Test-Path dist/LICENSE.md) { $files += "dist/LICENSE.md" }
+          gh release create "${{ github.ref_name }}" @files --title "아카식 ${{ github.ref_name }}" --generate-notes
