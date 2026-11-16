@@ -35,11 +35,6 @@ fn running_exe() -> Option<std::path::PathBuf> {
     std::env::current_exe().ok().map(|p| update::original_path(&p))
 }
 
-/// 개발 중 빌드(`target\` 아래)는 건드리지 않는다.
-fn is_dev_build(p: &std::path::Path) -> bool {
-    p.components().any(|c| c.as_os_str().eq_ignore_ascii_case("target"))
-}
-
 impl App {
     fn update_busy(&self) -> bool {
         ST.with(|s| s.borrow().rx.is_some())
@@ -67,7 +62,7 @@ impl App {
 
     fn update_install_start(&mut self, rel: Release) {
         let Some(exe) = running_exe() else { return };
-        if is_dev_build(&exe) {
+        if update::is_dev_build(&exe) {
             ST.with(|s| s.borrow_mut().status = format!("새 버전 v{}이 있습니다(개발 빌드라 설치하지 않음)", update::fmt_ver(rel.version)));
             return;
         }
@@ -120,7 +115,9 @@ impl App {
             Some(Msg::Checked(Ok(rel))) => {
                 self.cfg.update_last = db::now();
                 self.cfg.save();
-                if update::is_newer(&rel) {
+                // 이미 설치를 마친 버전(재시작 전)은 실행 중인 프로그램보다 새것이어도 다시 설치하지 않는다.
+                let already = ST.with(|s| s.borrow().installed.as_deref() == Some(rel.tag.as_str()));
+                if update::is_newer(&rel) && !already {
                     let v = update::fmt_ver(rel.version);
                     ST.with(|s| {
                         let mut s = s.borrow_mut();
@@ -136,7 +133,11 @@ impl App {
                     let auto = ST.with(|s| {
                         let mut s = s.borrow_mut();
                         s.available = None;
-                        s.status = format!("최신 버전입니다 (v{})", update::fmt_ver(update::current_version()));
+                        s.status = if already {
+                            format!("{} 설치 완료 — 다시 시작하면 적용됩니다", rel.tag)
+                        } else {
+                            format!("최신 버전입니다 (v{})", update::fmt_ver(update::current_version()))
+                        };
                         s.auto
                     });
                     let _ = auto;
@@ -214,6 +215,6 @@ impl App {
         if !status.is_empty() {
             ui.label(egui::RichText::new(status).color(dim));
         }
-        ui.label(egui::RichText::new(format!("출처: github.com/{} (릴리스의 SHA256 해시를 확인한 파일만 설치합니다)", update::REPO)).color(dim).size(crate::theme::ui(-1.0)));
+        ui.label(egui::RichText::new(format!("출처: github.com/{} (내려받은 파일이 손상되지 않았는지 릴리스의 SHA256 해시로 확인한 뒤 설치합니다)", update::REPO)).color(dim).size(crate::theme::ui(-1.0)));
     }
 }

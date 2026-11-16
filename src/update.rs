@@ -161,7 +161,14 @@ pub fn swap(exe: &Path, new: &Path) -> Result<(), String> {
     let _ = std::fs::remove_file(&old);
     std::fs::rename(exe, &old).map_err(|e| format!("현재 프로그램 이름을 바꿀 수 없음(쓰기 권한 확인): {e}"))?;
     if let Err(e) = std::fs::rename(new, exe) {
-        let _ = std::fs::rename(&old, exe);
+        if let Err(e2) = std::fs::rename(&old, exe) {
+            // 원래 이름으로 되돌리지도 못한 경우: 사용자가 직접 복구할 수 있게 상태를 알린다.
+            return Err(format!(
+                "새 프로그램을 놓을 수 없고({e}) 원래 이름으로 되돌리지도 못했습니다({e2}). 폴더의 {}를 {}로 이름을 바꿔 주세요",
+                old.display(),
+                exe.display()
+            ));
+        }
         return Err(format!("새 프로그램을 놓을 수 없음: {e}"));
     }
     Ok(())
@@ -182,27 +189,48 @@ pub fn original_path(exe: &Path) -> PathBuf {
     }
 }
 
-/// 잠시 뒤(지금 프로그램이 끝난 다음) 새 버전을 다시 실행한다.
+/// 다시 시작할 때 쓸 PowerShell 명령: 지금 프로그램(pid)이 끝나기를 기다린 뒤(최대 60초) 새 버전을 연다.
+/// 고정 시간(ping)이 아니라 프로세스 종료를 기다리므로 닫는 데 오래 걸려도 겹쳐 뜨지 않고,
+/// cmd와 달리 경로의 `%` 같은 글자도 그대로 전달된다. 작은따옴표만 두 번 써서 이스케이프한다.
+pub fn relaunch_script(pid: u32, target: &Path) -> String {
+    let q = target.display().to_string().replace('\'', "''");
+    format!("Wait-Process -Id {pid} -Timeout 60 -ErrorAction SilentlyContinue; Start-Process -FilePath '{q}'")
+}
+
+/// 지금 프로그램이 끝난 다음 새 버전을 다시 실행하도록 예약한다.
 pub fn relaunch_later(exe: &Path) {
-    let target = original_path(exe);
-    let mut c = Command::new("cmd");
+    let script = relaunch_script(std::process::id(), &original_path(exe));
+    let mut c = Command::new("powershell");
+    c.args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &script]);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         c.creation_flags(0x0800_0000);
-        // cmd는 \" 같은 이스케이프를 모르므로 따옴표를 그대로 넘긴다(raw_arg).
-        c.raw_arg(format!("/C ping -n 3 127.0.0.1 >nul & start \"\" \"{}\"", target.display()));
-    }
-    #[cfg(not(windows))]
-    {
-        c.args(["/C", "true"]);
     }
     let _ = c.spawn();
+}
+
+/// 개발 중 빌드(`target\release`·`target\debug` 아래)인가. 이런 파일은 자동으로 교체하지 않는다.
+/// 사용자가 `D:\target\` 같은 폴더에 설치한 경우까지 개발 빌드로 보지 않도록 바로 뒤 폴더 이름까지 본다.
+pub fn is_dev_build(p: &Path) -> bool {
+    let names: Vec<String> = p.components().map(|c| c.as_os_str().to_string_lossy().to_ascii_lowercase()).collect();
+    names.windows(2).any(|w| w[0] == "target" && (w[1] == "release" || w[1] == "debug"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dev_build_detection_and_relaunch_script() {
+        assert!(is_dev_build(Path::new(r"C:\w\akashic-rs\target\release\akashic.exe")));
+        assert!(is_dev_build(Path::new(r"C:\w\akashic-rs\Target\Debug\akashic.exe")));
+        assert!(!is_dev_build(Path::new(r"D:\target\Akashic.exe")));
+        assert!(!is_dev_build(Path::new(r"C:\Program Files\Akashic\Akashic.exe")));
+        let s = relaunch_script(42, Path::new(r"C:\a b\100%'s\Akashic.exe"));
+        assert!(s.starts_with("Wait-Process -Id 42 "));
+        assert!(s.ends_with(r"Start-Process -FilePath 'C:\a b\100%''s\Akashic.exe'"));
+    }
 
     #[test]
     fn original_path_strips_old() {
