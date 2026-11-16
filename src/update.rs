@@ -173,21 +173,42 @@ pub fn cleanup(exe: &Path) {
     let _ = std::fs::remove_file(with_suffix(exe, ".new"));
 }
 
-/// 잠시 뒤(지금 프로그램이 끝난 다음) `exe`를 다시 실행한다.
+/// 교체 뒤 실행 중인 프로그램은 `.old`로 이름이 바뀌어 있어 `current_exe()`가 그 경로를 돌려준다.
+/// 다시 시작할 때는 새 버전이 놓인 원래 경로를 써야 한다.
+pub fn original_path(exe: &Path) -> PathBuf {
+    match exe.file_name().and_then(|n| n.to_str()) {
+        Some(n) if n.to_ascii_lowercase().ends_with(".old") => exe.with_file_name(&n[..n.len() - 4]),
+        _ => exe.to_path_buf(),
+    }
+}
+
+/// 잠시 뒤(지금 프로그램이 끝난 다음) 새 버전을 다시 실행한다.
 pub fn relaunch_later(exe: &Path) {
+    let target = original_path(exe);
     let mut c = Command::new("cmd");
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         c.creation_flags(0x0800_0000);
+        // cmd는 \" 같은 이스케이프를 모르므로 따옴표를 그대로 넘긴다(raw_arg).
+        c.raw_arg(format!("/C ping -n 3 127.0.0.1 >nul & start \"\" \"{}\"", target.display()));
     }
-    c.args(["/C", "ping -n 3 127.0.0.1 >nul & start \"\" "]).arg(format!("\"{}\"", exe.display()));
+    #[cfg(not(windows))]
+    {
+        c.args(["/C", "true"]);
+    }
     let _ = c.spawn();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn original_path_strips_old() {
+        assert_eq!(original_path(Path::new(r"C:\dir x\Akashic.exe.old")), PathBuf::from(r"C:\dir x\Akashic.exe"));
+        assert_eq!(original_path(Path::new(r"C:\dir x\Akashic.exe")), PathBuf::from(r"C:\dir x\Akashic.exe"));
+    }
 
     #[test]
     fn versions() {

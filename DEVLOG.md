@@ -1,10 +1,10 @@
-# 아카식(Akashic) 개발 진행 기록
+﻿# 아카식(Akashic) 개발 진행 기록
 
 KnowVault(WPF)를 Rust + eframe/egui 0.37 + rusqlite로 다시 만드는 프로젝트의 진행 기록입니다.
 작업을 끝낼 때마다 아래 "기록" 맨 위에 항목을 추가합니다(날짜 · 무엇을 · 왜/어떻게 · 확인한 것 · 남은 것).
 
 - 빌드: `cargo build --release` → `out\Akashic.exe` (실행 중이라 잠기면 `Akashic-new.exe`)
-- 시험: `cargo test --release` (현재 88건 통과, 성능·실측 3건은 ignored)
+- 시험: `cargo test --release` (현재 89건 통과, 성능·실측 3건은 ignored)
 - 격리 실행: `AKASHIC_DATA=<폴더>`, `--seed`. 개발용 환경변수: `AKASHIC_OPEN_HELP/GRAPH/TITLE/OPT`, `AKASHIC_RENDERER`, `AKASHIC_DIAG`
 - 스냅숏(커밋 대신): `snapshots\<날짜>-<번호>-<이름>\` (src, Cargo.toml, build.rs, .cargo, assets)
 - 오픈소스 고지: 빌드할 때 `LICENSE.md`가 자동 생성됨(build.rs)
@@ -18,6 +18,7 @@ KnowVault(WPF)를 Rust + eframe/egui 0.37 + rusqlite로 다시 만드는 프로�
 ## 기록
 
 ### 2026-11-16
+- **업데이트 뒤 다시 시작 오류 수정 (v2.0.3)**: "경로를 찾을 수 없음" 오류. 원인 두 가지: ① 교체 뒤 실행 중인 exe는 `.old`로 이름이 바뀌어 `current_exe()`가 `.old` 경로를 돌려줌(그 경로로 다시 실행하려 함) → `update::original_path`로 원래 경로 복원, `running_exe()`도 이를 거침. ② `cmd /C`에 넣은 따옴표를 Rust가 `\"`로 이스케이프해 cmd가 경로를 못 읽음 → `raw_arg` 사용. 공백이 든 경로에서 같은 명령줄로 실제 실행되는 것을 확인(시험 1건 추가, 89건). 이미 설치된 2.0.2는 이 버그가 있어 2.0.3으로 자동 업데이트된 뒤에는 정상, 그 한 번은 수동으로 다시 시작해야 함.
 - **동기화 개선 (v2.0.2)**:
   1. 불러오기 뒤 `last_sync`를 불러온 저장본의 시각으로 맞춤(전에는 불러온 직후에도 "다른 기기가 올린 새 내용"으로 보여 자동 동기화가 멈추고 수동은 매번 덮어쓰기 확인이 떴음). `restore_from_dir`이 (백업 경로, saved_at)을 돌려줌.
   2. 결과 저장·표시: 설정에 `sync_result/sync_result_at/sync_failed/sync_skip` 추가. 옵션에 마지막 결과, 상태바에 "동기화 보류"(다른 기기 내용 때문)·"동기화 실패"를 주의색으로 표시하고 툴팁에 마지막 결과를 보임.

@@ -32,7 +32,7 @@ thread_local! {
 const DAY: i64 = 24 * 3600;
 
 fn running_exe() -> Option<std::path::PathBuf> {
-    std::env::current_exe().ok()
+    std::env::current_exe().ok().map(|p| update::original_path(&p))
 }
 
 /// 개발 중 빌드(`target\` 아래)는 건드리지 않는다.
