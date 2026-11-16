@@ -39,6 +39,7 @@ fn main() -> eframe::Result {
     }
     let safe_mode = args.iter().any(|a| a == "--safe-mode") || probe::shift_down();
     let mut cfg = app::Config::load();
+    let recovered = !cfg.renderer_pending.is_empty();
     // 지난 시작이 첫 화면을 그리기 전에 끝났다면(그래픽 드라이버 충돌 등) 그 렌더러를 믿지 않고 되돌린다.
     if !cfg.renderer_pending.is_empty() {
         let bad = std::mem::take(&mut cfg.renderer_pending);
@@ -103,7 +104,9 @@ fn main() -> eframe::Result {
     }
     // 렌더러: 기본은 모든 Windows에 있는 DirectX(12). 옵션/환경변수(AKASHIC_RENDERER)로 바꿀 수 있고,
     // 시작에 실패하면(드라이버 없음·Vulkan 로더 오류 등) 순서대로 다른 렌더러를 자동으로 시도한다.
-    let choice = if safe_mode { "directx".to_string() } else { std::env::var("AKASHIC_RENDERER").unwrap_or_else(|_| cfg.renderer.clone()).to_lowercase() };
+    // 지난 시작이 실패해 되돌린 직후에는 환경변수로 같은 렌더러를 다시 고르지 않는다(자동 복구가 무력화되므로).
+    let env_choice = if recovered { None } else { std::env::var("AKASHIC_RENDERER").ok() };
+    let choice = if safe_mode { "directx".to_string() } else { env_choice.unwrap_or_else(|| cfg.renderer.clone()).to_lowercase() };
     let chain = renderer_chain(&choice);
     let state = std::sync::Arc::new(std::sync::Mutex::new(Some((db, cfg))));
     let mut last_err = String::new();
@@ -241,21 +244,27 @@ fn renderer_chain(choice: &str) -> Vec<Kind> {
 }
 /// 개발용: 비어 있는 저장소에 화면 확인용 문서를 채운다(`--seed`).
 fn seed_demo(db: &db::Db) {
-    if db.counts().map(|c| c.0).unwrap_or(1) > 0 {
-        return;
+    if let Err(e) = seed_demo_inner(db) {
+        diag::log(&format!("예시 문서 만들기 실패: {e}"));
     }
-    let q = db.add_category(None, "품질").unwrap();
-    let m = db.add_category(Some(q), "측정기").unwrap();
-    let w = db.add_category(None, "업무").unwrap();
+}
+
+fn seed_demo_inner(db: &db::Db) -> Result<(), String> {
+    if db.counts().map(|c| c.0).unwrap_or(1) > 0 {
+        return Ok(());
+    }
+    let q = db.add_category(None, "품질")?;
+    let m = db.add_category(Some(q), "측정기")?;
+    let w = db.add_category(None, "업무")?;
     // 이모지 표시 확인용
-    let emo = db.add_category(None, "가 이모지").unwrap();
+    let emo = db.add_category(None, "가 이모지")?;
     for n in ["📁 프로젝트", "🔥 긴급 🚀", "😀 웃음", "👨‍👩‍👧 가족", "🇰🇷 국기", "한글🙂뒤", "✅ 완료", "❤ 하트"] {
         let _ = db.add_category(Some(emo), n);
     }
     // 깊은 한글 분류 확인용(3~4단계)
-    let k = db.add_category(Some(m), "교정 이력").unwrap();
-    let _ = db.add_category(Some(k), "2026년 정기 점검").unwrap();
-    let _ = db.add_category(Some(k), "가나다라마바사").unwrap();
+    let k = db.add_category(Some(m), "교정 이력")?;
+    let _ = db.add_category(Some(k), "2026년 정기 점검")?;
+    let _ = db.add_category(Some(k), "가나다라마바사")?;
     // 목차 확인용 긴 문서(제목 여러 단계 + 스크롤이 생길 만큼의 본문)
     let mut long_doc = String::from("# 목차 시험 문서\n\n이 문서는 오른쪽 사이드바의 목차 기능을 확인하기 위한 것입니다.\n");
     for (i, sec) in ["시작하기", "설치와 설정", "기본 사용법", "고급 기능", "문제 해결", "자주 묻는 질문"].iter().enumerate() {
@@ -278,8 +287,9 @@ fn seed_demo(db: &db::Db) {
         ("주간 회의록", Some(w), "## 이번 주\n- 회의 내용 정리\n- 다음 주 계획: 글자가 겹치는 걸 막기 위해 문서의 이름이 겹치지 않게 하라고 했는데 번갯불처럼 튀어 오르는 모습이 보기 안좋다는 의견이 있어서 줄바꿈된 행도 같은 간격으로 들여써서 보여야 한다\n1. 숫자 목록도 마찬가지로 아주 긴 문장이 줄바꿈되어 두 번째 줄이 첫 줄의 글자 위치에 맞춰져야 하며 번호 바로 아래로 파고들면 안 된다\n- [ ] 체크박스 항목도 긴 문장이 줄바꿈되면 체크박스 뒤 글자 위치에 맞춰져야 한다는 것을 확인하는 줄입니다\n\n참고: [[측정기 점검]], [[마크다운 서식 모음]], [[새 아이디어]]\n"),
     ];
     for (t, c, b) in docs {
-        let id = db.new_doc(c).unwrap();
-        db.save_doc(id, t, b).unwrap();
+        let id = db.new_doc(c)?;
+        db.save_doc(id, t, b)?;
         let _ = db.add_tag(id, "예시");
     }
+    Ok(())
 }

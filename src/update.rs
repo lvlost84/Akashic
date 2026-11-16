@@ -125,6 +125,9 @@ pub fn is_newer(r: &Release) -> bool {
     r.version > current_version()
 }
 
+/// 내려받은 실행 파일이 이보다 작으면 잘못된 파일로 본다(오류 페이지 등이 저장된 경우).
+const MIN_EXE_BYTES: u64 = 1_000_000;
+
 fn with_suffix(p: &Path, suffix: &str) -> PathBuf {
     let mut s = p.as_os_str().to_os_string();
     s.push(suffix);
@@ -147,11 +150,14 @@ pub fn install(rel: &Release, exe: &Path) -> Result<PathBuf, String> {
         let _ = std::fs::remove_file(&new);
         return Err("내려받은 파일의 해시가 맞지 않아 설치하지 않았습니다".into());
     }
-    if std::fs::metadata(&new).map_or(true, |m| m.len() < 1_000_000) {
+    if std::fs::metadata(&new).map_or(true, |m| m.len() < MIN_EXE_BYTES) {
         let _ = std::fs::remove_file(&new);
         return Err("내려받은 파일이 너무 작아 설치하지 않았습니다".into());
     }
-    swap(exe, &new)?;
+    if let Err(e) = swap(exe, &new) {
+        let _ = std::fs::remove_file(&new); // 교체에 실패해도 내려받은 파일을 남기지 않는다
+        return Err(e);
+    }
     Ok(exe.to_path_buf())
 }
 

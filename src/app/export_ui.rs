@@ -5,7 +5,7 @@ use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use std::sync::Mutex;
 
 /// 진행 중인 내보내기의 결과 수신기(앱 구조체를 건드리지 않으려고 모듈 전역으로 둔다).
-static RUNNING: Mutex<Option<Receiver<ExportResult>>> = Mutex::new(None);
+static RUNNING: Mutex<Option<Receiver<Result<ExportResult, String>>>> = Mutex::new(None);
 /// 마지막으로 끝난 내보내기 폴더.
 static LAST_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
 
@@ -32,27 +32,20 @@ impl App {
 
     fn start_export(&mut self, ctx: &egui::Context) {
         let Some(parent) = rfd::FileDialog::new().set_title("내보낼 위치 선택").pick_folder() else { return };
-        self.flush(); // 편집 중인 내용까지 포함
-        let (docs, cats) = match self.db.export_data() {
-            Ok(x) => x,
-            Err(x) => {
-                self.say(&format!("내보내기 실패: {x}"));
-                return;
-            }
-        };
-        let n = docs.len();
+        self.flush(); // 편집 중인 내용까지 저장한 뒤, 읽기·쓰기는 모두 별도 스레드에서 한다(큰 DB에서도 화면이 멈추지 않게)
+        let src = self.db.path.clone();
         let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
         let (tx, rx) = channel();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let r = export::run_export(&parent, &stamp, &docs, &cats);
+            let r = crate::db::Db::export_data_from_file(&src).map(|(docs, cats)| export::run_export(&parent, &stamp, &docs, &cats));
             let _ = tx.send(r);
             ctx.request_repaint();
         });
         if let Ok(mut g) = RUNNING.lock() {
             *g = Some(rx);
         }
-        self.say(&format!("내보내는 중… ({n}개)"));
+        self.say("내보내는 중…");
     }
 
     /// 매 프레임 호출: 끝난 내보내기 결과를 상태바에 알린다.
@@ -77,6 +70,14 @@ impl App {
         if crashed {
             self.say("내보내기 실패: 내부 오류로 작업이 중단되었습니다");
         }
+        let res = match res {
+            Some(Ok(r)) => Some(r),
+            Some(Err(x)) => {
+                self.say(&format!("내보내기 실패: {x}"));
+                None
+            }
+            None => None,
+        };
         if let Some(r) = res {
             // 하나도 쓰지 못했다면(폴더 생성 실패 등) "마지막 내보내기 폴더"로 기억하지 않는다.
             if r.ok > 0 {

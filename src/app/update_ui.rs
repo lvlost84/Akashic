@@ -130,7 +130,7 @@ impl App {
                         self.say(&format!("새 버전 v{v}이 있습니다 (옵션 > 정보에서 설치)"));
                     }
                 } else {
-                    let auto = ST.with(|s| {
+                    ST.with(|s| {
                         let mut s = s.borrow_mut();
                         s.available = None;
                         s.status = if already {
@@ -138,19 +138,12 @@ impl App {
                         } else {
                             format!("최신 버전입니다 (v{})", update::fmt_ver(update::current_version()))
                         };
-                        s.auto
                     });
-                    let _ = auto;
                 }
             }
             Some(Msg::Checked(Err(e))) => {
-                let auto = ST.with(|s| {
-                    let mut s = s.borrow_mut();
-                    s.status = format!("확인하지 못했습니다: {e}");
-                    s.auto
-                });
                 // 오프라인 등으로 자동 확인이 실패하면 조용히 넘어간다(상태는 옵션 > 정보에서 볼 수 있다).
-                let _ = auto;
+                ST.with(|s| s.borrow_mut().status = format!("확인하지 못했습니다: {e}"));
             }
             Some(Msg::Installed(Ok(()), tag)) => {
                 ST.with(|s| {

@@ -74,13 +74,23 @@ fn radial(adj: &[Vec<usize>], comp: &[usize], gap: f32) -> (Vec<(usize, Vec2)>, 
             leaves[v] = children[v].iter().map(|c| leaves[*c]).sum();
         }
     }
+    let maxd0 = order.iter().map(|&v| depth[v]).max().unwrap_or(0);
+    // 단계별 고리 반지름: 기본 간격에 더해, 그 단계 노드가 둘레에 겹치지 않고 놓일 만큼(허브에 노드가 아주 많을 때) 넓힌다.
+    let mut count = vec![0usize; maxd0 + 1];
+    for &v in &order {
+        count[depth[v]] += 1;
+    }
+    let mut radii = vec![0.0f32; maxd0 + 1];
+    for d in 1..=maxd0 {
+        radii[d] = (radii[d - 1] + gap).max(count[d] as f32 * 34.0 / TAU);
+    }
     let mut ang = vec![(0.0f32, TAU); n]; // 각 노드가 쓰는 각도 구간
     let mut res = vec![];
     let mut maxd = 0;
     for &v in &order {
         let (a0, a1) = ang[v];
         let mid = (a0 + a1) * 0.5;
-        let r = depth[v] as f32 * gap;
+        let r = radii[depth[v]];
         maxd = maxd.max(depth[v]);
         res.push((v, if depth[v] == 0 { Vec2::ZERO } else { Vec2::new(r * mid.cos(), r * mid.sin()) }));
         let total = leaves[v].max(1.0);
@@ -91,7 +101,7 @@ fn radial(adj: &[Vec<usize>], comp: &[usize], gap: f32) -> (Vec<(usize, Vec2)>, 
             a += w;
         }
     }
-    (res, maxd as f32 * gap)
+    (res, radii[maxd])
 }
 
 /// 성분들을 겹치지 않게 동심 고리에 놓는다(첫 성분은 가운데).
@@ -249,10 +259,24 @@ fn layered(adj: &[Vec<usize>], center: Option<usize>) -> Vec<Vec2> {
             place(&rows, &mut x);
         }
     }
+    // 한 계층이 너무 넓어지지 않게 MAX_COLS개씩 줄을 나눠 아래로 쌓는다.
+    const MAX_COLS: usize = 10;
+    let mut ybase = vec![0.0f32; rows.len() + 1];
+    for (l, r) in rows.iter().enumerate() {
+        let sub = r.len().max(1).div_ceil(MAX_COLS);
+        ybase[l + 1] = ybase[l] + (sub - 1) as f32 * 56.0 + 90.0;
+    }
+    let total = ybase[rows.len()] - 90.0;
     let mut pos = vec![Vec2::ZERO; n];
     for (l, r) in rows.iter().enumerate() {
-        for v in r {
-            pos[*v] = Vec2::new(x[*v] * 78.0, l as f32 * 90.0 - maxl as f32 * 45.0);
+        for (k, v) in r.iter().enumerate() {
+            if r.len() <= MAX_COLS {
+                pos[*v] = Vec2::new(x[*v] * 78.0, ybase[l] - total / 2.0);
+            } else {
+                let (s, c) = (k / MAX_COLS, k % MAX_COLS);
+                let in_row = (r.len() - s * MAX_COLS).min(MAX_COLS);
+                pos[*v] = Vec2::new((c as f32 - (in_row as f32 - 1.0) / 2.0) * 78.0, ybase[l] + s as f32 * 56.0 - total / 2.0);
+            }
         }
     }
     pos
@@ -285,6 +309,24 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn big_hub_and_wide_layer_do_not_overlap_or_get_too_wide() {
+        // 허브 0에 노드 60개
+        let e: Vec<(usize, usize)> = (1..=60).map(|i| (0, i)).collect();
+        let a = adj(61, &e);
+        for k in [2u8, 4] {
+            let p = compute(k, &a, Some(0));
+            for i in 0..61 {
+                for j in (i + 1)..61 {
+                    assert!((p[i] - p[j]).length() > 20.0, "배치 {k}: 노드 {i}와 {j}가 겹침");
+                }
+            }
+        }
+        let p = compute(3, &a, Some(0));
+        let wmax = p.iter().map(|v| v.x.abs()).fold(0.0, f32::max);
+        assert!(wmax <= 10.0 * 78.0 / 2.0 + 1.0, "계층형 폭 {wmax}");
     }
 
     #[test]

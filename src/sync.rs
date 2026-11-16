@@ -50,14 +50,18 @@ fn sha_hex(data: &[u8]) -> String {
     hex(&h.finalize())
 }
 
-pub fn part_name(i: usize) -> String {
-    format!("sync-vault.{i:04}.part")
+/// 조각 이름은 올린 세대(gen)를 넣어 만든다. 새 조각이 옛 저장본의 조각을 덮어쓰지 않으므로,
+/// 올리는 도중에 끊겨도 manifest가 가리키는 마지막 정상 저장본은 그대로 남는다.
+pub fn part_name(generation: i64, i: usize) -> String {
+    format!("sync-vault.{generation}.{i:04}.part")
 }
 
+/// 옛 형식(`sync-vault.0000.part`)과 세대 형식(`sync-vault.<세대>.0000.part`)을 모두 알아본다.
 fn is_part_name(n: &str) -> bool {
-    n.strip_prefix("sync-vault.")
-        .and_then(|r| r.strip_suffix(".part"))
-        .map_or(false, |m| !m.is_empty() && m.bytes().all(|c| c.is_ascii_digit()))
+    n.strip_prefix("sync-vault.").and_then(|r| r.strip_suffix(".part")).map_or(false, |m| {
+        let segs: Vec<&str> = m.split('.').collect();
+        (segs.len() == 1 || segs.len() == 2) && segs.iter().all(|s| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit()))
+    })
 }
 
 fn is_our_tmp(n: &str) -> bool {
@@ -66,7 +70,7 @@ fn is_our_tmp(n: &str) -> bool {
 
 /// 이 컴퓨터를 나타내는 기기 ID.
 pub fn device_id() -> String {
-    std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_else(|_| "unknown".into())
+    std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).or_else(|_| std::env::var("USERNAME")).unwrap_or_else(|_| "unknown".into())
 }
 
 fn read_full(f: &mut File, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -106,11 +110,60 @@ pub fn read_manifest(dir: &Path) -> Result<Option<Manifest>, String> {
     serde_json::from_str(&s).map(Some).map_err(|x| format!("manifest가 깨짐: {x}"))
 }
 
+/// 동시에 올리는 것을 막는 잠금 파일. 이 시간(초)이 지나면 비정상 종료로 보고 넘겨받는다.
+pub const LOCK: &str = "sync-vault.lock";
+const LOCK_STALE_SECS: i64 = 20 * 60;
+
+/// 잠금을 잡고 있는 동안만 올릴 수 있다. 값이 버려지면 잠금 파일을 지운다.
+struct UploadLock {
+    path: PathBuf,
+}
+
+impl Drop for UploadLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn acquire_lock(dir: &Path, device: &str, now: i64) -> Result<UploadLock, String> {
+    let path = dir.join(LOCK);
+    for _ in 0..2 {
+        match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut f) => {
+                let _ = writeln!(f, "{device}\n{now}");
+                let _ = f.sync_all();
+                return Ok(UploadLock { path });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let s = fs::read_to_string(&path).unwrap_or_default();
+                let mut it = s.lines();
+                let owner = it.next().unwrap_or("").to_string();
+                let at: i64 = it.next().and_then(|x| x.trim().parse().ok()).unwrap_or(0);
+                // 다른 기기가 최근에 잡은 잠금만 존중한다. 오래됐거나 읽을 수 없거나 우리 것이면 넘겨받는다.
+                if !owner.is_empty() && owner != device && (now - at).abs() <= LOCK_STALE_SECS {
+                    return Err(format!("다른 기기({owner})가 올리는 중입니다. 잠시 뒤 다시 시도하세요"));
+                }
+                let _ = fs::remove_file(&path);
+            }
+            Err(e) => return Err(format!("동기화 잠금을 만들 수 없음: {e}")),
+        }
+    }
+    Err("동기화 잠금을 얻지 못했습니다".into())
+}
+
 /// 스냅숏 파일을 조각으로 나눠 폴더에 쓴다. 안 바뀐 조각은 건너뛰고, manifest는 마지막에 쓴다.
 pub fn push_file(snapshot: &Path, dir: &Path, device: &str, now: i64, chunk: usize) -> Result<WriteStats, String> {
     let chunk = chunk.max(1);
     fs::create_dir_all(dir).map_err(|x| format!("동기화 폴더를 만들 수 없음: {x}"))?;
+    let _lock = acquire_lock(dir, device, now)?;
     let old = read_manifest(dir).ok().flatten();
+    // 이번 세대 번호: 옛 manifest의 조각 이름과 겹치지 않는 값(같은 초에 다시 올려도 덮어쓰지 않도록)
+    let mut generation = now;
+    if let Some(o) = &old {
+        while o.parts.iter().any(|p| p.name.starts_with(&format!("sync-vault.{generation}."))) {
+            generation += 1;
+        }
+    }
     let mut f = File::open(snapshot).map_err(|x| format!("스냅숏을 열 수 없음: {x}"))?;
     let mut buf = vec![0u8; chunk];
     let mut all = Sha256::new();
@@ -126,15 +179,16 @@ pub fn push_file(snapshot: &Path, dir: &Path, device: &str, now: i64, chunk: usi
         all.update(data);
         total += n as u64;
         let i = parts.len();
-        let name = part_name(i);
         let sha = sha_hex(data);
-        let same = old.as_ref().and_then(|m| m.parts.get(i)).map_or(false, |p| {
-            p.name == name
-                && p.sha256 == sha
-                && p.len == n as u64
-                && fs::metadata(dir.join(&name)).map_or(false, |md| md.len() == n as u64)
+        // 안 바뀐 조각은 옛 이름 그대로 가리키고, 바뀐 조각만 새 세대 이름으로 쓴다.
+        let same = old.as_ref().and_then(|m| m.parts.get(i)).filter(|p| {
+            p.sha256 == sha && p.len == n as u64 && fs::metadata(dir.join(&p.name)).map_or(false, |md| md.len() == n as u64)
         });
-        if same {
+        let name = match same {
+            Some(p) => p.name.clone(),
+            None => part_name(generation, i),
+        };
+        if same.is_some() {
             st.skipped += 1;
         } else {
             write_atomic(dir, &name, data)?;
@@ -345,6 +399,44 @@ mod tests {
     }
 
     #[test]
+    fn new_generation_never_overwrites_live_parts() {
+        let t = tmpdir("gen");
+        let src = t.join("snap.bin");
+        let a = pseudo(3 * 1024 * 1024, 7);
+        fs::write(&src, &a).unwrap();
+        let dir = t.join("sync");
+        push_file(&src, &dir, "A", 10, TC).unwrap();
+        let m1 = read_manifest(&dir).unwrap().unwrap();
+        // 같은 초에 내용을 바꿔 다시 올려도 옛 조각 이름과 겹치지 않는다
+        fs::write(&src, pseudo(3 * 1024 * 1024, 8)).unwrap();
+        push_file(&src, &dir, "A", 10, TC).unwrap();
+        let m2 = read_manifest(&dir).unwrap().unwrap();
+        assert!(m1.parts.iter().all(|p| m2.parts.iter().all(|q| q.name != p.name)));
+        // 올리다 끊겨 manifest 없이 새 조각만 남은 상태: 마지막 정상 저장본은 그대로 불러온다
+        fs::write(dir.join(part_name(99, 0)), b"partial").unwrap();
+        let out = t.join("o");
+        assemble(&dir, &m2, &out).unwrap();
+        let _ = fs::remove_dir_all(&t);
+    }
+
+    #[test]
+    fn upload_lock_blocks_other_device_but_not_stale_or_own() {
+        let t = tmpdir("lock");
+        let src = t.join("snap.bin");
+        fs::write(&src, pseudo(1000, 9)).unwrap();
+        let dir = t.join("sync");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(LOCK), "PC-B\n1000").unwrap();
+        let e = push_file(&src, &dir, "PC-A", 1100, TC).unwrap_err();
+        assert!(e.contains("PC-B"), "{e}");
+        assert!(dir.join(LOCK).exists(), "남의 잠금은 지우지 않는다");
+        // 오래된 잠금은 넘겨받고, 끝나면 잠금이 남지 않는다
+        push_file(&src, &dir, "PC-A", 1000 + LOCK_STALE_SECS + 5, TC).unwrap();
+        assert!(!dir.join(LOCK).exists());
+        let _ = fs::remove_dir_all(&t);
+    }
+
+    #[test]
     fn detects_missing_corrupt_size_and_cleans_old() {
         let t = tmpdir("bad");
         let src = t.join("snap.bin");
@@ -354,7 +446,7 @@ mod tests {
         let m = read_manifest(&dir).unwrap().unwrap();
         let out = t.join("o");
         // 손상
-        let p1 = dir.join(part_name(1));
+        let p1 = dir.join(&m.parts[1].name);
         let mut b = fs::read(&p1).unwrap();
         b[10] ^= 1;
         fs::write(&p1, &b).unwrap();
@@ -366,7 +458,7 @@ mod tests {
         let e = assemble(&dir, &m, &out).unwrap_err();
         assert!(e.contains("크기"), "{e}");
         // 누락
-        fs::remove_file(dir.join(part_name(2))).unwrap();
+        fs::remove_file(dir.join(&m.parts[2].name)).unwrap();
         fs::remove_file(&p1).unwrap();
         let e = assemble(&dir, &m, &out).unwrap_err();
         assert!(e.contains("2번째 조각이 없음"), "{e}");
@@ -375,8 +467,9 @@ mod tests {
         fs::write(&src, pseudo(1000, 4)).unwrap();
         let st = push_file(&src, &dir, "A", 5, TC).unwrap();
         assert_eq!(st.total, 1);
-        assert!(dir.join(part_name(0)).exists());
-        assert!(!dir.join(part_name(1)).exists() && !dir.join(part_name(2)).exists());
+        let m2 = read_manifest(&dir).unwrap().unwrap();
+        assert!(dir.join(&m2.parts[0].name).exists());
+        assert!(!dir.join(&m.parts[1].name).exists() && !dir.join(&m.parts[2].name).exists());
         assert!(dir.join("other.txt").exists());
         let _ = fs::remove_dir_all(&t);
     }

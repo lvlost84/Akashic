@@ -25,7 +25,10 @@ fn find_rc() -> Option<std::path::PathBuf> {
     let base = std::env::var_os("ProgramFiles(x86)").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Program Files (x86)"));
     let bin = base.join("Windows Kits").join("10").join("bin");
     let mut vers: Vec<PathBuf> = std::fs::read_dir(&bin).ok()?.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
-    vers.sort();
+    // 글자 순서가 아니라 숫자 순서로 정렬한다(10.0.9600.0 < 10.0.19041.0 < 10.0.22621.0).
+    vers.sort_by_key(|p| {
+        p.file_name().map(|n| n.to_string_lossy().split('.').map(|x| x.parse::<u32>().unwrap_or(0)).collect::<Vec<u32>>()).unwrap_or_default()
+    });
     for v in vers.into_iter().rev() {
         let c = v.join("x64").join("rc.exe");
         if c.is_file() {

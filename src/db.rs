@@ -752,6 +752,13 @@ COMMIT;"
         self.conn.execute_batch(&format!("VACUUM INTO '{d}'")).map_err(e)
     }
 
+    /// 저장된 DB 파일(WAL 포함)을 읽기 전용 연결로 열어 내보낼 자료를 읽는다. 화면 스레드 밖에서 쓸 수 있다.
+    pub fn export_data_from_file(src: &Path) -> Res<(Vec<ExportDoc>, Vec<Category>)> {
+        let conn = Connection::open_with_flags(src, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(e)?;
+        conn.execute_batch("PRAGMA busy_timeout=3000;").map_err(e)?;
+        Db { conn, path: src.to_path_buf() }.export_data()
+    }
+
     /// 이미 저장된 DB 파일(WAL 포함)을 읽기 전용 연결로 열어 스냅숏을 만든다. 화면 스레드 밖에서 쓸 수 있다.
     pub fn snapshot_file(src: &Path, dest: &Path) -> Res<()> {
         if dest.exists() {

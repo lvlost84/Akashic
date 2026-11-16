@@ -6,6 +6,8 @@ use std::time::SystemTime;
 #[derive(Clone, Default)]
 pub(super) struct DocStats {
     pub bytes: usize,
+    /// 본문 지문(같은 길이의 편집도 알아내기 위함)
+    pub key: u64,
     pub chars: usize,
     pub lines: usize,
     pub words: usize,
@@ -17,7 +19,9 @@ impl DocStats {
         DocStats { bytes: usize::MAX, ..Default::default() }
     }
     pub fn of(s: &str) -> DocStats {
-        DocStats { bytes: s.len(), chars: s.chars().count(), lines: s.lines().count().max(1), words: s.split_whitespace().count() }
+        // 줄 수는 위치 표시(줄 N)와 같은 기준(개행 수 + 1)으로 센다. 끝의 빈 줄도 한 줄이다.
+        let lines = s.bytes().filter(|&b| b == b'\n').count() + 1;
+        DocStats { bytes: s.len(), key: crate::render::cache_key(s), chars: s.chars().count(), lines, words: s.split_whitespace().count() }
     }
 }
 
@@ -27,11 +31,9 @@ pub(super) struct FsSnap {
     wal: u64,
     backups: usize,
     last_backup: Option<SystemTime>,
-    /// 동기화 폴더를 확인했으면 (접근 가능, 폴더의 manifest 저장 시각·기기)
-    sync: Option<(bool, Option<(i64, String)>)>,
 }
 
-fn collect_fs(db_path: &std::path::Path, sync_dir: Option<&str>, check_sync: bool) -> FsSnap {
+fn collect_fs(db_path: &std::path::Path) -> FsSnap {
     let len = |p: &std::path::Path| {
         crate::diag::count("fs_stat");
         std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
@@ -51,21 +53,24 @@ fn collect_fs(db_path: &std::path::Path, sync_dir: Option<&str>, check_sync: boo
             }
         }
     }
-    let sync = match (check_sync, sync_dir) {
-        (true, Some(d)) => {
-            crate::diag::count("sync_dir_check");
-            let p = std::path::Path::new(d);
-            if p.is_dir() {
-                let remote = crate::sync::read_manifest(p).ok().flatten().map(|m| (m.saved_at, m.device));
-                Some((true, remote))
-            } else {
-                Some((false, None))
-            }
-        }
-        _ => None,
-    };
-    FsSnap { db, wal, backups: n, last_backup: newest, sync }
+    FsSnap { db, wal, backups: n, last_backup: newest }
 }
+
+/// 동기화 폴더 확인(접근 가능 여부, 그 폴더의 저장본). 끊어진 네트워크 폴더에서는 오래 멈출 수 있으므로
+/// 로컬 정보와 따로, 시간 제한을 두고 읽는다.
+fn collect_sync(dir: &str) -> (bool, Option<(i64, String)>) {
+    crate::diag::count("sync_dir_check");
+    let p = std::path::Path::new(dir);
+    if p.is_dir() {
+        let remote = crate::sync::read_manifest(p).ok().flatten().map(|m| (m.saved_at, m.device));
+        (true, remote)
+    } else {
+        (false, None)
+    }
+}
+
+/// 동기화 폴더 확인을 이 시간(초) 안에 끝내지 못하면 "접근 불가"로 본다.
+const SYNC_CHECK_LIMIT_SECS: u64 = 15;
 /// 저장소 정보(파일 시스템을 매 프레임 읽지 않도록 5초마다 갱신).
 #[derive(Default)]
 pub(super) struct StorageInfo {
@@ -76,6 +81,8 @@ pub(super) struct StorageInfo {
     pub at: Option<Instant>,
     /// 백그라운드 읽기 결과를 기다리는 채널
     pub rx: Option<std::sync::mpsc::Receiver<FsSnap>>,
+    /// 동기화 폴더 확인 결과를 기다리는 채널과 시작 시각(시간 제한용)
+    pub sync_rx: Option<(std::sync::mpsc::Receiver<(bool, Option<(i64, String)>)>, Instant)>,
     /// 동기화 폴더를 마지막으로 확인한 시각(None이면 다음에 확인)
     pub sync_at: Option<Instant>,
     /// 동기화 폴더 접근 가능 여부(폴더 미설정·아직 모름이면 None)
@@ -224,11 +231,6 @@ impl App {
                     self.storage.wal = s.wal;
                     self.storage.backups = s.backups;
                     self.storage.last_backup = s.last_backup;
-                    if let Some((ok, remote)) = s.sync {
-                        self.storage.sync_ok = Some(ok);
-                        self.storage.remote = remote;
-                        self.storage.sync_at = Some(Instant::now());
-                    }
                     self.storage.rx = None;
                     self.storage.at = Some(Instant::now());
                 }
@@ -236,30 +238,60 @@ impl App {
                 Err(TryRecvError::Empty) => {}
             }
         }
-        if self.storage.rx.is_some() {
-            return;
+        // 동기화 폴더 확인 결과: 시간 안에 오면 반영, 너무 오래 걸리면 접근 불가로 보고 기다림을 포기한다(멈춘 스레드는 버린다).
+        if let Some((rx, started)) = &self.storage.sync_rx {
+            let mut done = true;
+            match rx.try_recv() {
+                Ok((ok, remote)) => {
+                    self.storage.sync_ok = Some(ok);
+                    self.storage.remote = remote;
+                }
+                Err(TryRecvError::Disconnected) => {}
+                Err(TryRecvError::Empty) => {
+                    if started.elapsed() >= Duration::from_secs(SYNC_CHECK_LIMIT_SECS) {
+                        self.storage.sync_ok = Some(false);
+                        self.storage.remote = None;
+                        crate::diag::log("동기화 폴더 확인이 시간 안에 끝나지 않아 접근 불가로 처리");
+                    } else {
+                        done = false;
+                        ctx.request_repaint_after(Duration::from_secs(1));
+                    }
+                }
+            }
+            if done {
+                self.storage.sync_rx = None;
+                self.storage.sync_at = Some(Instant::now());
+            }
         }
         // 크기·백업은 변경 신호(at=None)나 60초마다, 동기화 폴더는 시작·동기화·설정 변경이나 30분마다 확인한다.
-        let local_due = self.storage.at.map_or(true, |t| t.elapsed() >= Duration::from_secs(60));
-        let sync_due = self.storage.sync_at.map_or(true, |t| t.elapsed() >= Duration::from_secs(1800));
-        if !local_due && !sync_due {
-            return;
+        let local_due = self.storage.rx.is_none() && self.storage.at.map_or(true, |t| t.elapsed() >= Duration::from_secs(60));
+        let sync_due = self.storage.sync_rx.is_none() && self.storage.sync_at.map_or(true, |t| t.elapsed() >= Duration::from_secs(1800));
+        if local_due {
+            let db_path = self.db.path.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let ctx2 = ctx.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(collect_fs(&db_path));
+                ctx2.request_repaint();
+            });
+            self.storage.rx = Some(rx);
         }
-        let db_path = self.db.path.clone();
-        let sync_dir = if self.cfg.sync_dir.trim().is_empty() { None } else { Some(self.cfg.sync_dir.clone()) };
-        let check_sync = sync_due;
-        let (tx, rx) = std::sync::mpsc::channel();
-        let ctx = ctx.clone();
-        std::thread::spawn(move || {
-            let _ = tx.send(collect_fs(&db_path, sync_dir.as_deref(), check_sync));
-            ctx.request_repaint();
-        });
-        self.storage.rx = Some(rx);
-        // 폴더 설정이 없으면 확인할 것이 없으므로 시각만 갱신한다.
-        if self.cfg.sync_dir.trim().is_empty() {
-            self.storage.sync_ok = None;
-            self.storage.remote = None;
-            self.storage.sync_at = Some(Instant::now());
+        if sync_due {
+            if self.cfg.sync_dir.trim().is_empty() {
+                // 폴더 설정이 없으면 확인할 것이 없으므로 시각만 갱신한다.
+                self.storage.sync_ok = None;
+                self.storage.remote = None;
+                self.storage.sync_at = Some(Instant::now());
+            } else {
+                let dir = self.cfg.sync_dir.clone();
+                let (tx, rx) = std::sync::mpsc::channel();
+                let ctx2 = ctx.clone();
+                std::thread::spawn(move || {
+                    let _ = tx.send(collect_sync(&dir));
+                    ctx2.request_repaint();
+                });
+                self.storage.sync_rx = Some((rx, Instant::now()));
+            }
         }
     }
 
@@ -271,7 +303,9 @@ impl App {
         }
     }
     pub(super) fn status_bar(&mut self, ui: &mut egui::Ui) {
-        if self.stats.bytes != self.body.len() {
+        // 길이가 같은 편집(글자 바꾸기)도 반영되도록 빠른 해시로 변경을 알아낸다.
+        let body_key = crate::render::cache_key(&self.body);
+        if self.stats.bytes != self.body.len() || self.stats.key != body_key {
             self.stats = DocStats::of(&self.body);
         }
         self.refresh_storage_info(&ui.ctx().clone());
@@ -281,11 +315,11 @@ impl App {
             self.storage.mem_at = Some(Instant::now());
         }
         // 커서의 줄·칸(커서나 길이가 바뀔 때만 다시 계산)
-        if self.pos_cache.0 != self.cursor_idx || self.pos_cache.1 != self.body.len() {
+        if self.pos_cache.0 != self.cursor_idx || self.pos_cache.1 != body_key as usize {
             let upto = &self.body[..byte_of(&self.body, self.cursor_idx)];
             let line = upto.matches('\n').count() + 1;
             let col = upto.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
-            self.pos_cache = (self.cursor_idx, self.body.len(), line, col);
+            self.pos_cache = (self.cursor_idx, body_key as usize, line, col);
         }
 
         let dim = self.theme.dim;

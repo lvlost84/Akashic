@@ -16,7 +16,9 @@ impl App {
         let mut changed = false;
         let mut rebuild = false;
         ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("akashic_graph"), builder, |ui, _class| {
-            if ui.ctx().input(|i| i.viewport().close_requested() || i.key_pressed(Key::Escape)) {
+            // 설정 메뉴(우클릭)가 열려 있을 때의 Esc는 메뉴만 닫고 그래프 창은 닫지 않는다.
+            let menu_open = egui::Popup::is_any_open(ui.ctx());
+            if ui.ctx().input(|i| i.viewport().close_requested() || (i.key_pressed(Key::Escape) && !menu_open)) {
                 close = true;
             }
             let Some(gr) = g.as_mut() else {

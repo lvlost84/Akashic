@@ -308,7 +308,8 @@ impl Graph {
             Some(g) => (g.zoom, g.pan, if nodes.len() == g.nodes.len() { MAX_STEPS - 60 } else { 80 }),
             None => (1.0, Vec2::ZERO, 0),
         };
-        let mut g = Graph { nodes, edges, pedges: vec![], adj: vec![], center, zoom, pan, steps, drag: None, want_fit: false, forces: s.forces(), targets: vec![], wob: vec![], lay_key: (0, 0, 0, None), lbl_slot: vec![], lbl_off: vec![], lbl_alpha: vec![], lbl_ta: vec![], lbl_key: None, lbl_vis: vec![], lbl_next: 0.0 };
+        // 배치 종류를 이어받아, 재빌드 때 고정(끌어 놓은) 노드가 풀리지 않게 한다.
+        let mut g = Graph { nodes, edges, pedges: vec![], adj: vec![], center, zoom, pan, steps, drag: None, want_fit: false, forces: s.forces(), targets: vec![], wob: vec![], lay_key: (old.map_or(0, |g| g.lay_key.0), 0, 0, None), lbl_slot: vec![], lbl_off: vec![], lbl_alpha: vec![], lbl_ta: vec![], lbl_key: None, lbl_vis: vec![], lbl_next: 0.0 };
         g.rebuild_derived();
         g
     }
@@ -345,11 +346,15 @@ impl Graph {
             Some(i) => self.center = Some(i),
             None => {
                 let t = title.trim();
+                // 원점에는 다른 노드가 몰려 있으므로, 기존 노드들 바깥쪽 빈 자리에 둔다.
+                let far = self.nodes.iter().map(|n| n.pos.length()).fold(0.0f32, f32::max) + 70.0;
+                let a = self.nodes.len() as f32 * 2.399_963;
+                let pos = if self.nodes.is_empty() { Vec2::ZERO } else { Vec2::new(far * a.cos(), far * a.sin()) };
                 self.nodes.push(Node {
                     key: format!("#{id}"),
                     id: Some(id),
                     title: if t.is_empty() { "(제목 없음)".into() } else { t.to_string() },
-                    pos: Vec2::ZERO,
+                    pos,
                     vel: Vec2::ZERO,
                     fixed: true,
                     cat: None,
@@ -559,6 +564,8 @@ impl Graph {
         painter.rect_filled(rect, CornerRadius::ZERO, t.bg);
         painter.rect_stroke(rect, CornerRadius::ZERO, Stroke::new(1.0, t.border), StrokeKind::Inside);
         let mut out = GraphOut::default();
+        // 설정 메뉴가 열려 있던 프레임: 메뉴를 닫으려는 바깥 클릭·끌기가 노드 열기나 이동으로 이어지지 않게 한다.
+        let menu_was_open = resp.context_menu_opened();
 
         if self.nodes.is_empty() {
             painter.text(rect.center(), Align2::CENTER_CENTER, "[[문서 링크]]로 연결된\n문서가 아직 없습니다", FontId::proportional(crate::theme::ui(0.0)), t.dim);
@@ -589,7 +596,7 @@ impl Graph {
             }
             let mut moving = false;
             for (nd, t) in self.nodes.iter_mut().zip(&self.targets) {
-                if nd.fixed {
+                if nd.fixed && !nd.temp {
                     continue;
                 }
                 let d = *t - nd.pos;
@@ -663,7 +670,7 @@ impl Graph {
             }
         }
         // 끌기: 노드는 자리 고정, 빈 곳은 이동
-        if resp.drag_started_by(egui::PointerButton::Primary) {
+        if resp.drag_started_by(egui::PointerButton::Primary) && !menu_was_open {
             self.drag = resp.interact_pointer_pos().and_then(|p| hit(self, p));
         }
         if resp.dragged_by(egui::PointerButton::Primary) {
@@ -856,7 +863,7 @@ impl Graph {
             let items: Vec<(u8, String)> = if s.shape_mode == 1 {
                 vec![(2, "연결 0~1".into()), (0, "보통".into()), (1, format!("허브 {}+", s.hub_links))]
             } else {
-                vec![(0, "분류 A".into()), (1, "분류 B".into()), (2, "분류 C".into())]
+                vec![(0, "분류 그룹1·미분류".into()), (1, "분류 그룹2".into()), (2, "분류 그룹3".into())]
             };
             let mut y = rect.top() + 10.0;
             for (k, label) in items {
@@ -875,7 +882,7 @@ impl Graph {
         painter.text(Pos2::new(rect.left() + 6.0, rect.bottom() - 4.0), Align2::LEFT_BOTTOM, summary, FontId::proportional(crate::theme::ui(-1.0)), t.dim);
         painter.text(Pos2::new(rect.right() - 6.0, rect.bottom() - 4.0), Align2::RIGHT_BOTTOM, "우클릭: 설정", FontId::proportional(crate::theme::ui(-1.0)), t.dim);
 
-        if resp.clicked_by(egui::PointerButton::Primary) {
+        if resp.clicked_by(egui::PointerButton::Primary) && !menu_was_open {
             if let Some(i) = resp.interact_pointer_pos().and_then(|p| hit(self, p)) {
                 let nd = &self.nodes[i];
                 out.act = Some(match nd.id {

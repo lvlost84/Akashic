@@ -119,12 +119,13 @@ impl App {
             }
             Some(cat) => {
                 // 목록에 없는 저장값은 기본값으로 되돌린다.
+                let mut font_changed = false;
                 for (name, need_hangul) in [(&mut self.cfg.font_latin, false), (&mut self.cfg.font_korean, true)] {
                     if !name.is_empty() && !cat.iter().any(|f| f.name.eq_ignore_ascii_case(name) && (if need_hangul { f.hangul } else { f.latin })) {
                         name.clear();
+                        font_changed = true; // 비운 값도 적용·저장한다
                     }
                 }
-                let mut font_changed = false;
                 for (label, salt, hangul) in [("영문 글꼴", "font_latin", false), ("한글 글꼴", "font_korean", true)] {
                     let cur = if hangul { self.cfg.font_korean.clone() } else { self.cfg.font_latin.clone() };
                     let default_label = if hangul { "기본값(맑은 고딕)" } else { "기본값(Segoe UI)" };

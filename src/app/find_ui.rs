@@ -52,14 +52,24 @@ impl App {
         } else if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F3)) {
             self.find_step(true);
         }
-        if !self.show_options && !self.show_help && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+        // 한글 조합 중의 Esc는 조합 취소용이므로 찾기 막대를 닫지 않는다.
+        if !self.find.composing && !self.show_options && !self.show_help && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
             self.find_close(ctx, body_id);
         }
+    }
+
+    /// 다른 문서로 옮길 때: 이전 문서의 일치 위치·번호를 버린다(검색어는 유지).
+    pub(super) fn find_reset_for_doc(&mut self) {
+        self.find.sig = 0;
+        self.find.cur = 0;
+        self.find.matches.clear();
+        self.find.jump = false;
     }
 
     fn find_close(&mut self, ctx: &egui::Context, body_id: egui::Id) {
         self.find.open = false;
         self.find.jump = false;
+        self.find.composing = false;
         ctx.memory_mut(|m| m.request_focus(body_id));
     }
 
@@ -152,6 +162,10 @@ impl App {
             if r.lost_focus() && enter && !composing_before && !self.find.composing {
                 step = Some(!shift);
                 r.request_focus();
+            }
+            // 입력칸이 포커스를 잃었으면 조합 상태가 남지 않게 푼다(Esc·Enter가 영영 막히는 것 방지).
+            if !r.has_focus() && !r.lost_focus() {
+                self.find.composing = false;
             }
             let n = self.find.matches.len();
             let label = if self.find.query.is_empty() {

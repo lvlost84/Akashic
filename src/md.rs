@@ -1238,6 +1238,24 @@ pub fn hang_info(text: &str) -> (Vec<Option<usize>>, usize) {
     (out, maxm)
 }
 
+/// 이어지는 행이 밀려나는 폭 중 가장 큰 값(예상 폭과 비교해 줄 폭을 다시 정하는 데 쓴다).
+pub fn max_hang_shift(g: &eframe::egui::Galley, hangs: &[Option<usize>]) -> f32 {
+    let mut para = 0usize;
+    let mut first_of_para = true;
+    let mut best = 0.0f32;
+    for pr in g.rows.iter() {
+        if first_of_para {
+            let s = hangs.get(para).copied().flatten().and_then(|m| pr.row.glyphs.get(m)).map_or(0.0, |gl| gl.pos.x);
+            best = best.max(s);
+        }
+        first_of_para = pr.ends_with_newline;
+        if pr.ends_with_newline {
+            para += 1;
+        }
+    }
+    best
+}
+
 /// 목록 줄이 줄바꿈될 때 다음 행을 글이 시작하는 자리(기호 뒤)에 맞춰 들여쓴다(HTML의 `<li>`처럼).
 /// egui는 첫 행만 들여쓸 수 있어, 배치가 끝난 갤러리의 이어지는 행 위치를 옮긴다(글자 위치·클릭·선택은 같은 갤러리를 쓰므로 맞는다).
 pub fn apply_hang(g: &eframe::egui::Galley, hangs: &[Option<usize>]) -> eframe::egui::Galley {

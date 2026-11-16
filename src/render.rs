@@ -207,8 +207,18 @@ fn table(ui: &egui::Ui, shapes: &mut Vec<Shape>, b: &Block, aligns: &[Align], ro
     let total: f32 = widths.iter().sum();
     if total > avail {
         let k = avail / total;
+        // 열이 아주 많으면 최소 폭 합계가 본문 폭을 넘으므로, 최소 폭도 한 칸 몫(avail/열 수)을 넘지 않게 한다.
+        let min_w = (PAD * 2.0 + 12.0).min(avail / ncols as f32);
         for w in widths.iter_mut() {
-            *w = (*w * k).max(PAD * 2.0 + 12.0);
+            *w = (*w * k).max(min_w);
+        }
+        // 최소 폭 보정으로 합이 다시 넘으면 한 번 더 같은 비율로 줄인다.
+        let sum: f32 = widths.iter().sum();
+        if sum > avail {
+            let k2 = avail / sum;
+            for w in widths.iter_mut() {
+                *w *= k2;
+            }
         }
     }
     let total: f32 = widths.iter().sum();

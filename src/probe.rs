@@ -85,7 +85,12 @@ fn probe_blocking(name: &str, limit: Duration) -> Probe {
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            Err(e) => return Probe::Fail(format!("시험 확인 실패: {e}")),
+            Err(e) => {
+                // 상태를 알 수 없으면 자식 프로세스를 남겨 두지 않는다.
+                let _ = child.kill();
+                let _ = child.wait();
+                return Probe::Fail(format!("시험 확인 실패: {e}"));
+            }
         }
     };
     let st = result.unwrap();

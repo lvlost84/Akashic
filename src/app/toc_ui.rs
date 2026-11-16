@@ -6,7 +6,7 @@ impl App {
         // 제목 목록은 본문이 바뀔 때만 다시 만든다.
         let mut h = DefaultHasher::new();
         self.cur.hash(&mut h);
-        self.body.hash(&mut h);
+        crate::render::cache_key(&self.body).hash(&mut h); // 빠른 해시(매 프레임 호출)
         let sig = h.finish();
         if sig != self.toc_sig {
             self.toc = md::headings(&self.body);
@@ -50,9 +50,9 @@ impl App {
         egui::ScrollArea::vertical().id_salt("toc_scroll").auto_shrink([false, false]).show(ui, |ui| {
             for &i in &shown {
                 let hd = &self.toc[i];
-                let (resp, rect) = Self::row_widget(ui, 24.0, Some(i) == current, &t);
+                let (resp, rect) = Self::row_widget(ui, (crate::theme::ui(0.0) + 12.0).max(24.0), Some(i) == current, &t);
                 let indent = 8.0 + (hd.level - base) as f32 * 14.0;
-                let (size, color) = if hd.level <= 2 { (14.0, t.text) } else { (13.0, t.quote) };
+                let (size, color) = if hd.level <= 2 { (crate::theme::ui(2.0), t.text) } else { (crate::theme::ui(1.0), t.quote) };
                 // 단계를 알려 주는 작은 직각 마커
                 let m = Rect::from_center_size(Pos2::new(rect.left() + indent - 3.0, rect.center().y), Vec2::splat(if hd.level == 1 { 5.0 } else { 3.0 }));
                 ui.painter().rect_filled(m, CornerRadius::ZERO, if Some(i) == current { t.accent } else { t.dim });

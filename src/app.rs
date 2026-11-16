@@ -323,6 +323,8 @@ pub struct App {
     cur_pinned: bool,
     cur_cat: Option<i64>,
     last_edit: Option<Instant>,
+    /// 본문 편집창에서 한글 등 IME 조합 중인지(조합을 끝내는 Enter가 목록 이어쓰기를 일으키지 않게)
+    body_composing: bool,
     back: Vec<i64>,
     fwd: Vec<i64>,
     out_links: Vec<(String, Option<i64>)>,
@@ -410,6 +412,7 @@ impl App {
             cur_pinned: false,
             cur_cat: None,
             last_edit: None,
+            body_composing: false,
             back: vec![],
             fwd: vec![],
             out_links: vec![],
@@ -585,6 +588,7 @@ impl App {
         if !self.flush() {
             return; // 저장하지 못한 채 다른 문서로 가면 편집 내용이 사라진다
         }
+        self.find_reset_for_doc();
         if let Some(old) = self.cur {
             if old != id {
                 let _ = self.db.delete_empty(old); // 쓰다 만 빈 문서 정리
@@ -1032,8 +1036,26 @@ impl App {
             new_cursor = Some((a + 1, b + 1));
             changed = true;
         }
+        // 한글 조합 상태 추적: 조합 중이거나 이번 프레임에 조합이 끝났다면 Enter는 조합 확정용이다.
+        let composing_before = self.body_composing;
+        let mut ime_this_frame = false;
+        ctx.input(|i| {
+            for e in &i.events {
+                if let egui::Event::Ime(ev) = e {
+                    match ev {
+                        egui::ImeEvent::Preedit { text, .. } => self.body_composing = !text.is_empty(),
+                        egui::ImeEvent::Commit(_) => {
+                            self.body_composing = false;
+                            ime_this_frame = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        });
+        let ime_busy = composing_before || self.body_composing || ime_this_frame;
         // Enter: 목록·인용·체크박스 이어쓰기
-        if !changed && a == b && ctx.input(|i| i.key_pressed(Key::Enter) && !i.modifiers.any()) {
+        if !changed && !ime_busy && a == b && ctx.input(|i| i.key_pressed(Key::Enter) && !i.modifiers.any()) {
             let bi = byte_of(&self.body, a);
             let ls = self.body[..bi].rfind('\n').map_or(0, |p| p + 1);
             let le = self.body[bi..].find('\n').map_or(self.body.len(), |p| bi + p);
@@ -1043,8 +1065,10 @@ impl App {
                 match md::continue_list(&line) {
                     Some(md::Enter::Insert(p)) => {
                         ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter));
-                        self.body.insert_str(bi, &format!("\n{p}"));
-                        let c = a + 1 + p.chars().count();
+                        // 줄 끝이 CRLF인 본문이면 CRLF로 이어 줄 바꿈이 섞이지 않게 한다.
+                        let nl = if self.body[bi..].starts_with('\r') { "\r\n" } else { "\n" };
+                        self.body.insert_str(bi, &format!("{nl}{p}"));
+                        let c = a + nl.chars().count() + p.chars().count();
                         new_cursor = Some((c, c));
                         changed = true;
                     }
@@ -1483,6 +1507,14 @@ impl App {
             let reserve = if maxm > 0 { size * (md::LIST_INDENT + 0.6 * maxm as f32) } else { 0.0 };
             let job = md::build(text, cl, size, &t, (w - reserve).max(60.0), hide);
             let mut g = ui.ctx().fonts_mut(|f| f.layout_job(job));
+            if maxm > 0 {
+                // 예상보다 많이 밀려나면(넓은 글자·체크박스) 실제 폭만큼 줄 폭을 줄여 다시 배치한다.
+                let actual = md::max_hang_shift(&g, &hangs);
+                if actual > reserve + 0.5 {
+                    let job = md::build(text, cl, size, &t, (w - actual).max(60.0), hide);
+                    g = ui.ctx().fonts_mut(|f| f.layout_job(job));
+                }
+            }
             if maxm > 0 {
                 g = Arc::new(md::apply_hang(&g, &hangs));
             }
