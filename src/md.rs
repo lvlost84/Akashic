@@ -308,6 +308,49 @@ fn list_marker_len(line: &str) -> Option<usize> {
 
 /// 표 줄(투명 글자)의 글자 크기 배율: 격자 칸의 위아래 여백이 된다.
 pub const TABLE_ROW_MUL: f32 = 1.25;
+
+/// `s`가 `<br>`·`<br/>`·`<br />`(대소문자 무시, 안쪽 공백 허용)로 시작하면 그 태그의 바이트 길이.
+fn br_tag_len(s: &[u8]) -> Option<usize> {
+    if s.len() < 4 || s[0] != b'<' || !s[1].eq_ignore_ascii_case(&b'b') || !s[2].eq_ignore_ascii_case(&b'r') {
+        return None;
+    }
+    let mut j = 3;
+    let skip = |j: &mut usize| {
+        while *j < s.len() && s[*j] == b' ' {
+            *j += 1;
+        }
+    };
+    skip(&mut j);
+    if j < s.len() && s[j] == b'/' {
+        j += 1;
+        skip(&mut j);
+    }
+    (j < s.len() && s[j] == b'>').then_some(j + 1)
+}
+
+/// 표 셀 글을 `<br>` 기준으로 줄별로 나눈다. 줄마다 앞뒤 공백을 다듬고, 맨앞·맨뒤 `<br>`은 빈 줄이 된다.
+pub fn split_br(cell: &str) -> Vec<&str> {
+    let b = cell.as_bytes();
+    let (mut out, mut start, mut i) = (Vec::new(), 0, 0);
+    while i < b.len() {
+        if b[i] == b'<' {
+            if let Some(len) = br_tag_len(&b[i..]) {
+                out.push(cell[start..i].trim());
+                i += len;
+                start = i;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out.push(cell[start..].trim());
+    out
+}
+
+/// 표 한 행이 차지하는 줄 수(셀 중 `<br>`로 나뉜 줄이 가장 많은 것). 항상 1 이상.
+pub fn row_lines(row: &[String]) -> usize {
+    row.iter().map(|c| split_br(c).len()).max().unwrap_or(1).max(1)
+}
 /// 제목 줄 높이(글자 크기 대비): 제목과 바로 뒤 본문·목록 사이에 숨 쉴 여백을 둔다.
 pub const HEADING_LINE: f32 = 1.55;
 
@@ -668,7 +711,7 @@ pub fn build(text: &str, cursor_line: Option<usize>, size: f32, t: &Theme, wrap:
                 push(&mut job, line, &St { code: true, block: hide_syntax, ..plain }, &cx);
                 nl_fmt = Some(fmt(&St { code: true, block: hide_syntax, ..plain }, false, &cx));
             }
-        } else if let Some(Block { kind: BlockKind::Table { .. }, start, .. }) = blk {
+        } else if let Some(Block { kind: BlockKind::Table { rows, .. }, start, .. }) = blk {
             if collapsed {
                 // 격자는 render.rs가 그린다. 글자는 투명하게 두되 줄 높이는 유지한다.
                 if n == start + 1 {
@@ -679,6 +722,12 @@ pub fn build(text: &str, cursor_line: Option<usize>, size: f32, t: &Theme, wrap:
                     let mut f = fmt(&St { code: true, block: true, ..plain }, false, &cx);
                     f.font_id = FontId::new(size * TABLE_ROW_MUL, FontFamily::Monospace);
                     f.color = Color32::TRANSPARENT;
+                    // 셀에 <br>이 있으면 그 줄 수만큼 행을 키운다(머리글은 n == start, 본문은 n - start - 1번째 행).
+                    let r = if n == *start { 0 } else { n - start - 1 };
+                    let k = rows.get(r).map_or(1, |row| row_lines(row));
+                    if k > 1 {
+                        f.line_height = Some(size * TABLE_ROW_MUL * 1.2 + (k - 1) as f32 * size * 1.3);
+                    }
                     job.append(line, 0.0, f.clone());
                     nl_fmt = Some(f);
                 }
@@ -1056,6 +1105,52 @@ mod tests {
         let (w, _) = image_display_size(800, 600, 400.0);
         assert_eq!(800.0 * image_row_scale(&[(800, 600)], 400.0), w);
         assert!(image_row_scale(&[(800, 600), (800, 600)], 0.0) > 0.0);
+    }
+
+    #[test]
+    fn split_br_variants() {
+        assert_eq!(split_br("a<br>b"), vec!["a", "b"]);
+        assert_eq!(split_br("a<BR/>b<br />c<Br  / >d"), vec!["a", "b", "c", "d"]);
+        assert_eq!(split_br(" a <br> b "), vec!["a", "b"]); // 앞뒤 공백은 줄마다 다듬는다
+        assert_eq!(split_br("<br>x"), vec!["", "x"]);
+        assert_eq!(split_br("x<br>"), vec!["x", ""]);
+        assert_eq!(split_br("한글<br>둘째 줄<br>셋"), vec!["한글", "둘째 줄", "셋"]);
+        // <br>이 아닌 것은 나누지 않는다
+        for s in ["<b>굵게</b>", "<brx>", "a < br > b", "<br", "plain", ""] {
+            assert_eq!(split_br(s), vec![s.trim()], "{s}");
+        }
+    }
+
+    #[test]
+    fn row_lines_is_max_over_cells() {
+        let row = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(row_lines(&row(&["a", "b"])), 1);
+        assert_eq!(row_lines(&row(&["a<br>b", "x<br>y<br>z"])), 3);
+        assert_eq!(row_lines(&[]), 1);
+    }
+
+    #[test]
+    fn table_row_with_br_is_taller_when_collapsed() {
+        let t = &themes()[0];
+        let text = "| a | b |\n|---|---|\n| 1<br>2<br>3 | x |\n| y | z |\n";
+        let job = build(text, None, 15.0, t, 600.0, true);
+        let lh = |needle: &str| job.sections.iter().find(|s| job.text[s.byte_range.start.0..s.byte_range.end.0].contains(needle)).unwrap().format.line_height;
+        let tall = lh("1<br>2<br>3").expect("<br>이 있는 행은 줄 높이를 직접 정한다");
+        let normal = lh("| y | z |");
+        assert!(normal.map_or(true, |n| tall > n), "{tall} {normal:?}");
+        let two = lh("| a | b |"); // 머리글 행(<br> 없음)
+        assert!(two.map_or(true, |n| n < tall));
+        // 커서가 표 안에 있으면(원문 편집) 높이를 키우지 않는다
+        let job = build(text, Some(2), 15.0, t, 600.0, true);
+        let s = job.sections.iter().find(|s| job.text[s.byte_range.start.0..s.byte_range.end.0].contains("1<br>2<br>3")).unwrap();
+        assert!(s.format.line_height.map_or(true, |v| v < tall));
+    }
+
+    #[test]
+    fn table_br_text_is_preserved() {
+        let doc = "| a | b |\n|---|---|\n| 1<br>2 | x<BR/>y |\r\n| 3 | 4 |";
+        same(doc, None);
+        same(doc, Some(2));
     }
 
     #[test]

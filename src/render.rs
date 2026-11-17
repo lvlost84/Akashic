@@ -241,8 +241,11 @@ fn table(ui: &egui::Ui, shapes: &mut Vec<Shape>, b: &Block, aligns: &[Align], ro
     let mut widths = vec![PAD * 2.0; ncols];
     for (r, row) in rows.iter().enumerate() {
         for (c, cell) in row.iter().enumerate().take(ncols) {
-            let w = ui.ctx().fonts_mut(|f| f.layout_no_wrap(cell.clone(), font(r), t.text)).size().x;
-            widths[c] = widths[c].max(w + PAD * 2.0);
+            // 셀 안에 <br>이 있으면 줄마다 따로 재고 가장 넓은 줄을 기준으로 한다.
+            for piece in md::split_br(cell) {
+                let w = ui.ctx().fonts_mut(|f| f.layout_no_wrap(piece.to_string(), font(r), t.text)).size().x;
+                widths[c] = widths[c].max(w + PAD * 2.0);
+            }
         }
     }
     let avail = (right - left - 2.0).max(40.0);
@@ -300,16 +303,22 @@ fn table(ui: &egui::Ui, shapes: &mut Vec<Shape>, b: &Block, aligns: &[Align], ro
                 continue;
             }
             let color = t.text;
-            let g = fit(ui, cell, &font(r), color, widths[c] - PAD * 2.0);
-            let w = g.size().x;
             let inner = widths[c] - PAD * 2.0;
-            let dx = match aligns[c] {
-                Align::Left => 0.0,
-                Align::Center => (inner - w) / 2.0,
-                Align::Right => inner - w,
-            };
-            let p = pos2(xs[c] + PAD + dx.max(0.0), (ya + yb) / 2.0 - g.size().y / 2.0);
-            shapes.push(Shape::galley(p, g, color));
+            // <br>로 나뉜 줄들을 위아래로 쌓아 셀 한가운데에 놓는다(<br>이 없으면 한 줄).
+            let gs: Vec<Arc<Galley>> = md::split_br(cell).into_iter().map(|piece| fit(ui, piece, &font(r), color, inner)).collect();
+            let total_h: f32 = gs.iter().map(|g| g.size().y).sum();
+            let mut y = (ya + yb) / 2.0 - total_h / 2.0;
+            for g in gs {
+                let w = g.size().x;
+                let dx = match aligns[c] {
+                    Align::Left => 0.0,
+                    Align::Center => (inner - w) / 2.0,
+                    Align::Right => inner - w,
+                };
+                let h = g.size().y;
+                shapes.push(Shape::galley(pos2(xs[c] + PAD + dx.max(0.0), y), g, color));
+                y += h;
+            }
         }
     }
 }

@@ -32,14 +32,12 @@ pub struct GraphSettings {
     /// 마우스를 올린 노드의 이웃만 강조하고 나머지는 흐리게
     pub highlight: bool,
     pub color_by_category: bool,
-    /// 노드 모양: 0 = 모두 사각형, 1 = 연결 수별, 2 = 분류별
-    pub shape_mode: u8,
+    /// 입체 효과 세기(0 = 끔, 1 = 최대). 마우스에 따라 시차·기울임 원근으로 입체처럼 보이게 한다(그리기만 바뀜).
+    pub depth_fx: f32,
     /// 배치: 0 = 자유(물리), 1 원형, 2 방사형, 3 계층형, 4 별자리, 5 해바라기
     pub layout: u8,
     /// 잔잔한 움직임 세기(0 = 정지). 노드가 천천히 떠다니며 영감을 준다.
     pub motion: f32,
-    /// 연결 수별 모양에서 '허브'(마름모)로 치는 최소 연결 수
-    pub hub_links: u32,
     // ── 힘(바꾸면 다시 흔들어 자리 잡음) ──
     pub center_force: f32,
     pub repel_force: f32,
@@ -63,10 +61,9 @@ impl Default for GraphSettings {
             label_zoom: 0.6,
             highlight: true,
             color_by_category: false,
-            shape_mode: 1,
+            depth_fx: 0.6,
             layout: 0,
             motion: 1.0,
-            hub_links: 4,
             center_force: 1.0,
             repel_force: 1.0,
             link_force: 1.0,
@@ -141,6 +138,8 @@ pub struct Graph {
     lbl_key: Option<(u32, u32, u32, usize, u32, bool, Option<usize>, u32)>,
     lbl_vis: Vec<bool>,
     lbl_next: f64,
+    /// 부드럽게 따라가는 마우스 위치(각 축 -1..1, 입체 효과용)
+    ptr: Vec2,
 }
 
 const MAX_NODES: usize = 500;
@@ -168,6 +167,62 @@ pub fn cat_color(cat: Option<i64>, t: &Theme) -> Color32 {
         None => t.dim,
         Some(c) => hsv((c as f32 * 0.618_034).fract(), 0.6, if t.dark { 0.92 } else { 0.72 }),
     }
+}
+
+/// 입체 효과 상수(그리기에만 쓰인다).
+const Z_UNIT: f32 = 120.0;
+const PERSP_D: f32 = 900.0;
+const TILT_DEG: f32 = 12.0;
+const PARALLAX_PX: f32 = 14.0;
+const FOLLOW: f32 = 0.12;
+
+/// 깊이 z ∈ [-1, 1]: 연결이 많을수록 앞(+1). 중심 노드는 항상 +1. 연결 있는 노드가 없으면 0.
+pub fn depth_of(deg: usize, max_deg: usize, is_center: bool) -> f32 {
+    if is_center {
+        return 1.0;
+    }
+    if max_deg == 0 {
+        return 0.0;
+    }
+    (2.0 * (deg as f32 / max_deg as f32).min(1.0).sqrt() - 1.0).clamp(-1.0, 1.0)
+}
+
+/// 노드 반지름(화면 픽셀, 투영 배율 적용 전). 연결 수에 따라 최대 5배까지 커진다.
+pub fn node_radius(deg: usize, node_size: f32, size_by_links: bool, is_center: bool) -> f32 {
+    let by = if size_by_links { (1.0 + 0.6 * (deg as f32).sqrt()).min(5.0) } else { 1.0 };
+    let c = if is_center { 1.3 } else { 1.0 };
+    (4.5 * node_size * by * c).max(2.0)
+}
+
+/// 월드 위치 `p`·깊이 `z`를 마우스 위치 `ptr`(각 축 -1..1)에 따라 기울여 원근 투영한다 → (투영된 위치, 크기 배율).
+/// `fx`가 0이면 그대로 `(p, 1.0)`.
+pub fn project(p: Vec2, z: f32, ptr: Vec2, fx: f32) -> (Vec2, f32) {
+    if fx <= 0.0 {
+        return (p, 1.0);
+    }
+    let zz = z * Z_UNIT;
+    let (sx, cx) = (ptr.y * TILT_DEG.to_radians() * fx).sin_cos();
+    let (y1, z1) = (p.y * cx - zz * sx, p.y * sx + zz * cx);
+    let (sy, cy) = (-ptr.x * TILT_DEG.to_radians() * fx).sin_cos();
+    let (x2, z2) = (p.x * cy + z1 * sy, -p.x * sy + z1 * cy);
+    let k = PERSP_D / (PERSP_D - z2).max(PERSP_D * 0.3);
+    (Vec2::new(x2 * k, y1 * k), k)
+}
+
+/// 시차: 마우스 반대 방향으로 화면 픽셀만큼 밀린다. 앞(z↑) 점이 더 많이 움직인다.
+pub fn parallax(z: f32, ptr: Vec2, fx: f32) -> Vec2 {
+    if fx <= 0.0 {
+        return Vec2::ZERO;
+    }
+    -ptr * (PARALLAX_PX * fx * ((z + 1.6) / 2.6))
+}
+
+/// 원을 흉내 낸 16각형 꼭짓점(점선 원용).
+fn circle_pts(c: Pos2, r: f32) -> Vec<Pos2> {
+    (0..16).map(|i| {
+        let a = i as f32 * std::f32::consts::TAU / 16.0;
+        Pos2::new(c.x + r * a.cos(), c.y + r * a.sin())
+    }).collect()
 }
 
 impl Graph {
@@ -309,7 +364,7 @@ impl Graph {
             None => (1.0, Vec2::ZERO, 0),
         };
         // 배치 종류를 이어받아, 재빌드 때 고정(끌어 놓은) 노드가 풀리지 않게 한다.
-        let mut g = Graph { nodes, edges, pedges: vec![], adj: vec![], center, zoom, pan, steps, drag: None, want_fit: false, forces: s.forces(), targets: vec![], wob: vec![], lay_key: (old.map_or(0, |g| g.lay_key.0), 0, 0, None), lbl_slot: vec![], lbl_off: vec![], lbl_alpha: vec![], lbl_ta: vec![], lbl_key: None, lbl_vis: vec![], lbl_next: 0.0 };
+        let mut g = Graph { nodes, edges, pedges: vec![], adj: vec![], center, zoom, pan, steps, drag: None, want_fit: false, forces: s.forces(), targets: vec![], wob: vec![], lay_key: (old.map_or(0, |g| g.lay_key.0), 0, 0, None), lbl_slot: vec![], lbl_off: vec![], lbl_alpha: vec![], lbl_ta: vec![], lbl_key: None, lbl_vis: vec![], lbl_next: 0.0, ptr: Vec2::ZERO };
         g.rebuild_derived();
         g
     }
@@ -448,11 +503,21 @@ impl Graph {
     }
 
     fn radius(&self, i: usize, s: &GraphSettings) -> f32 {
-        let n = &self.nodes[i];
-        let base = 4.5 * s.node_size;
-        let by = if s.size_by_links { (1.0 + 0.35 * (n.deg as f32).sqrt()).min(3.2) } else { 1.0 };
-        let c = if Some(i) == self.center { 1.3 } else { 1.0 };
-        (base * by * c).max(2.0)
+        node_radius(self.nodes[i].deg, s.node_size, s.size_by_links, Some(i) == self.center)
+    }
+
+    /// 노드마다 (화면 위치, 크기 배율, 깊이). 그리기·강조·클릭 판정·글자 위치가 모두 이 값을 쓴다.
+    fn projected(&self, center: Pos2, fx: f32) -> Vec<(Pos2, f32, f32)> {
+        let maxd = self.nodes.iter().map(|n| n.deg).max().unwrap_or(0);
+        let o = center + self.pan;
+        (0..self.nodes.len())
+            .map(|i| {
+                let z = depth_of(self.nodes[i].deg, maxd, Some(i) == self.center);
+                let (q, k) = project(self.dpos(i), z, self.ptr, fx);
+                let sh = parallax(z, self.ptr, fx);
+                (Pos2::new(o.x + q.x * self.zoom + sh.x, o.y + q.y * self.zoom + sh.y), k, z)
+            })
+            .collect()
     }
 
     fn fit(&mut self, size: Vec2) {
@@ -510,15 +575,7 @@ impl Graph {
         ui.add(egui::Slider::new(&mut s.node_size, 0.5..=3.0).text("노드 크기"));
         ui.checkbox(&mut s.size_by_links, "연결이 많을수록 크게");
         ui.checkbox(&mut s.color_by_category, "분류별로 색 구분");
-        ui.horizontal(|ui| {
-            ui.label("노드 모양");
-            for (m, name) in [(0u8, "■ 모두 같게"), (1, "▲■◆ 연결 수별"), (2, "분류별")] {
-                ui.selectable_value(&mut s.shape_mode, m, name);
-            }
-        });
-        if s.shape_mode == 1 {
-            ui.add(egui::Slider::new(&mut s.hub_links, 2..=12).text("허브(◆) 기준 연결 수"));
-        }
+        ui.add(egui::Slider::new(&mut s.depth_fx, 0.0..=1.0).text("입체 효과 (0=끔)"));
         ui.add(egui::Slider::new(&mut s.link_width, 0.5..=4.0).text("선 굵기"));
         ui.add(egui::Slider::new(&mut s.label_size, 9.0..=22.0).text("글자 크기"));
         ui.add(egui::Slider::new(&mut s.label_zoom, 0.3..=2.0).text("글자 표시 확대 기준"));
@@ -648,19 +705,33 @@ impl Graph {
             self.fit(size);
         }
 
+        // 입체 효과: 마우스 위치를 부드럽게 따라가고, 수렴하면 다시 그리기를 멈춘다.
+        let fx = s.depth_fx.clamp(0.0, 1.0);
+        let tgt = if fx > 0.0 && !resp.context_menu_opened() {
+            resp.hover_pos().map_or(Vec2::ZERO, |p| Vec2::new((p.x - rect.center().x) / (rect.width() / 2.0).max(1.0), (p.y - rect.center().y) / (rect.height() / 2.0).max(1.0)).clamp(Vec2::splat(-1.0), Vec2::splat(1.0)))
+        } else {
+            Vec2::ZERO
+        };
+        self.ptr += (tgt - self.ptr) * FOLLOW;
+        if (tgt - self.ptr).length() < 0.002 {
+            self.ptr = tgt;
+        } else {
+            ui.ctx().request_repaint();
+        }
+
         let origin = |g: &Graph| rect.center() + g.pan;
         let to_screen = |g: &Graph, p: Vec2| {
             let o = origin(g);
             Pos2::new(o.x + p.x * g.zoom, o.y + p.y * g.zoom)
         };
-        let hit = |g: &Graph, p: Pos2| -> Option<usize> {
-            g.nodes
-                .iter()
+        let hit = |g: &Graph, pr: &[(Pos2, f32, f32)], p: Pos2| -> Option<usize> {
+            pr.iter()
                 .enumerate()
-                .filter(|(i, _)| (to_screen(g, g.dpos(*i)) - p).length() <= g.radius(*i, s).max(6.0) + 4.0)
-                .min_by(|a, b| (to_screen(g, g.dpos(a.0)) - p).length().total_cmp(&(to_screen(g, g.dpos(b.0)) - p).length()))
+                .filter(|(i, (q, k, _))| (*q - p).length() <= (g.radius(*i, s) * *k).max(6.0) + 4.0)
+                .min_by(|a, b| (a.1.0 - p).length().total_cmp(&(b.1.0 - p).length()))
                 .map(|(i, _)| i)
         };
+        let proj = self.projected(rect.center(), fx);
 
         // 확대/축소
         if resp.hovered() {
@@ -671,7 +742,7 @@ impl Graph {
         }
         // 끌기: 노드는 자리 고정, 빈 곳은 이동
         if resp.drag_started_by(egui::PointerButton::Primary) && !menu_was_open {
-            self.drag = resp.interact_pointer_pos().and_then(|p| hit(self, p));
+            self.drag = resp.interact_pointer_pos().and_then(|p| hit(self, &proj, p));
         }
         if resp.dragged_by(egui::PointerButton::Primary) {
             let d = resp.drag_delta();
@@ -691,7 +762,10 @@ impl Graph {
             self.drag = None;
         }
 
-        let hover = if resp.context_menu_opened() { None } else { resp.hover_pos().and_then(|p| hit(self, p)) };
+        // 끌어서 노드가 움직였을 수 있으니 투영을 다시 계산한다(한 프레임 늦게 따라오지 않게).
+        let proj = self.projected(rect.center(), fx);
+        let zfade = |i: usize| 1.0 - 0.25 * fx * (-proj[i].2).max(0.0);
+        let hover = if resp.context_menu_opened() { None } else { resp.hover_pos().and_then(|p| hit(self, &proj, p)) };
         let n = self.nodes.len();
         // 강조/흐림 대상 계산
         let mut near: Option<Vec<bool>> = None;
@@ -713,11 +787,12 @@ impl Graph {
         // 선
         let lw = s.link_width;
         for (a, b) in &self.edges {
-            let (pa, pb) = (to_screen(self, self.dpos(*a)), to_screen(self, self.dpos(*b)));
+            let (pa, pb) = (proj[*a].0, proj[*b].0);
             let touch_c = Some(*a) == self.center || Some(*b) == self.center;
             let touch_h = hover.map_or(false, |h| h == *a || h == *b);
             let fade = faded(*a) || faded(*b);
             let col = if touch_h || (touch_c && near.is_none()) { t.accent } else { dim_c(t.border, fade) };
+            let col = col.gamma_multiply((zfade(*a) + zfade(*b)) / 2.0);
             let w = if touch_h || touch_c { lw * 1.4 } else { lw };
             painter.line_segment([pa, pb], Stroke::new(w, col));
             if s.arrows {
@@ -725,7 +800,7 @@ impl Graph {
                 let len = d.length();
                 if len > 1.0 {
                     let dir = d / len;
-                    let tip = pb - dir * (self.radius(*b, s) + 2.0);
+                    let tip = pb - dir * (self.radius(*b, s) * proj[*b].1 + 2.0);
                     let sz = 5.0 + lw * 1.5;
                     let perp = Vec2::new(-dir.y, dir.x);
                     let pts = vec![tip, tip - dir * sz + perp * sz * 0.5, tip - dir * sz - perp * sz * 0.5];
@@ -752,7 +827,7 @@ impl Graph {
         let mut vis_list: Vec<(usize, std::sync::Arc<egui::Galley>)> = Vec::new();
         let mut vis_flags = vec![false; n];
         for i in order {
-            let p = to_screen(self, self.dpos(i));
+            let p = proj[i].0;
             if !rect.expand(20.0).contains(p) {
                 continue;
             }
@@ -770,7 +845,7 @@ impl Graph {
             // 아직 없는 문서(점선 점)는 이름을 흐리게 하고 "(없음)"을 붙여 만들어진 문서와 한눈에 구분한다.
             let missing = self.nodes[i].id.is_none();
             let base = if is_c { t.text } else if missing { t.dim } else { t.quote };
-            let col = dim_c(base, faded(i)).gamma_multiply(self.lbl_alpha[i]);
+            let col = dim_c(base, faded(i)).gamma_multiply(self.lbl_alpha[i] * zfade(i));
             vis_flags[i] = true;
             let shown = if missing { format!("{} (없음)", self.nodes[i].title) } else { self.nodes[i].title.clone() };
             vis_list.push((i, painter.layout_no_wrap(shown, font.clone(), col)));
@@ -821,19 +896,23 @@ impl Graph {
             if self.lbl_alpha[i] <= 0.01 {
                 continue;
             }
-            let p = to_screen(self, self.dpos(i));
-            let pos = snap(Pos2::new(p.x - g.size().x / 2.0, p.y + self.radius(i, s) + 3.0 + self.lbl_off[i] * g.size().y));
+            let p = proj[i].0;
+            let pos = snap(Pos2::new(p.x - g.size().x / 2.0, p.y + self.radius(i, s) * proj[i].1 + 3.0 + self.lbl_off[i] * g.size().y));
             painter.galley(pos, g, Color32::WHITE);
         }
         if animating {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
         }
-        // 노드(직각)
-        for (i, nd) in self.nodes.iter().enumerate() {
-            let p = to_screen(self, self.dpos(i));
+        // 노드(구슬 모양 원). 입체 효과가 켜져 있으면 뒤(깊이 낮은) 노드부터 그려 앞 노드가 위에 겹친다.
+        let mut ord: Vec<usize> = (0..n).collect();
+        if fx > 0.0 {
+            ord.sort_by(|a, b| proj[*a].2.total_cmp(&proj[*b].2));
+        }
+        for i in ord {
+            let nd = &self.nodes[i];
+            let p = proj[i].0;
             let is_c = Some(i) == self.center;
-            let half = self.radius(i, s) + if hover == Some(i) { 1.5 } else { 0.0 };
-            let r = Rect::from_center_size(p, Vec2::splat(half * 2.0));
+            let half = self.radius(i, s) * proj[i].1 + if hover == Some(i) { 1.5 } else { 0.0 };
             let fade = faded(i);
             let fill = if is_c {
                 t.accent
@@ -842,35 +921,24 @@ impl Graph {
             } else {
                 t.dim
             };
-            let kind = shape_of(nd, s);
             let h = half;
+            let zf = zfade(i);
             if nd.id.is_none() {
-                painter.add(egui::Shape::convex_polygon(shape_pts(kind, p, h), t.bg, Stroke::NONE));
-                dashed_poly(&painter, &shape_pts(kind, p, h), Stroke::new(1.5, dim_c(t.dim, fade)));
+                painter.circle_filled(p, h, t.bg);
+                dashed_poly(&painter, &circle_pts(p, h), Stroke::new(1.5, dim_c(t.dim, fade).gamma_multiply(zf)));
             } else {
-                painter.add(egui::Shape::convex_polygon(shape_pts(kind, p, h), dim_c(fill, fade), Stroke::NONE));
+                painter.circle_filled(p, h, dim_c(fill, fade).gamma_multiply(zf));
+                if fx > 0.0 {
+                    // 구슬의 반짝이는 하이라이트(왼쪽 위)
+                    let a = (90.0 * fx * zf * if fade { 0.28 } else { 1.0 }) as u8;
+                    painter.circle_filled(p + Vec2::new(-0.32, -0.32) * h, h * 0.4, Color32::from_white_alpha(a));
+                }
                 if nd.fixed {
-                    painter.add(egui::Shape::closed_line(shape_pts(kind, p, h + 2.0), Stroke::new(1.0, dim_c(t.accent, fade))));
+                    painter.circle_stroke(p, h + 2.0, Stroke::new(1.0, dim_c(t.accent, fade)));
                 }
             }
-            let _ = r;
             if matched.as_ref().map_or(false, |v| v[i]) {
-                painter.add(egui::Shape::closed_line(shape_pts(kind, p, h + 3.0), Stroke::new(1.5, t.accent)));
-            }
-        }
-        if s.shape_mode != 0 {
-            // 범례(오른쪽 위): 모양이 무엇을 뜻하는지
-            let items: Vec<(u8, String)> = if s.shape_mode == 1 {
-                vec![(2, "연결 0~1".into()), (0, "보통".into()), (1, format!("허브 {}+", s.hub_links))]
-            } else {
-                vec![(0, "분류 그룹1·미분류".into()), (1, "분류 그룹2".into()), (2, "분류 그룹3".into())]
-            };
-            let mut y = rect.top() + 10.0;
-            for (k, label) in items {
-                let c = Pos2::new(rect.right() - 62.0, y);
-                painter.add(egui::Shape::convex_polygon(shape_pts(k, c, 4.0), t.dim, Stroke::NONE));
-                painter.text(Pos2::new(rect.right() - 52.0, y), Align2::LEFT_CENTER, label, FontId::proportional(crate::theme::ui(-1.0)), t.dim);
-                y += 15.0;
+                painter.circle_stroke(p, h + 3.0, Stroke::new(1.5, t.accent));
             }
         }
 
@@ -883,7 +951,7 @@ impl Graph {
         painter.text(Pos2::new(rect.right() - 6.0, rect.bottom() - 4.0), Align2::RIGHT_BOTTOM, "우클릭: 설정", FontId::proportional(crate::theme::ui(-1.0)), t.dim);
 
         if resp.clicked_by(egui::PointerButton::Primary) && !menu_was_open {
-            if let Some(i) = resp.interact_pointer_pos().and_then(|p| hit(self, p)) {
+            if let Some(i) = resp.interact_pointer_pos().and_then(|p| hit(self, &proj, p)) {
                 let nd = &self.nodes[i];
                 out.act = Some(match nd.id {
                     Some(id) => GraphAct::Open(id),
@@ -895,38 +963,6 @@ impl Graph {
         out.changed = *s != before;
         out.rebuild = s.build_key() != before.build_key();
         out
-    }
-}
-
-/// 노드 모양 번호(0 = ■ 사각형, 1 = ◆ 마름모, 2 = ▲ 삼각형).
-pub fn shape_of(n: &Node, s: &GraphSettings) -> u8 {
-    match s.shape_mode {
-        1 => {
-            if n.deg <= 1 {
-                2
-            } else if n.deg as u32 >= s.hub_links.max(2) {
-                1
-            } else {
-                0
-            }
-        }
-        2 => (n.cat.unwrap_or(0).rem_euclid(3)) as u8,
-        _ => 0,
-    }
-}
-
-/// 모양의 꼭짓점(면적이 비슷해 보이도록 보정).
-pub fn shape_pts(kind: u8, c: Pos2, h: f32) -> Vec<Pos2> {
-    match kind {
-        1 => {
-            let d = h * 1.3;
-            vec![Pos2::new(c.x, c.y - d), Pos2::new(c.x + d, c.y), Pos2::new(c.x, c.y + d), Pos2::new(c.x - d, c.y)]
-        }
-        2 => {
-            let d = h * 1.25;
-            vec![Pos2::new(c.x, c.y - d), Pos2::new(c.x + d, c.y + d * 0.8), Pos2::new(c.x - d, c.y + d * 0.8)]
-        }
-        _ => vec![Pos2::new(c.x - h, c.y - h), Pos2::new(c.x + h, c.y - h), Pos2::new(c.x + h, c.y + h), Pos2::new(c.x - h, c.y + h)],
     }
 }
 
@@ -1114,23 +1150,60 @@ mod tests {
 }
 
 #[cfg(test)]
-mod shape_tests {
+mod depth_tests {
     use super::*;
 
     #[test]
-    fn shapes_by_links_and_category() {
-        let mut s = GraphSettings::default();
-        let g = Graph::build(&[(1, "A".into(), "[[B]] [[C]] [[D]] [[E]]".into()), (2, "B".into(), "".into()), (3, "C".into(), "".into()), (4, "D".into(), "".into()), (5, "E".into(), "".into())], &HashMap::new(), Some(1), None, &s);
-        let a = g.nodes.iter().find(|n| n.key == "a").unwrap();
-        let b = g.nodes.iter().find(|n| n.key == "b").unwrap();
-        assert_eq!(shape_of(a, &s), 1, "연결 4개 이상 = 마름모");
-        assert_eq!(shape_of(b, &s), 2, "연결 1개 = 삼각형");
-        s.shape_mode = 0;
-        assert_eq!(shape_of(a, &s), 0);
-        s.shape_mode = 2;
-        assert!(shape_of(a, &s) < 3);
-        for k in 0..3 {
-            assert!(shape_pts(k, Pos2::ZERO, 5.0).len() >= 3);
+    fn depth_of_range_and_center() {
+        assert_eq!(depth_of(0, 0, false), 0.0); // 연결 있는 노드가 없어도 NaN이 아니다
+        assert_eq!(depth_of(0, 10, false), -1.0);
+        assert_eq!(depth_of(10, 10, false), 1.0);
+        assert_eq!(depth_of(0, 10, true), 1.0);
+        for d in 0..=40 {
+            let z = depth_of(d, 40, false);
+            assert!(z.is_finite() && (-1.0..=1.0).contains(&z), "{d} {z}");
         }
+    }
+
+    #[test]
+    fn node_radius_grows_with_links_and_caps() {
+        assert!((node_radius(0, 1.0, true, false) - 4.5).abs() < 1e-4);
+        assert!((node_radius(4, 1.0, true, false) - 9.9).abs() < 0.1);
+        assert!((node_radius(25, 1.0, true, false) - 18.0).abs() < 1e-3);
+        assert!((node_radius(10_000, 1.0, true, false) - 22.5).abs() < 1e-3); // 상한 5배
+        assert_eq!(node_radius(50, 1.0, false, false), node_radius(0, 1.0, false, false));
+        assert!((node_radius(0, 1.0, true, true) - 4.5 * 1.3).abs() < 1e-4);
+        assert!(node_radius(0, 0.0, true, false) >= 2.0);
+    }
+
+    #[test]
+    fn project_identity_when_fx_zero() {
+        for (p, z, ptr) in [(Vec2::new(40.0, -25.0), 0.7, Vec2::new(0.9, -0.4)), (Vec2::ZERO, -1.0, Vec2::new(1.0, 1.0))] {
+            assert_eq!(project(p, z, ptr, 0.0), (p, 1.0));
+            assert_eq!(parallax(z, ptr, 0.0), Vec2::ZERO);
+        }
+    }
+
+    #[test]
+    fn project_near_is_bigger_and_finite() {
+        let ptr = Vec2::new(1.0, 1.0);
+        let (_, near) = project(Vec2::new(100.0, 80.0), 1.0, ptr, 1.0);
+        let (_, far) = project(Vec2::new(100.0, 80.0), -1.0, ptr, 1.0);
+        assert!(near > far, "{near} {far}");
+        for z in [-1.0, 0.0, 1.0] {
+            for p in [Vec2::new(5000.0, 5000.0), Vec2::new(-5000.0, 5000.0)] {
+                let (q, k) = project(p, z, ptr, 1.0);
+                assert!(q.x.is_finite() && q.y.is_finite() && k.is_finite() && k > 0.0, "{q:?} {k}");
+            }
+        }
+        // 앞 점이 뒤 점보다 더 많이 밀린다
+        assert!(parallax(1.0, ptr, 1.0).length() > parallax(-1.0, ptr, 1.0).length());
+    }
+
+    #[test]
+    fn settings_drop_old_shape_fields() {
+        let s: GraphSettings = serde_json::from_str(r#"{"shape_mode":2,"hub_links":7,"depth":2}"#).unwrap();
+        assert_eq!(s.depth, 2);
+        assert_eq!(s.depth_fx, 0.6);
     }
 }
