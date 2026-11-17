@@ -1,6 +1,7 @@
 //! 표·코드 블록·가로줄을 편집창 뒤에 진짜 박스/격자로 그린다.
 //! 편집창의 글자는 원문 그대로이고(투명 처리), 여기서는 그 줄들의 위치에 맞춰 그림만 만든다.
 use crate::img::Tex;
+use crate::math;
 use crate::md::{self, Align, Block, BlockKind};
 use crate::theme::Theme;
 use eframe::egui::{self, Color32, CornerRadius, FontFamily, FontId, Galley, Pos2, Rect, Shape, Stroke, StrokeKind, pos2};
@@ -182,6 +183,33 @@ pub fn paint(ui: &egui::Ui, blocks: &[Block], galley: &Galley, galley_origin: Po
                     continue;
                 }
                 table(ui, &mut shapes, b, aligns, rows, &spans, galley_origin, left, right, t, size, &px);
+            }
+            BlockKind::Math { node } => {
+                if inside {
+                    continue; // 커서가 있는 줄은 원문을 보여 준다
+                }
+                let font = |sc: f32| FontId::new(size * sc, FontFamily::Proportional);
+                let mut measure = |s: &str, sc: f32| ui.ctx().fonts_mut(|f| f.layout_no_wrap(s.to_string(), font(sc), t.text)).size().x / size;
+                let lay = math::layout(node, &mut measure);
+                // 본문 폭보다 넓으면 통째로 줄여 맞춘다(높이는 그대로 두고 가운데에 놓는다).
+                let k = ((right - left - 16.0).max(40.0) / (lay.w * size).max(1.0)).min(1.0);
+                let total_h = (lay.asc + lay.desc) * size * k;
+                let x0 = (text_rect.left() + text_rect.right()) / 2.0 - lay.w * size * k / 2.0;
+                let base_y = (top + bottom) / 2.0 - total_h / 2.0 + lay.asc * size * k;
+                for it in &lay.items {
+                    match it {
+                        math::Item::Glyph { x, y, text, scale } => {
+                            let g = ui.ctx().fonts_mut(|f| f.layout_no_wrap(text.clone(), FontId::new(size * scale * k, FontFamily::Proportional), t.text));
+                            // 글자의 기준선이 galley 안에서 어디인지(첫 글자의 y)를 빼서 기준선에 맞춘다.
+                            let base = g.rows.first().and_then(|r| r.glyphs.first().map(|gl| r.pos.y + gl.pos.y)).unwrap_or(g.size().y * 0.8);
+                            shapes.push(Shape::galley(pos2(px(x0 + x * size * k), px(base_y + y * size * k - base)), g, t.text));
+                        }
+                        math::Item::Line { a, b } => {
+                            let p = |q: &(f32, f32)| pos2(x0 + q.0 * size * k, base_y + q.1 * size * k);
+                            shapes.push(Shape::line_segment([p(a), p(b)], Stroke::new((math::RULE * size * k).max(1.0), t.text)));
+                        }
+                    }
+                }
             }
             BlockKind::Image { items } => {
                 if inside {

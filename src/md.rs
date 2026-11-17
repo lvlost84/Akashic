@@ -397,7 +397,12 @@ pub enum BlockKind {
     Check { done: bool, col: usize },
     /// 이미지 줄(`![대체글](img:해시 가로x세로)`만 한 개 이상 있는 줄). 그림은 render.rs가 그린다.
     Image { items: Vec<ImageRef> },
+    /// 수식 줄(`$$수식$$`만 있는 줄). 그림은 render.rs가 그린다.
+    Math { node: crate::math::Node },
 }
+
+/// 수식 줄의 위아래 여백 합(논리 픽셀).
+pub const MATH_PAD: f32 = 12.0;
 
 /// 본문에 적힌 이미지 한 줄의 내용.
 #[derive(Clone, Debug, PartialEq)]
@@ -660,6 +665,8 @@ pub fn scan_blocks(text: &str) -> Vec<Block> {
             out.push(Block { kind: BlockKind::Hr, start: i, end: i });
         } else if let Some(items) = parse_image_row(line) {
             out.push(Block { kind: BlockKind::Image { items }, start: i, end: i });
+        } else if let Some(node) = crate::math::parse_block(line) {
+            out.push(Block { kind: BlockKind::Math { node }, start: i, end: i });
         } else if let Some(m) = list_marker_len(line) {
             let rest = &line[m..];
             let done = rest.starts_with("[x] ") || rest.starts_with("[X] ");
@@ -748,8 +755,18 @@ pub fn build(text: &str, cursor_line: Option<usize>, size: f32, t: &Theme, wrap:
             } else {
                 push(&mut job, line, &St { dim: true, code: true, ..plain }, &cx);
             }
+        } else if let Some(Block { kind: BlockKind::Math { node }, .. }) = blk {
+            if hide {
+                // 글자는 투명하고 아주 작게 두고, 줄 높이를 수식 높이로 키운다. 수식은 render.rs가 그린다.
+                let mut f = hidden_fmt(4.0);
+                f.line_height = Some(crate::math::height_em(node) * size + MATH_PAD);
+                job.append(line, 0.0, f.clone());
+                nl_fmt = Some(f);
+            } else {
+                push(&mut job, line, &St { dim: true, code: true, ..plain }, &cx);
+            }
         } else if let Some(lv) = heading_level(line) {
-            let mul = [1.0, 1.7, 1.4, 1.2, 1.1, 1.0, 1.0][lv];
+            let mul =[1.0, 1.7, 1.4, 1.2, 1.1, 1.0, 1.0][lv];
             let sp = if line[lv..].starts_with(' ') { 1 } else { 0 };
             marker(&mut job, &line[..lv + sp], hide, &cx);
             // 제목 바로 아래에 빈 줄이 없으면 본문 한 줄만큼 띄운다(HTML의 h1~h6 아래 여백처럼). 빈 줄이 있으면 그 빈 줄이 간격이다.
@@ -1049,6 +1066,7 @@ mod tests {
                     BlockKind::Hr => "hr",
                     BlockKind::Check { .. } => "check",
                     BlockKind::Image { .. } => "image",
+                    BlockKind::Math { .. } => "math",
                 };
                 (k.to_string(), b.start, b.end)
             })
@@ -1145,6 +1163,29 @@ mod tests {
         let job = build(text, Some(2), 15.0, t, 600.0, true);
         let s = job.sections.iter().find(|s| job.text[s.byte_range.start.0..s.byte_range.end.0].contains("1<br>2<br>3")).unwrap();
         assert!(s.format.line_height.map_or(true, |v| v < tall));
+    }
+
+    #[test]
+    fn math_line_is_a_block_and_only_when_valid() {
+        let k = kinds("앞\n$$x=\\frac{a}{b}$$\n뒤\n$$\\frac{1}$$\n");
+        assert_eq!(k, vec![("math".to_string(), 1, 1)]); // 틀린 수식은 블록이 아니다
+        // 코드 블록 안의 $$...$$는 수식이 아니다
+        assert!(kinds("```\n$$x$$\n```\n").iter().all(|(k, ..)| k != "math"));
+    }
+
+    #[test]
+    fn math_line_height_follows_formula_and_cursor_shows_source() {
+        let t = &themes()[0];
+        let text = "a\n$$\\frac{a}{b}$$\n$$x$$\nz\n";
+        let job = build(text, None, 15.0, t, 600.0, true);
+        let lh = |needle: &str| job.sections.iter().find(|s| job.text[s.byte_range.start.0..s.byte_range.end.0].contains(needle)).unwrap().format.line_height;
+        let frac = lh("frac").expect("수식 줄은 줄 높이를 직접 정한다");
+        let flat = lh("$$x$$").expect("한 줄짜리 수식도 마찬가지");
+        assert!(frac > flat * 1.4, "{frac} {flat}");
+        // 커서가 있는 줄은 원문을 그대로(줄 높이를 키우지 않고) 보인다
+        let job = build(text, Some(1), 15.0, t, 600.0, true);
+        let s = job.sections.iter().find(|s| job.text[s.byte_range.start.0..s.byte_range.end.0].contains("frac")).unwrap();
+        assert!(s.format.line_height.map_or(true, |v| v < frac));
     }
 
     #[test]

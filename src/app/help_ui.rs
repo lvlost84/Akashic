@@ -110,6 +110,13 @@ const TOPICS: &[Topic] = &[
     },
     Topic {
         group: "마크다운 문법",
+        title: "수식",
+        desc: "한 줄에 $$수식$$만 쓰면 그 줄이 수식으로 그려집니다(커서가 그 줄에 있으면 원문). 예: $$x=\\frac{a \\times b}{1-c}$$\n\n쓸 수 있는 것: \\frac{분자}{분모} 분수, ^ 위첨자, _ 아래첨자, \\sqrt{} 제곱근, \\text{한글 글자}, { } 묶기, \\times \\div \\pm \\cdot \\le \\ge \\ne \\approx \\infty \\sum \\int \\to, 그리스 문자(\\alpha \\beta \\pi …), \\sin \\cos \\log 등, \\quad 빈칸.\n\n문법이 틀리면(예: 중괄호가 닫히지 않음) 수식으로 그리지 않고 원문 그대로 둡니다. 문장 중간의 $x$ 같은 줄 안 수식은 아직 지원하지 않습니다.",
+        example: "",
+        kind: Kind::Plain,
+    },
+    Topic {
+        group: "마크다운 문법",
         title: "가로줄",
         desc: "---  또는  ***  또는  ___  만 있는 줄은 가로줄입니다. 커서가 그 줄 밖에 있으면 줄 폭 전체의 가로선으로, 커서가 그 줄에 있으면 원문으로 보입니다.",
         example: "---",
