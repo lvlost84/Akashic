@@ -350,8 +350,8 @@ pub enum BlockKind {
     Hr,
     /// 체크박스 목록 줄. col은 줄 안에서 [의 글자 위치.
     Check { done: bool, col: usize },
-    /// 이미지 줄(`![대체글](img:해시 가로x세로)`만 있는 줄). 그림은 render.rs가 그린다.
-    Image { alt: String, hash: String, w: u32, h: u32 },
+    /// 이미지 줄(`![대체글](img:해시 가로x세로)`만 한 개 이상 있는 줄). 그림은 render.rs가 그린다.
+    Image { items: Vec<ImageRef> },
 }
 
 /// 본문에 적힌 이미지 한 줄의 내용.
@@ -386,16 +386,20 @@ pub fn clean_alt(alt: &str) -> String {
     alt.chars().filter(|c| !matches!(c, '[' | ']' | '(' | ')') && !c.is_control()).collect::<String>().trim().chars().take(ALT_MAX).collect()
 }
 
-/// 줄 전체가 `![대체글](img:<16자리 해시> <가로>x<세로>)`일 때만 이미지 줄로 본다.
-pub fn parse_image_line(line: &str) -> Option<ImageRef> {
-    let rest = line.trim().strip_prefix("![")?;
+/// 한 줄 안에서 이미지 사이의 간격(논리 픽셀).
+pub const IMAGE_GAP: f32 = 8.0;
+
+/// `rest` 맨 앞의 `![대체글](img:<16자리 해시> <가로>x<세로>)` 하나를 읽고, 그 뒤 나머지를 돌려준다.
+fn parse_image_at(rest: &str) -> Option<(ImageRef, &str)> {
+    let rest = rest.strip_prefix("![")?;
     let k = rest.find("](img:")?;
     let alt = &rest[..k];
     if alt.contains(['[', ']']) {
         return None;
     }
-    let body = rest[k + "](img:".len()..].strip_suffix(')')?;
-    let (hash, dims) = body.split_once(' ')?;
+    let after = &rest[k + "](img:".len()..];
+    let close = after.find(')')?;
+    let (hash, dims) = after[..close].split_once(' ')?;
     if !is_img_hash(hash) {
         return None;
     }
@@ -404,7 +408,34 @@ pub fn parse_image_line(line: &str) -> Option<ImageRef> {
     if w == 0 || h == 0 {
         return None;
     }
-    Some(ImageRef { alt: alt.to_string(), hash: hash.to_string(), w, h })
+    Some((ImageRef { alt: alt.to_string(), hash: hash.to_string(), w, h }, &after[close + 1..]))
+}
+
+/// 줄 전체가 이미지(하나 이상, 공백으로 구분)로만 이루어졌을 때 그 목록을 돌려준다. 다른 글이 섞이면 None.
+pub fn parse_image_row(line: &str) -> Option<Vec<ImageRef>> {
+    let mut rest = line.trim();
+    let mut out = Vec::new();
+    while !rest.is_empty() {
+        let (r, next) = parse_image_at(rest)?;
+        out.push(r);
+        rest = next.trim_start();
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+/// 줄 전체가 `![대체글](img:<16자리 해시> <가로>x<세로>)` 하나일 때만 이미지로 본다.
+pub fn parse_image_line(line: &str) -> Option<ImageRef> {
+    let mut v = parse_image_row(line)?;
+    if v.len() == 1 { v.pop() } else { None }
+}
+
+/// 한 줄에 놓인 이미지들을 폭 `max_w`에 맞추는 공통 배율(키우지 않음, 가장 큰 높이가 상한 이하).
+/// 모두 같은 배율이라 비율이 유지되고, 줄 높이 = 가장 큰 원본 높이 × 배율이다.
+pub fn image_row_scale(dims: &[(u32, u32)], max_w: f32) -> f32 {
+    let sum_w: f32 = dims.iter().map(|d| d.0.max(1) as f32).sum();
+    let max_h = dims.iter().map(|d| d.1.max(1) as f32).fold(1.0, f32::max);
+    let avail = max_w - IMAGE_GAP * dims.len().saturating_sub(1) as f32;
+    (avail / sum_w).min(IMAGE_MAX_H / max_h).min(1.0).max(1.0 / max_h.max(sum_w))
 }
 
 /// 이미지 줄 한 줄(개행 없음)을 만든다.
@@ -426,6 +457,25 @@ pub fn image_refs(text: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// `line_no`(0부터)번 줄이 이미지 줄이면 그 줄 끝에 공백 하나와 `item`을 이어 붙인 본문을 돌려준다. 아니면 None.
+pub fn append_to_image_row(text: &str, line_no: usize, item: &str) -> Option<String> {
+    let mut start = 0;
+    for (i, piece) in text.split_inclusive('\n').enumerate() {
+        if i == line_no {
+            let body = piece.trim_end_matches(['\r', '\n']);
+            parse_image_row(body)?;
+            let mut out = String::with_capacity(text.len() + item.len() + 1);
+            out.push_str(&text[..start + body.len()]);
+            out.push(' ');
+            out.push_str(item);
+            out.push_str(&text[start + body.len()..]);
+            return Some(out);
+        }
+        start += piece.len();
+    }
+    None
 }
 
 /// `after_line`(0부터, 범위를 넘으면 마지막 줄) 다음 줄에 `line`을 넣는다. 앞뒤 줄이 비어 있지 않으면 빈 줄을 하나씩 보정한다.
@@ -563,8 +613,8 @@ pub fn scan_blocks(text: &str) -> Vec<Block> {
         }
         if heading_level(line).is_none() && is_hr(line) {
             out.push(Block { kind: BlockKind::Hr, start: i, end: i });
-        } else if let Some(r) = parse_image_line(line) {
-            out.push(Block { kind: BlockKind::Image { alt: r.alt, hash: r.hash, w: r.w, h: r.h }, start: i, end: i });
+        } else if let Some(items) = parse_image_row(line) {
+            out.push(Block { kind: BlockKind::Image { items }, start: i, end: i });
         } else if let Some(m) = list_marker_len(line) {
             let rest = &line[m..];
             let done = rest.starts_with("[x] ") || rest.starts_with("[X] ");
@@ -635,10 +685,12 @@ pub fn build(text: &str, cursor_line: Option<usize>, size: f32, t: &Theme, wrap:
             } else {
                 push(&mut job, line, &St { code: true, ..plain }, &cx);
             }
-        } else if let Some(Block { kind: BlockKind::Image { w, h, .. }, .. }) = blk {
+        } else if let Some(Block { kind: BlockKind::Image { items }, .. }) = blk {
             if hide {
-                // 글자는 투명하고 아주 작게 두고, 줄 높이를 그림 높이로 키운다. 그림은 render.rs가 그린다.
-                let (_, dh) = image_display_size(*w, *h, wrap);
+                // 글자는 투명하고 아주 작게 두고, 줄 높이를 가장 큰 그림 높이로 키운다. 그림은 render.rs가 그린다.
+                let dims: Vec<(u32, u32)> = items.iter().map(|r| (r.w, r.h)).collect();
+                let max_h = dims.iter().map(|d| d.1.max(1) as f32).fold(1.0, f32::max);
+                let dh = (max_h * image_row_scale(&dims, wrap)).max(1.0);
                 let mut f = hidden_fmt(4.0);
                 f.line_height = Some(dh + IMAGE_PAD);
                 job.append(line, 0.0, f.clone());
@@ -975,6 +1027,65 @@ mod tests {
         ] {
             assert!(parse_image_line(l).is_none(), "{l}");
         }
+    }
+
+    #[test]
+    fn image_row_parses_several_on_one_line() {
+        let l = format!("![a](img:{H16} 8x6) ![b](img:aaaaaaaaaaaaaaaa 10x20)![](img:bbbbbbbbbbbbbbbb 3x3)");
+        let v = parse_image_row(&l).unwrap();
+        assert_eq!(v.len(), 3);
+        assert_eq!((v[1].alt.as_str(), v[1].hash.as_str(), v[1].w, v[1].h), ("b", "aaaaaaaaaaaaaaaa", 10, 20));
+        assert_eq!(parse_image_row(&format!("![a](img:{H16} 8x6)")).unwrap().len(), 1);
+        for bad in [format!("![a](img:{H16} 8x6) 글 ![a](img:{H16} 8x6)"), format!("![a](img:{H16} 8x6) ![b](img:ZZ 1x1)"), "".to_string(), "  ".to_string()] {
+            assert!(parse_image_row(&bad).is_none(), "{bad}");
+        }
+        // 한 개짜리 전용 함수는 여러 개를 받지 않는다
+        assert!(parse_image_line(&l).is_none());
+    }
+
+    #[test]
+    fn image_row_scale_fits_one_row_bottom_aligned() {
+        // 두 장(200x100, 200x200)이 폭 1000이면 그대로(키우지 않음)
+        assert_eq!(image_row_scale(&[(200, 100), (200, 200)], 1000.0), 1.0);
+        // 폭 208(간격 8 제외 200)이면 같은 비율로 절반
+        let s = image_row_scale(&[(200, 100), (200, 200)], 208.0);
+        assert!((s - 0.5).abs() < 1e-4, "{s}");
+        // 높이 상한
+        assert_eq!(image_row_scale(&[(100, 2000)], 1000.0), IMAGE_MAX_H / 2000.0);
+        // 한 장일 때는 image_display_size와 같다
+        let (w, _) = image_display_size(800, 600, 400.0);
+        assert_eq!(800.0 * image_row_scale(&[(800, 600)], 400.0), w);
+        assert!(image_row_scale(&[(800, 600), (800, 600)], 0.0) > 0.0);
+    }
+
+    #[test]
+    fn append_to_image_row_only_on_image_lines() {
+        let a = format!("![a](img:{H16} 8x6)");
+        let b = format!("![b](img:aaaaaaaaaaaaaaaa 1x1)");
+        assert_eq!(append_to_image_row(&format!("x\n{a}\ny"), 1, &b), Some(format!("x\n{a} {b}\ny")));
+        assert_eq!(append_to_image_row(&format!("{a}\r\nz"), 0, &b), Some(format!("{a} {b}\r\nz"))); // CRLF 유지
+        assert_eq!(append_to_image_row(&a, 0, &b), Some(format!("{a} {b}"))); // 마지막 줄(개행 없음)
+        assert_eq!(append_to_image_row("x\ny", 0, &b), None); // 이미지 줄이 아니면 안 붙인다
+        assert_eq!(append_to_image_row(&format!("글 {a}"), 0, &b), None);
+        assert_eq!(append_to_image_row(&a, 5, &b), None); // 범위 밖
+    }
+
+    #[test]
+    fn scan_blocks_finds_multi_image_row() {
+        let l = format!("![a](img:{H16} 8x6) ![b](img:{H16} 8x6)");
+        assert_eq!(kinds(&format!("a\n{l}\nb")), vec![("image".into(), 1, 1)]);
+    }
+
+    #[test]
+    fn build_multi_image_row_height_is_tallest_scaled() {
+        let t = &themes()[0];
+        let text = format!("![a](img:{H16} 100x100) ![b](img:{H16} 100x300)\n");
+        let job = build(&text, None, 15.0, t, 1000.0, true);
+        assert_eq!(job.sections[0].format.line_height, Some(300.0 + IMAGE_PAD));
+        let job = build(&text, None, 15.0, t, 108.0, true); // 간격 8 제외 폭 100 / 합 200 → 배율 0.5, 높이 150
+        assert_eq!(job.sections[0].format.line_height, Some(150.0 + IMAGE_PAD));
+        let job = build(&text, None, 15.0, t, 58.0, true); // 폭 50 → 배율 0.25
+        assert_eq!(job.sections[0].format.line_height, Some(75.0 + IMAGE_PAD));
     }
 
     #[test]

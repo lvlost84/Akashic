@@ -183,30 +183,42 @@ pub fn paint(ui: &egui::Ui, blocks: &[Block], galley: &Galley, galley_origin: Po
                 }
                 table(ui, &mut shapes, b, aligns, rows, &spans, galley_origin, left, right, t, size, &px);
             }
-            BlockKind::Image { hash, w, h, .. } => {
+            BlockKind::Image { items } => {
                 if inside {
                     continue; // 커서가 있는 줄은 원문을 보여 준다
                 }
-                // 줄 높이(build가 그림 높이 + 여백으로 잡아 둔 것)에서 그릴 크기를 거꾸로 얻는다 → 본문 폭이 바뀌어도 어긋나지 않는다.
-                let ph = (bottom - top - md::IMAGE_PAD).max(1.0);
-                let pw = (ph * *w as f32 / (*h).max(1) as f32).min((right - left).max(1.0));
-                let ph = pw * (*h).max(1) as f32 / (*w).max(1) as f32;
-                let cx = (text_rect.left() + text_rect.right()) / 2.0;
-                let rect = Rect::from_center_size(pos2(px(cx), px(top + (bottom - top) / 2.0)), egui::vec2(pw, ph));
+                // 줄 높이(build가 가장 큰 그림 높이 + 여백으로 잡아 둔 것)에서 공통 배율을 거꾸로 얻는다 → 본문 폭이 바뀌어도 어긋나지 않는다.
+                let max_h = items.iter().map(|r| r.h.max(1) as f32).fold(1.0, f32::max);
+                let sum_w: f32 = items.iter().map(|r| r.w.max(1) as f32).sum();
+                let gaps = md::IMAGE_GAP * items.len().saturating_sub(1) as f32;
+                let mut s = ((bottom - top - md::IMAGE_PAD).max(1.0) / max_h).min(1.0);
+                if sum_w * s + gaps > (right - left).max(1.0) {
+                    s = ((right - left - gaps).max(1.0) / sum_w).min(s); // 폭이 어긋났을 때의 안전장치
+                }
+                let total = sum_w * s + gaps;
+                let row_bottom = bottom - md::IMAGE_PAD / 2.0; // 마크다운 표준처럼 아래(기준선)에 맞춘다
+                let mut x = (text_rect.left() + text_rect.right()) / 2.0 - total / 2.0;
                 let rr = CornerRadius::same(4);
-                match imgs(hash) {
-                    Tex::Ready(tex) => {
-                        let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
-                        shapes.push(Shape::Rect(egui::epaint::RectShape::filled(rect, rr, Color32::WHITE).with_texture(tex.id(), uv)));
-                        shapes.push(Shape::rect_stroke(rect, rr, Stroke::new(1.0, t.border), StrokeKind::Inside));
-                    }
-                    other => {
-                        // 불러오는 중이거나 DB에 없는 그림: 회색 상자(없을 때만 안내 글)
-                        shapes.push(Shape::rect_filled(rect, rr, t.code_bg));
-                        shapes.push(Shape::rect_stroke(rect, rr, Stroke::new(1.0, t.border), StrokeKind::Inside));
-                        if matches!(other, Tex::Missing) {
-                            let g = ui.ctx().fonts_mut(|f| f.layout_no_wrap("이미지를 찾을 수 없음".into(), FontId::new(size * 0.85, FontFamily::Proportional), t.dim));
-                            shapes.push(Shape::galley(rect.center() - g.size() / 2.0, g, t.dim));
+                for r in items {
+                    let (pw, ph) = ((r.w.max(1) as f32 * s).max(1.0), (r.h.max(1) as f32 * s).max(1.0));
+                    let rect = Rect::from_min_size(pos2(px(x), px(row_bottom - ph)), egui::vec2(pw, ph));
+                    x += pw + md::IMAGE_GAP;
+                    match imgs(&r.hash) {
+                        Tex::Ready(tex) => {
+                            let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+                            shapes.push(Shape::Rect(egui::epaint::RectShape::filled(rect, rr, Color32::WHITE).with_texture(tex.id(), uv)));
+                            shapes.push(Shape::rect_stroke(rect, rr, Stroke::new(1.0, t.border), StrokeKind::Inside));
+                        }
+                        other => {
+                            // 불러오는 중이거나 DB에 없는 그림: 회색 상자(없을 때만 안내 글)
+                            shapes.push(Shape::rect_filled(rect, rr, t.code_bg));
+                            shapes.push(Shape::rect_stroke(rect, rr, Stroke::new(1.0, t.border), StrokeKind::Inside));
+                            if matches!(other, Tex::Missing) {
+                                let g = ui.ctx().fonts_mut(|f| f.layout_no_wrap("이미지를 찾을 수 없음".into(), FontId::new(size * 0.85, FontFamily::Proportional), t.dim));
+                                if g.size().x <= rect.width() {
+                                    shapes.push(Shape::galley(rect.center() - g.size() / 2.0, g, t.dim));
+                                }
+                            }
                         }
                     }
                 }

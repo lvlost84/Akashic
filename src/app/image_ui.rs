@@ -17,6 +17,8 @@ struct Job {
     /// 시작할 때 열려 있던 문서와 그때의 커서 줄(끝나면 이 문서가 아니면 취소)
     doc: i64,
     line: Option<usize>,
+    /// 커서가 이미지 줄 위일 때 그 줄에 이어 붙여도 되는 작업인지(묶음의 첫 그림만)
+    join: bool,
 }
 
 // 앱 구조체를 건드리지 않으려고 모듈 전역으로 둔다(export_ui.rs와 같은 방식).
@@ -93,9 +95,10 @@ impl App {
             }
             return;
         }
-        let line = match NEXT_LINE.lock().ok().and_then(|g| *g) {
-            Some((d, l)) if d == doc => Some(l),
-            _ => self.cursor_line,
+        // 묶음(여러 파일)의 두 번째부터는 앞 그림 줄 아래에 쌓고, 처음 하나만 커서의 이미지 줄에 이어 붙일 수 있다.
+        let (line, join) = match NEXT_LINE.lock().ok().and_then(|g| *g) {
+            Some((d, l)) if d == doc => (Some(l), false),
+            _ => (self.cursor_line, true),
         };
         let (max, quality) = (self.cfg.img_max, self.cfg.img_quality);
         let (tx, rx) = channel();
@@ -112,7 +115,7 @@ impl App {
             c.request_repaint();
         });
         if let Ok(mut g) = JOB.lock() {
-            *g = Some(Job { rx, doc, line });
+            *g = Some(Job { rx, doc, line, join });
         }
         self.say("이미지 처리 중…");
     }
@@ -142,10 +145,10 @@ impl App {
         let mut crashed = false;
         let done = {
             let Ok(mut g) = JOB.lock() else { return };
-            match g.as_ref().map(|j| (j.rx.try_recv(), j.doc, j.line)) {
-                Some((Ok(r), doc, line)) => {
+            match g.as_ref().map(|j| (j.rx.try_recv(), j.doc, j.line, j.join)) {
+                Some((Ok(r), doc, line, join)) => {
                     *g = None;
-                    Some((r, doc, line))
+                    Some((r, doc, line, join))
                 }
                 Some((Err(TryRecvError::Disconnected), ..)) => {
                     *g = None;
@@ -158,9 +161,9 @@ impl App {
         if crashed {
             self.say("이미지를 넣지 못했습니다: 내부 오류로 작업이 중단되었습니다");
         }
-        if let Some((r, doc, line)) = done {
+        if let Some((r, doc, line, join)) = done {
             match r {
-                Ok(p) => self.finish_image(p, doc, line),
+                Ok(p) => self.finish_image(p, doc, line, join),
                 Err(x) => self.say(&format!("이미지를 넣지 못했습니다: {x}")),
             }
         }
@@ -177,7 +180,7 @@ impl App {
         }
     }
 
-    fn finish_image(&mut self, p: Processed, doc: i64, line: Option<usize>) {
+    fn finish_image(&mut self, p: Processed, doc: i64, line: Option<usize>, join: bool) {
         if self.cur != Some(doc) || self.cur_trashed {
             self.say("문서를 바꿔서 이미지 삽입을 취소했습니다");
             return;
@@ -187,13 +190,19 @@ impl App {
             return;
         }
         let text = md::format_image_line(&p.alt, &p.hash, p.w, p.h);
-        let after = line.unwrap_or(usize::MAX);
-        self.body = md::insert_block_line(&self.body, after, &text);
-        self.last_edit.get_or_insert_with(Instant::now);
-        let idx = match line {
-            Some(l) => line_index_of(&self.body, &text, l),
-            None => self.body.split('\n').enumerate().filter(|(_, l)| l.trim() == text).map(|(i, _)| i).last(), // 끝에 붙은 줄
+        // 커서가 이미지 줄 위에 있으면 그 줄 뒤에 이어 붙여 한 줄에 여러 장이 되게 한다.
+        let joined = if join { line.and_then(|l| md::append_to_image_row(&self.body, l, &text).map(|b| (l, b))) } else { None };
+        let idx = if let Some((l, b)) = joined {
+            self.body = b;
+            Some(l)
+        } else {
+            self.body = md::insert_block_line(&self.body, line.unwrap_or(usize::MAX), &text);
+            match line {
+                Some(l) => line_index_of(&self.body, &text, l),
+                None => self.body.split('\n').enumerate().filter(|(_, l)| l.trim() == text).map(|(i, _)| i).last(), // 끝에 붙은 줄
+            }
         };
+        self.last_edit.get_or_insert_with(Instant::now);
         if let Some(i) = idx {
             if let Ok(mut n) = NEXT_LINE.lock() {
                 *n = Some((doc, i));

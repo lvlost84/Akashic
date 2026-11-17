@@ -225,10 +225,10 @@ pub fn category_path(cats: &[Category], id: Option<i64>) -> String {
 /// 코드 블록·표 안이나 줄 중간의 것은 이미지가 아니므로 건드리지 않는다. 줄바꿈은 그대로 둔다.
 /// 쓰인 (해시, 대체글) 목록(중복 없음)을 함께 돌려준다.
 pub fn rewrite_images(body: &str, depth: usize) -> (String, Vec<(String, String)>) {
-    let imgs: HashMap<usize, (String, String)> = crate::md::scan_blocks(body)
+    let imgs: HashMap<usize, Vec<crate::md::ImageRef>> = crate::md::scan_blocks(body)
         .into_iter()
         .filter_map(|b| match b.kind {
-            crate::md::BlockKind::Image { alt, hash, .. } => Some((b.start, (alt, hash))),
+            crate::md::BlockKind::Image { items } => Some((b.start, items)),
             _ => None,
         })
         .collect();
@@ -240,11 +240,15 @@ pub fn rewrite_images(body: &str, depth: usize) -> (String, Vec<(String, String)
     let mut used: Vec<(String, String)> = Vec::new();
     for (i, raw) in body.split_inclusive('\n').enumerate() {
         match imgs.get(&i) {
-            Some((alt, hash)) => {
+            Some(items) => {
                 let eol = &raw[raw.trim_end_matches(['\r', '\n']).len()..];
-                out.push_str(&format!("![{alt}]({prefix}images/{hash}.webp){eol}"));
-                if !used.iter().any(|(h, _)| h == hash) {
-                    used.push((hash.clone(), alt.clone()));
+                let parts: Vec<String> = items.iter().map(|r| format!("![{}]({prefix}images/{}.webp)", r.alt, r.hash)).collect();
+                out.push_str(&parts.join(" "));
+                out.push_str(eol);
+                for r in items {
+                    if !used.iter().any(|(h, _)| *h == r.hash) {
+                        used.push((r.hash.clone(), r.alt.clone()));
+                    }
                 }
             }
             None => out.push_str(raw),
@@ -497,6 +501,14 @@ mod image_tests {
         assert_eq!(s, format!("![x](images/{H}.webp)\n"));
         assert_eq!(used, vec![(H.to_string(), "x".to_string())]);
         assert_eq!(rewrite_images(&format!("{}\n", line()), 2).0, format!("![x](../../images/{H}.webp)\n"));
+    }
+
+    #[test]
+    fn rewrite_images_handles_several_on_one_line() {
+        let body = format!("{} ![y](img:aaaaaaaaaaaaaaaa 1x1) {}\r\n", line(), line());
+        let (s, used) = rewrite_images(&body, 1);
+        assert_eq!(s, format!("![x](../images/{H}.webp) ![y](../images/aaaaaaaaaaaaaaaa.webp) ![x](../images/{H}.webp)\r\n"));
+        assert_eq!(used.len(), 2); // 중복 없음
     }
 
     #[test]
