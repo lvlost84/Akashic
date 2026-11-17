@@ -308,6 +308,8 @@ fn list_marker_len(line: &str) -> Option<usize> {
 
 /// 표 줄(투명 글자)의 글자 크기 배율: 격자 칸의 위아래 여백이 된다.
 pub const TABLE_ROW_MUL: f32 = 1.25;
+/// 접힌 표 행의 투명 원문 글자 크기(pt). 아주 작아야 한 줄이 좁은 창에서 여러 줄로 감기지 않는다.
+const TABLE_TEXT_PT: f32 = 2.0;
 
 /// `s`가 `<br>`·`<br/>`·`<br />`(대소문자 무시, 안쪽 공백 허용)로 시작하면 그 태그의 바이트 길이.
 fn br_tag_len(s: &[u8]) -> Option<usize> {
@@ -720,14 +722,13 @@ pub fn build(text: &str, cursor_line: Option<usize>, size: f32, t: &Theme, wrap:
                     nl_fmt = Some(f);
                 } else {
                     let mut f = fmt(&St { code: true, block: true, ..plain }, false, &cx);
-                    f.font_id = FontId::new(size * TABLE_ROW_MUL, FontFamily::Monospace);
+                    // 투명한 원문 글자는 아주 작게 해서 좁은 창에서도 여러 줄로 감기지 않게 하고(감기면 행마다 높이가 부풀었다),
+                    // 행 높이는 줄 높이로 직접 정한다. 셀에 <br>이 있으면 그 줄 수만큼 키운다(머리글은 n == start, 본문은 n - start - 1번째 행).
+                    f.font_id = FontId::new(TABLE_TEXT_PT, FontFamily::Monospace);
                     f.color = Color32::TRANSPARENT;
-                    // 셀에 <br>이 있으면 그 줄 수만큼 행을 키운다(머리글은 n == start, 본문은 n - start - 1번째 행).
                     let r = if n == *start { 0 } else { n - start - 1 };
                     let k = rows.get(r).map_or(1, |row| row_lines(row));
-                    if k > 1 {
-                        f.line_height = Some(size * TABLE_ROW_MUL * 1.2 + (k - 1) as f32 * size * 1.3);
-                    }
+                    f.line_height = Some(size * TABLE_ROW_MUL * 1.2 + (k - 1) as f32 * size * 1.3);
                     job.append(line, 0.0, f.clone());
                     nl_fmt = Some(f);
                 }
@@ -1144,6 +1145,38 @@ mod tests {
         let job = build(text, Some(2), 15.0, t, 600.0, true);
         let s = job.sections.iter().find(|s| job.text[s.byte_range.start.0..s.byte_range.end.0].contains("1<br>2<br>3")).unwrap();
         assert!(s.format.line_height.map_or(true, |v| v < tall));
+    }
+
+    #[test]
+    fn collapsed_table_row_height_does_not_depend_on_text_length() {
+        // 아주 긴 행이 좁은 창에서 감겨 높이가 부풀지 않도록, 접힌 행의 글자는 작고 높이는 줄 수로만 정해진다.
+        let t = &themes()[0];
+        let long = "x".repeat(400);
+        let text = format!("| a | b |\n|---|---|\n| {long} | y |\n| s | t |\n");
+        let job = build(&text, None, 15.0, t, 200.0, true);
+        let sec = |needle: &str| job.sections.iter().find(|s| job.text[s.byte_range.start.0..s.byte_range.end.0].contains(needle)).unwrap();
+        let (a, b) = (sec(&long), sec("| s | t |"));
+        assert_eq!(a.format.line_height, b.format.line_height, "행 높이는 글자 길이와 무관");
+        assert!(a.format.font_id.size < 4.0, "투명 원문 글자는 감기지 않게 작다");
+        assert!(a.format.line_height.unwrap() > 15.0);
+    }
+
+    #[test]
+    fn real_table_with_many_br_keeps_height_and_text() {
+        // 사용자가 보고한 표: 탭이 섞이고, 한 칸에 <br>이 5개(6줄)이며 한 줄이 매우 길다.
+        let text = "|자료명|\t상세내역 (모든 심사 시 제출)|\n|---|---|\n|고객목록|\t(해당되는 경우 고객지정 요구사항 목록 제출)|\n|프로세스 맵|\t외주처리된 프로세스 및 원격 지원 기능 포함한 순서 및 상호작용을 보여주는 프로세스 기술<br>외주처리된 프로세스에 대한 정보*외주처리된 프로세스가 있을경우 식별(어떤 프로세스에서 관리되는지 식별)<br>외주처리된 프로세스가 없을경우, 외주처리된 프로세스가 없음을 식별<br>*원격지원기능 및 장소에 대한 정보<br>원격지원기능 주는곳의 주소, 프로세스, 기능/원격지원기능 받는곳의 주소, 프로세스, 기능)<br>*원격지원기능이 없을 경우, 원격지원기능이 없음을 식별|\n|요구사항 매트릭스\t|(CSR을 포함한) IATF 16949 요구사항이 조직의 프로세스에서 다루어졌다는 증거|\n";
+        same(text, None);
+        let t = &themes()[0];
+        let heights = |wrap: f32| {
+            let job = build(text, None, 15.0, t, wrap, true);
+            let find = |needle: &str| job.sections.iter().find(|s| job.text[s.byte_range.start.0..s.byte_range.end.0].contains(needle)).unwrap().format.line_height;
+            (find("|고객목록|"), find("|프로세스 맵|"), find("|요구사항 매트릭스"))
+        };
+        let (a1, b1, c1) = heights(900.0);
+        assert_eq!(heights(250.0), (a1, b1, c1), "창 폭과 무관");
+        let (one, six) = (a1.unwrap(), b1.unwrap());
+        assert_eq!(c1.unwrap(), one);
+        assert!((six - (one + 5.0 * 15.0 * 1.3)).abs() < 0.01, "6줄 행 = 한 줄 높이 + 5줄: {one} {six}");
     }
 
     #[test]
