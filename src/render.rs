@@ -1,5 +1,6 @@
 //! 표·코드 블록·가로줄을 편집창 뒤에 진짜 박스/격자로 그린다.
 //! 편집창의 글자는 원문 그대로이고(투명 처리), 여기서는 그 줄들의 위치에 맞춰 그림만 만든다.
+use crate::img::Tex;
 use crate::md::{self, Align, Block, BlockKind};
 use crate::theme::Theme;
 use eframe::egui::{self, Color32, CornerRadius, FontFamily, FontId, Galley, Pos2, Rect, Shape, Stroke, StrokeKind, pos2};
@@ -110,7 +111,8 @@ fn fit(ui: &egui::Ui, text: &str, font: &FontId, color: Color32, maxw: f32) -> A
 
 /// 편집창 뒤에 깔 그림을 만든다. `hide`가 꺼져 있으면 아무것도 그리지 않는다.
 /// `galley_origin`: galley의 (0,0)이 화면 어디인지. `text_rect`: 글이 놓이는 영역(좌우 끝).
-pub fn paint(ui: &egui::Ui, blocks: &[Block], galley: &Galley, galley_origin: Pos2, text_rect: Rect, cl: Option<usize>, t: &Theme, size: f32, hide: bool) -> Vec<Shape> {
+#[allow(clippy::too_many_arguments)]
+pub fn paint(ui: &egui::Ui, blocks: &[Block], galley: &Galley, galley_origin: Pos2, text_rect: Rect, cl: Option<usize>, t: &Theme, size: f32, hide: bool, imgs: &mut dyn FnMut(&str) -> Tex<egui::TextureHandle>) -> Vec<Shape> {
     let mut shapes = Vec::new();
     if !hide || blocks.is_empty() {
         return shapes;
@@ -180,6 +182,34 @@ pub fn paint(ui: &egui::Ui, blocks: &[Block], galley: &Galley, galley_origin: Po
                     continue;
                 }
                 table(ui, &mut shapes, b, aligns, rows, &spans, galley_origin, left, right, t, size, &px);
+            }
+            BlockKind::Image { hash, w, h, .. } => {
+                if inside {
+                    continue; // 커서가 있는 줄은 원문을 보여 준다
+                }
+                // 줄 높이(build가 그림 높이 + 여백으로 잡아 둔 것)에서 그릴 크기를 거꾸로 얻는다 → 본문 폭이 바뀌어도 어긋나지 않는다.
+                let ph = (bottom - top - md::IMAGE_PAD).max(1.0);
+                let pw = (ph * *w as f32 / (*h).max(1) as f32).min((right - left).max(1.0));
+                let ph = pw * (*h).max(1) as f32 / (*w).max(1) as f32;
+                let cx = (text_rect.left() + text_rect.right()) / 2.0;
+                let rect = Rect::from_center_size(pos2(px(cx), px(top + (bottom - top) / 2.0)), egui::vec2(pw, ph));
+                let rr = CornerRadius::same(4);
+                match imgs(hash) {
+                    Tex::Ready(tex) => {
+                        let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+                        shapes.push(Shape::Rect(egui::epaint::RectShape::filled(rect, rr, Color32::WHITE).with_texture(tex.id(), uv)));
+                        shapes.push(Shape::rect_stroke(rect, rr, Stroke::new(1.0, t.border), StrokeKind::Inside));
+                    }
+                    other => {
+                        // 불러오는 중이거나 DB에 없는 그림: 회색 상자(없을 때만 안내 글)
+                        shapes.push(Shape::rect_filled(rect, rr, t.code_bg));
+                        shapes.push(Shape::rect_stroke(rect, rr, Stroke::new(1.0, t.border), StrokeKind::Inside));
+                        if matches!(other, Tex::Missing) {
+                            let g = ui.ctx().fonts_mut(|f| f.layout_no_wrap("이미지를 찾을 수 없음".into(), FontId::new(size * 0.85, FontFamily::Proportional), t.dim));
+                            shapes.push(Shape::galley(rect.center() - g.size() / 2.0, g, t.dim));
+                        }
+                    }
+                }
             }
         }
     }

@@ -4,7 +4,7 @@ KnowVault(WPF)를 Rust + eframe/egui 0.37 + rusqlite로 다시 만드는 프로�
 작업을 끝낼 때마다 아래 "기록" 맨 위에 항목을 추가합니다(날짜 · 무엇을 · 왜/어떻게 · 확인한 것 · 남은 것).
 
 - 빌드: `cargo build --release` → `out\Akashic.exe` (실행 중이라 잠기면 `Akashic-new.exe`)
-- 시험: `cargo test --release` (현재 94건 통과, 성능·실측 3건은 ignored)
+- 시험: `cargo test --release` (현재 132건 통과·1건 기존 실패(theme), 성능·실측 4건은 ignored)
 - 격리 실행: `AKASHIC_DATA=<폴더>`, `--seed`. 개발용 환경변수: `AKASHIC_OPEN_HELP/GRAPH/TITLE/OPT`, `AKASHIC_RENDERER`, `AKASHIC_DIAG`
 - 스냅숏(커밋 대신): `snapshots\<날짜>-<번호>-<이름>\` (src, Cargo.toml, build.rs, .cargo, assets)
 - 오픈소스 고지: 빌드할 때 `LICENSE.md`가 자동 생성됨(build.rs)
@@ -18,6 +18,7 @@ KnowVault(WPF)를 Rust + eframe/egui 0.37 + rusqlite로 다시 만드는 프로�
 ## 기록
 
 ### 2026-11-17
+- **이미지 삽입 (v2.1.0, 태그·푸시 전)**: 설계 `docs/superpowers/specs/2026-11-17-image-insert-design.md`, 계획 `docs/superpowers/plans/2026-11-17-image-insert.md`. 그림을 Ctrl+V(egui-winit의 `PasteImage` 이벤트: 클립보드에 글이 없을 때 `V` 키 이벤트 없이 이것만 온다)·끌어놓기·"…" 메뉴의 "이미지 삽입…"으로 넣으면 별도 스레드에서 긴 변 1600px(옵션 800~2400)·품질 80(60~95)의 WebP(libwebp, `webp` 크레이트)로 줄여 DB `images` 테이블(스키마 v3, 변경 카운터 트리거 포함)에 저장하고 본문에 `![이름](img:해시16자 가로x세로)` 한 줄을 끼운다(해시 = 원본 픽셀+크기의 SHA-256 앞 16자리라 같은 그림은 한 번만 저장). 편집기는 접힌 줄의 줄 높이를 그림 높이로 키우고 `render.rs`가 그림을 그린다(커서가 그 줄이면 원문). 텍스처는 LRU 32개·64MB, 프레임당 새 디코딩 2개. DB에 없는 그림은 "이미지를 찾을 수 없음" 상자. 쓰지 않는 그림은 영구 삭제·휴지통 비우기·(시작 때 자동 영구 삭제가 있었을 때)·옵션 버튼에서 정리(정리 전에 편집 중인 본문을 먼저 저장: 방금 넣은 그림이 지워지는 것을 막음). 전체·단일 내보내기는 `images/해시.webp`로 꺼내 상대경로로 연결. 의존성 `webp`·`image`(png/jpeg/bmp/gif/webp) 추가(처음 넣은 `arboard`는 egui가 이미 클립보드 그림을 주므로 뺌). 테스트 132건 통과(+38), `theme::tests::text_env_detects_theme_switch` 1건은 v2.0.6 원본에서도 실패하는 기존 문제(egui `TexturesDelta` drop 패닉, 이번 변경과 무관). 동기화 실측(`measure_image_churn`, 512KB 조각): 그림 40장(약 3.4MB) 상태에서 800×600 그림(84KB) 한 장 추가 → 10조각 중 4개 갱신(경우에 따라 전체). 실행 파일 12.7 → 13.9MB. 실제 화면에서 그림·뒤 문단 배치·없는 그림 상자·Ctrl+V 붙여넣기(캡처 그림을 클립보드에 넣고 실제 키 입력) 확인. 미확인: 끌어놓기·메뉴 대화상자, 좁은 창에서 접힌 줄 감김, 다크 테마, 긴 문서 스크롤 성능.
 - **v2.0.6 태그**: 미개선 항목 개선분을 담아 버전을 2.0.5 → 2.0.6으로 올리고 `v2.0.6` 태그를 만듦(푸시하면 release 워크플로가 빌드해 GitHub Releases에 올림).
 - **남은 두 항목**: (상태바 읽기 시간 제한) 동기화 폴더 확인을 로컬 파일 확인과 분리해 별도 스레드·15초 제한으로 읽음. 끊어진 네트워크 폴더에서 응답이 없으면 "접근 불가"로 처리하고 기다림을 포기하므로, 크기·백업 정보 갱신과 다음 확인이 멈추지 않음(멈춘 스레드는 버림, 로그에 기록). (그래프 Esc) 설정 메뉴가 열려 있을 때의 Esc는 메뉴만 닫고 그래프 창은 닫지 않음(`Popup::is_any_open`). 빌드 OK, 테스트 97건 통과. 실제 끊어진 네트워크 폴더와 Esc 동작은 화면으로 미확인.
 - **내보내기·기타 (F1·F3·F4)**: (F1) 내보내기가 DB 읽기까지 별도 스레드에서 읽기 전용 연결로 수행(`Db::export_data_from_file`)해 큰 DB에서도 화면이 멈추지 않음, 읽기 실패도 상태바에 알림. (F2) 경로 길이·예약 이름(COM¹ 등)은 이미 `export.rs`에 반영돼 있어 추가 수정 없음. (F3) 지난 시작이 실패해 렌더러를 되돌린 직후에는 `AKASHIC_RENDERER` 환경변수를 무시. (F4) 업데이트의 죽은 `let _ = auto;` 제거, 교체 실패 때 `.new` 파일 정리, 최소 크기를 상수(`MIN_EXE_BYTES`)로, `probe.rs`가 상태 확인 실패 시 자식 프로세스 종료, `--seed`의 unwrap을 오류 기록으로 바꿈, `build.rs`의 SDK 버전을 숫자 순서로 정렬. 빌드 OK, 테스트 97건 통과. 실제 큰 DB 내보내기는 미확인.

@@ -38,7 +38,8 @@ impl App {
         let (tx, rx) = channel();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let r = crate::db::Db::export_data_from_file(&src).map(|(docs, cats)| export::run_export(&parent, &stamp, &docs, &cats));
+            let r = crate::db::Db::export_data_from_file(&src)
+                .map(|(docs, cats)| export::run_export(&parent, &stamp, &docs, &cats, &|h| crate::db::Db::image_from_file(&src, h)));
             let _ = tx.send(r);
             ctx.request_repaint();
         });

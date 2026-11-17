@@ -4,6 +4,7 @@ mod export_ui;
 mod find_ui;
 mod graph_ui;
 mod help_ui;
+mod image_ui;
 mod status_ui;
 mod sync_ui;
 mod toc_ui;
@@ -128,6 +129,9 @@ pub struct Config {
     pub sync_rev: i64,
     /// 닫을 때 마지막 동기화 이후 바뀐 것이 있으면 한 번 올린다(자동 동기화가 켜져 있을 때)
     pub sync_on_close: bool,
+    /// 이미지를 넣을 때 줄이는 긴 변 최대 크기(px)와 WebP 품질(60~95)
+    pub img_max: u32,
+    pub img_quality: u32,
     /// 마지막 동기화 시도의 결과(성공/실패 한 줄)와 그 시각
     pub sync_result: String,
     pub sync_result_at: i64,
@@ -186,6 +190,8 @@ impl Default for Config {
             last_doc: 0,
             sync_rev: 0,
             sync_on_close: true,
+            img_max: 1600,
+            img_quality: 80,
             sync_result: String::new(),
             sync_result_at: 0,
             sync_failed: false,
@@ -273,6 +279,7 @@ enum Act {
     ToggleCollapse(i64),
     Import,
     Export,
+    InsertImage,
     Back,
     Forward,
     Follow(String),
@@ -346,6 +353,8 @@ pub struct App {
     cursor_line: Option<usize>,
     cursor_idx: usize,
     galley_cache: Option<(u64, Arc<egui::Galley>)>,
+    /// 문서 안 이미지의 화면용 텍스처 캐시
+    img: crate::img::ImgCache<egui::TextureHandle>,
     stats: status_ui::DocStats,
     storage: status_ui::StorageInfo,
     last_saved_ts: i64,
@@ -432,6 +441,7 @@ impl App {
             cursor_line: None,
             cursor_idx: 0,
             galley_cache: None,
+            img: crate::img::ImgCache::new(),
             stats: status_ui::DocStats::unset(),
             storage: Default::default(),
             last_saved_ts: 0,
@@ -457,7 +467,11 @@ impl App {
             cfg,
         };
         let days = a.cfg.trash_days;
-        let _ = a.db.purge_old(days);
+        if let Ok(n) = a.db.purge_old(days) {
+            if n > 0 {
+                let _ = a.db.prune_images(); // 영구 삭제된 문서가 있을 때만 쓰지 않는 그림을 정리한다
+            }
+        }
         match a.db.daily_backup(a.cfg.backup_keep) {
             Ok(Some(_)) => a.say("오늘의 자동 백업을 만들었습니다"),
             Err(x) => a.say(&format!("자동 백업 실패: {x}")),
@@ -824,6 +838,7 @@ impl App {
                         self.cur_trashed = false;
                         self.last_edit = None;
                     }
+                    let _ = self.prune_images_now(); // 어느 문서도 쓰지 않는 그림을 정리한다(편집 중인 내용을 먼저 저장)
                     self.list_dirty = true;
                     self.say("영구 삭제했습니다");self.graph_stale = true;
                 }
@@ -850,6 +865,7 @@ impl App {
                             self.cur_trashed = false;
                             self.last_edit = None;
                         }
+                        let _ = self.prune_images_now(); // 어느 문서도 쓰지 않는 그림을 정리한다(편집 중인 내용을 먼저 저장)
                         self.list_dirty = true;
                         if failed == 0 {
                             self.say(&format!("휴지통을 비웠습니다 ({}개)", ids.len()));
@@ -910,6 +926,7 @@ impl App {
                         self.collapsed.insert(id);
                     }
                 }
+                Act::InsertImage => self.insert_image_dialog(),
                 Act::Import => {
                     if let Some(p) = rfd::FileDialog::new().add_filter("마크다운/텍스트", &["md", "txt"]).pick_files() {
                         self.import_paths(p);
@@ -920,8 +937,27 @@ impl App {
                         let name = if self.title.trim().is_empty() { "문서".to_string() } else { self.title.clone() };
                         let safe: String = name.chars().map(|c| if r#"\/:*?"<>|"#.contains(c) { '_' } else { c }).collect();
                         if let Some(p) = rfd::FileDialog::new().add_filter("마크다운", &["md"]).set_file_name(format!("{safe}.md")).save_file() {
-                            match std::fs::write(&p, &self.body) {
-                                Ok(()) => self.say(&format!("내보냄: {}", p.display())),
+                            // 이미지 줄은 파일 옆 images 폴더의 상대경로 링크로 바꾸고 그림 파일을 함께 쓴다.
+                            let (text, used) = crate::export::rewrite_images(&self.body, 0);
+                            match std::fs::write(&p, &text) {
+                                Ok(()) => {
+                                    let mut miss = 0;
+                                    if !used.is_empty() {
+                                        let dir = p.parent().unwrap_or(std::path::Path::new(".")).join("images");
+                                        let _ = std::fs::create_dir_all(&dir);
+                                        for (h, _) in &used {
+                                            match self.db.get_image(h) {
+                                                Ok(Some((b, _, _))) if std::fs::write(dir.join(format!("{h}.webp")), &b).is_ok() => {}
+                                                _ => miss += 1,
+                                            }
+                                        }
+                                    }
+                                    if miss == 0 {
+                                        self.say(&format!("내보냄: {}", p.display()));
+                                    } else {
+                                        self.say(&format!("내보냄: {} (이미지 {miss}개는 저장하지 못했습니다)", p.display()));
+                                    }
+                                }
                                 Err(x) => self.say(&format!("내보내기 실패: {x}")),
                             }
                         }
@@ -1003,6 +1039,7 @@ impl App {
         if self.cur_trashed || !ctx.memory(|m| m.has_focus(id)) {
             return;
         }
+        self.paste_image_if_any(ctx); // 클립보드에 그림만 있으면 이미지로 넣는다
         let Some(mut state) = egui::TextEdit::load_state(ctx, id) else { return };
         let Some(range) = state.cursor.char_range() else { return };
         let (pi, si): (usize, usize) = (range.primary.index.into(), range.secondary.index.into());
@@ -1386,6 +1423,7 @@ impl App {
                         if crate::icons::btn(ui, crate::icons::Icon::Star, if self.cur_pinned { "즐겨찾기 해제" } else { "즐겨찾기 (Ctrl+Shift+D)" }).clicked() { acts.push(Act::Pin(self.cur.unwrap())); ui.close(); }
                         if crate::icons::btn(ui, crate::icons::Icon::Export, ".md로 내보내기").clicked() { acts.push(Act::Export); ui.close(); }
                         if crate::icons::btn(ui, crate::icons::Icon::Import, ".md/.txt 가져오기").clicked() { acts.push(Act::Import); ui.close(); }
+                        if crate::icons::btn_ex(ui, crate::icons::Icon::Import, "이미지 삽입…", !self.cur_trashed, None).on_hover_text("그림을 WebP로 줄여 문서에 넣습니다(붙여넣기·끌어놓기도 됩니다)").clicked() { acts.push(Act::InsertImage); ui.close(); }
                         ui.separator();
                         if self.cur_trashed {
                             if crate::icons::btn(ui, crate::icons::Icon::Restore, "복원").clicked() { acts.push(Act::Restore(self.cur.unwrap())); ui.close(); }
@@ -1527,6 +1565,8 @@ impl App {
         let find_view: Option<(&[(usize, usize)], usize)> = if self.find.open { Some((&self.find.matches[..], self.find.cur)) } else { None };
         let bg = ui.visuals().extreme_bg_color;
         let avail_h = ui.available_height();
+        self.img.begin_frame();
+        let (img_cache, db_ref) = (&mut self.img, &self.db);
         let out = area
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -1542,7 +1582,8 @@ impl App {
                     .background_color(egui::Color32::TRANSPARENT)
                     .layouter(&mut layouter)
                     .show(ui);
-                Self::paint_blocks_behind(ui, slot, &out, &blocks, bg, &t, size, hide, cl, find_view);
+                let mut imgs = |h: &str| img_cache.texture(&ctx, db_ref, h);
+                Self::paint_blocks_behind(ui, slot, &out, &blocks, bg, &t, size, hide, cl, find_view, &mut imgs);
                 if let Some(idx) = find_jump {
                     // 찾은 곳이 보이는 영역 가운데쯤 오도록 스크롤한다.
                     let r = out.galley.pos_from_cursor(egui::text::CCursor::new(idx)).translate(out.galley_pos.to_vec2());
@@ -1600,11 +1641,11 @@ impl App {
 
     /// 편집창 뒤(자리 `slot`)에 바탕과 표·코드 박스·가로선을 깐다. 글자가 아닌 그림만 더한다.
     #[allow(clippy::too_many_arguments)]
-    fn paint_blocks_behind(ui: &egui::Ui, slot: egui::layers::ShapeIdx, out: &egui::text_edit::TextEditOutput, blocks: &[md::Block], bg: egui::Color32, t: &theme::Theme, size: f32, hide: bool, cl: Option<usize>, find: Option<(&[(usize, usize)], usize)>) {
+    fn paint_blocks_behind(ui: &egui::Ui, slot: egui::layers::ShapeIdx, out: &egui::text_edit::TextEditOutput, blocks: &[md::Block], bg: egui::Color32, t: &theme::Theme, size: f32, hide: bool, cl: Option<usize>, find: Option<(&[(usize, usize)], usize)>, imgs: &mut dyn FnMut(&str) -> crate::img::Tex<egui::TextureHandle>) {
         let origin = out.galley_pos - egui::vec2(out.galley.rect.left(), 0.0);
         let mut shapes = vec![egui::Shape::rect_filled(out.response.rect, egui::CornerRadius::ZERO, bg)];
         let text_rect = egui::Rect::from_min_max(out.text_clip_rect.min, egui::pos2(out.response.rect.right() - 8.0, out.text_clip_rect.max.y));
-        shapes.extend(crate::render::paint(ui, blocks, &out.galley, origin, text_rect, cl, t, size, hide));
+        shapes.extend(crate::render::paint(ui, blocks, &out.galley, origin, text_rect, cl, t, size, hide, imgs));
         // 찾은 글자 표시는 표·코드 상자 바탕 위, 글자 뒤에 깐다.
         if let Some((m, cur)) = find {
             shapes.extend(Self::find_highlights(out, m, cur, t));
@@ -1842,6 +1883,8 @@ impl App {
                     });
                     // 내보내기 → export_ui.rs
                     self.export_options(ui, &mut notes);
+                    // 이미지 → image_ui.rs
+                    self.image_options(ui, &mut notes);
                 }
                 2 => {
                     ui.label(egui::RichText::new("자동 백업").strong());
@@ -2099,9 +2142,17 @@ impl eframe::App for App {
         if fwd { acts.push(Act::Forward); }
 
         // 파일 끌어 놓기 가져오기
+        self.poll_image(&ctx);
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
         if !dropped.is_empty() {
-            self.import_paths(dropped);
+            // 그림 파일은 이미지로 넣고, 나머지(.md/.txt)는 문서로 가져온다.
+            let (pics, docs): (Vec<PathBuf>, Vec<PathBuf>) = dropped.into_iter().partition(|p| image_ui::is_image_path(p));
+            for p in pics {
+                self.start_image_job(&ctx, image_ui::ImageSrc::File(p));
+            }
+            if !docs.is_empty() {
+                self.import_paths(docs);
+            }
         }
 
         // 자동 저장

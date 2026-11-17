@@ -10,7 +10,7 @@ fn e<E: std::fmt::Display>(x: E) -> String {
 }
 
 pub const MAX_DEPTH: usize = 6;
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 /// 직접 정렬 위치 값 사이의 기본 간격.
 pub const POS_GAP: i64 = 1024;
 
@@ -122,7 +122,9 @@ CREATE TRIGGER IF NOT EXISTS rev_cat_d AFTER DELETE ON categories BEGIN UPDATE m
 CREATE TRIGGER IF NOT EXISTS rev_tag_i AFTER INSERT ON tags BEGIN UPDATE meta SET value=CAST(value AS INTEGER)+1 WHERE key='rev'; END;
 CREATE TRIGGER IF NOT EXISTS rev_tag_d AFTER DELETE ON tags BEGIN UPDATE meta SET value=CAST(value AS INTEGER)+1 WHERE key='rev'; END;
 CREATE TRIGGER IF NOT EXISTS rev_dt_i AFTER INSERT ON doc_tags BEGIN UPDATE meta SET value=CAST(value AS INTEGER)+1 WHERE key='rev'; END;
-CREATE TRIGGER IF NOT EXISTS rev_dt_d AFTER DELETE ON doc_tags BEGIN UPDATE meta SET value=CAST(value AS INTEGER)+1 WHERE key='rev'; END;";
+CREATE TRIGGER IF NOT EXISTS rev_dt_d AFTER DELETE ON doc_tags BEGIN UPDATE meta SET value=CAST(value AS INTEGER)+1 WHERE key='rev'; END;
+CREATE TRIGGER IF NOT EXISTS rev_img_i AFTER INSERT ON images BEGIN UPDATE meta SET value=CAST(value AS INTEGER)+1 WHERE key='rev'; END;
+CREATE TRIGGER IF NOT EXISTS rev_img_d AFTER DELETE ON images BEGIN UPDATE meta SET value=CAST(value AS INTEGER)+1 WHERE key='rev'; END;";
 
 /// 스키마 v1(처음 만들 때와 v1 파일 시험에 쓴다).
 pub const SCHEMA_V1: &str = "BEGIN;
@@ -217,6 +219,17 @@ CREATE INDEX docs_pos ON docs(pos);
 INSERT OR REPLACE INTO meta(key,value) VALUES('schema','2');
 COMMIT;"
                 ))
+                .map_err(e)?;
+        }
+        if ver < 3 {
+            // v3: 이미지(WebP로 줄인 그림). 본문의 `img:해시`가 가리킨다.
+            self.conn
+                .execute_batch(
+                    "BEGIN;
+CREATE TABLE IF NOT EXISTS images(hash TEXT PRIMARY KEY, webp BLOB NOT NULL, w INTEGER NOT NULL, h INTEGER NOT NULL, created INTEGER NOT NULL);
+INSERT OR REPLACE INTO meta(key,value) VALUES('schema','3');
+COMMIT;",
+                )
                 .map_err(e)?;
         }
         self.conn.execute_batch(REV_SQL).map_err(e)?;
@@ -759,6 +772,59 @@ COMMIT;"
         Db { conn, path: src.to_path_buf() }.export_data()
     }
 
+    // ---------- 이미지 ----------
+    /// 이미지를 저장한다(같은 해시가 이미 있으면 그대로 둔다).
+    pub fn put_image(&self, hash: &str, webp: &[u8], w: u32, h: u32) -> Res<()> {
+        self.conn
+            .execute("INSERT OR IGNORE INTO images(hash,webp,w,h,created) VALUES(?,?,?,?,?)", params![hash, webp, w, h, now()])
+            .map_err(e)?;
+        Ok(())
+    }
+
+    /// (WebP 바이트, 가로, 세로). 없으면 None.
+    pub fn get_image(&self, hash: &str) -> Res<Option<(Vec<u8>, u32, u32)>> {
+        self.conn
+            .query_row("SELECT webp,w,h FROM images WHERE hash=?", [hash], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .optional()
+            .map_err(e)
+    }
+
+    /// (이미지 개수, WebP 총 바이트).
+    pub fn image_stats(&self) -> Res<(usize, u64)> {
+        self.conn
+            .query_row("SELECT COUNT(*), COALESCE(SUM(LENGTH(webp)),0) FROM images", [], |r| Ok((r.get::<_, i64>(0)? as usize, r.get::<_, i64>(1)? as u64)))
+            .map_err(e)
+    }
+
+    /// 어떤 문서(휴지통 포함)의 본문에서도 쓰이지 않는 이미지를 지우고 지운 개수를 돌려준다.
+    pub fn prune_images(&self) -> Res<usize> {
+        let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+        {
+            let mut st = self.conn.prepare("SELECT body FROM docs WHERE body LIKE '%img:%'").map_err(e)?;
+            let rows = st.query_map([], |r| r.get::<_, String>(0)).map_err(e)?;
+            for b in rows.flatten() {
+                used.extend(crate::md::image_refs(&b));
+            }
+        }
+        let all: Vec<String> = {
+            let mut st = self.conn.prepare("SELECT hash FROM images").map_err(e)?;
+            let v = st.query_map([], |r| r.get::<_, String>(0)).map_err(e)?.flatten().collect();
+            v
+        };
+        let mut n = 0;
+        for h in all.iter().filter(|h| !used.contains(*h)) {
+            n += self.conn.execute("DELETE FROM images WHERE hash=?", [h]).map_err(e)?;
+        }
+        Ok(n)
+    }
+
+    /// 저장된 DB 파일을 읽기 전용 연결로 열어 이미지 WebP 바이트를 읽는다. 화면 스레드 밖(내보내기)에서 쓴다.
+    pub fn image_from_file(src: &Path, hash: &str) -> Option<Vec<u8>> {
+        let conn = Connection::open_with_flags(src, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+        conn.execute_batch("PRAGMA busy_timeout=3000;").ok()?;
+        conn.query_row("SELECT webp FROM images WHERE hash=?", [hash], |r| r.get(0)).optional().ok()?
+    }
+
     /// 이미 저장된 DB 파일(WAL 포함)을 읽기 전용 연결로 열어 스냅숏을 만든다. 화면 스레드 밖에서 쓸 수 있다.
     pub fn snapshot_file(src: &Path, dest: &Path) -> Res<()> {
         if dest.exists() {
@@ -1012,7 +1078,7 @@ mod tests {
         }
         let db = Db::open(&path).unwrap();
         let v: String = db.conn.query_row("SELECT value FROM meta WHERE key='schema'", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, "2");
+        assert_eq!(v, "3");
         assert_eq!(order(&db), vec![2, 3, 1]); // 최근 수정순 순위
         let n = db.new_doc(None).unwrap();
         assert_eq!(order(&db)[0], n);
@@ -1023,6 +1089,92 @@ mod tests {
         c.execute("UPDATE meta SET value='99' WHERE key='schema'", []).unwrap();
         drop(c);
         assert!(Db::open(&path).is_err());
+    }
+
+    const HA: &str = "aaaaaaaaaaaaaaaa";
+    const HB: &str = "bbbbbbbbbbbbbbbb";
+    const HC: &str = "cccccccccccccccc";
+
+    fn doc_with(db: &Db, body: &str) -> i64 {
+        let id = db.new_doc(None).unwrap();
+        db.save_doc(id, "t", body).unwrap();
+        id
+    }
+
+    #[test]
+    fn image_roundtrip_and_dedup() {
+        let db = Db::open(&tmp("img-rt")).unwrap();
+        db.put_image(HA, &[1, 2, 3], 8, 6).unwrap();
+        db.put_image(HA, &[9, 9, 9, 9], 8, 6).unwrap(); // 같은 해시는 무시
+        assert_eq!(db.image_stats().unwrap(), (1, 3));
+        assert_eq!(db.get_image(HA).unwrap(), Some((vec![1, 2, 3], 8, 6)));
+        assert_eq!(db.get_image(HB).unwrap(), None);
+    }
+
+    #[test]
+    fn images_bump_rev() {
+        let db = Db::open(&tmp("img-rev")).unwrap();
+        let r0 = db.rev();
+        db.put_image(HA, &[1], 1, 1).unwrap();
+        let r1 = db.rev();
+        assert!(r1 > r0);
+        assert_eq!(db.prune_images().unwrap(), 1); // 어디서도 안 쓰는 그림
+        assert!(db.rev() > r1);
+    }
+
+    #[test]
+    fn v2_db_migrates_to_v3() {
+        let path = tmp("img-v2");
+        {
+            let db = Db::open(&path).unwrap();
+            doc_with(&db, "본문");
+            db.conn.execute_batch("DROP TABLE images; UPDATE meta SET value='2' WHERE key='schema';").unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let v: String = db.conn.query_row("SELECT value FROM meta WHERE key='schema'", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, "3");
+        db.put_image(HA, &[1], 1, 1).unwrap();
+        assert_eq!(db.list_docs(&filter("")).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn prune_keeps_referenced_and_trashed() {
+        let db = Db::open(&tmp("img-prune")).unwrap();
+        for h in [HA, HB, HC] {
+            db.put_image(h, &[1], 1, 1).unwrap();
+        }
+        doc_with(&db, &format!("![a](img:{HA} 1x1)"));
+        let d2 = doc_with(&db, &format!("![b](img:{HB} 1x1)"));
+        db.trash(d2).unwrap(); // 휴지통 문서의 그림은 복원될 수 있으니 남긴다
+        assert_eq!(db.prune_images().unwrap(), 1);
+        assert!(db.get_image(HA).unwrap().is_some());
+        assert!(db.get_image(HB).unwrap().is_some());
+        assert!(db.get_image(HC).unwrap().is_none());
+    }
+
+    #[test]
+    fn prune_after_one_doc_purged_keeps_shared_image() {
+        let db = Db::open(&tmp("img-shared")).unwrap();
+        db.put_image(HA, &[1], 1, 1).unwrap();
+        let body = format!("![a](img:{HA} 1x1)");
+        let d1 = doc_with(&db, &body);
+        let d2 = doc_with(&db, &body);
+        db.trash(d1).unwrap();
+        db.purge(d1).unwrap();
+        assert_eq!(db.prune_images().unwrap(), 0);
+        assert!(db.get_image(HA).unwrap().is_some());
+        db.trash(d2).unwrap();
+        db.purge(d2).unwrap();
+        assert_eq!(db.prune_images().unwrap(), 1);
+    }
+
+    #[test]
+    fn image_from_file_reads_blob() {
+        let path = tmp("img-file");
+        let db = Db::open(&path).unwrap();
+        db.put_image(HA, &[7, 8, 9], 3, 1).unwrap();
+        assert_eq!(Db::image_from_file(&path, HA), Some(vec![7, 8, 9]));
+        assert_eq!(Db::image_from_file(&path, HB), None);
     }
 
     #[test]

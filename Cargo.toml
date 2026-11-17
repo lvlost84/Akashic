@@ -1,6 +1,6 @@
 [package]
 name = "akashic"
-version = "2.0.6"
+version = "2.1.0"
 edition = "2024"
 
 [dependencies]
@@ -13,6 +13,8 @@ rusqlite = { version = "0.42.0", features = ["bundled", "backup"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"
+webp = "0.3.1"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "bmp", "gif", "webp"] }
 
 [build-dependencies]
 # LICENSE.md를 빌드 때 만들기 위한 cargo metadata 해석(이미 쓰는 크레이트라 새 크레이트는 늘지 않는다)

@@ -220,8 +220,45 @@ pub fn category_path(cats: &[Category], id: Option<i64>) -> String {
     names.join(" / ")
 }
 
+/// 본문의 이미지 줄(`![대체글](img:해시 가로x세로)`)을 내보낸 파일 기준 상대경로
+/// `![대체글](../…/images/해시.webp)`로 바꾼다(`depth` = 문서가 내보내기 폴더 아래 몇 칸 깊이인지).
+/// 코드 블록·표 안이나 줄 중간의 것은 이미지가 아니므로 건드리지 않는다. 줄바꿈은 그대로 둔다.
+/// 쓰인 (해시, 대체글) 목록(중복 없음)을 함께 돌려준다.
+pub fn rewrite_images(body: &str, depth: usize) -> (String, Vec<(String, String)>) {
+    let imgs: HashMap<usize, (String, String)> = crate::md::scan_blocks(body)
+        .into_iter()
+        .filter_map(|b| match b.kind {
+            crate::md::BlockKind::Image { alt, hash, .. } => Some((b.start, (alt, hash))),
+            _ => None,
+        })
+        .collect();
+    if imgs.is_empty() {
+        return (body.to_string(), Vec::new());
+    }
+    let prefix = "../".repeat(depth);
+    let mut out = String::with_capacity(body.len());
+    let mut used: Vec<(String, String)> = Vec::new();
+    for (i, raw) in body.split_inclusive('\n').enumerate() {
+        match imgs.get(&i) {
+            Some((alt, hash)) => {
+                let eol = &raw[raw.trim_end_matches(['\r', '\n']).len()..];
+                out.push_str(&format!("![{alt}]({prefix}images/{hash}.webp){eol}"));
+                if !used.iter().any(|(h, _)| h == hash) {
+                    used.push((hash.clone(), alt.clone()));
+                }
+            }
+            None => out.push_str(raw),
+        }
+    }
+    (out, used)
+}
+
 /// 파일 전체 내용: front matter + 본문(원문 그대로).
 pub fn render(d: &ExportDoc, cats: &[Category]) -> String {
+    render_body(d, cats, &d.body)
+}
+
+fn render_body(d: &ExportDoc, cats: &[Category], body: &str) -> String {
     let mut s = String::from("---\n");
     s.push_str(&format!("title: {}\n", yaml_str(&d.title)));
     if d.tags.is_empty() {
@@ -235,13 +272,14 @@ pub fn render(d: &ExportDoc, cats: &[Category]) -> String {
     let cp = category_path(cats, d.category);
     s.push_str(&format!("category: {}\n", if cp.is_empty() { "\"\"".to_string() } else { yaml_str(&cp) }));
     s.push_str(&format!("created: {}\nupdated: {}\npinned: {}\n---\n", iso(d.created), iso(d.updated), d.pinned));
-    s.push_str(&d.body);
+    s.push_str(body);
     s
 }
 
 // ---------------------------------------------------------------- 쓰기
 /// `parent` 안에 `아카식-내보내기-<stamp>` 폴더를 만들고 모든 문서를 쓴다.
-pub fn run_export(parent: &Path, stamp: &str, docs: &[ExportDoc], cats: &[Category]) -> ExportResult {
+/// `load_image(해시)`는 그 그림의 WebP 바이트를 돌려준다(없으면 None). 쓰인 그림은 `images/해시.webp`로 한 번씩 쓴다.
+pub fn run_export(parent: &Path, stamp: &str, docs: &[ExportDoc], cats: &[Category], load_image: &dyn Fn(&str) -> Option<Vec<u8>>) -> ExportResult {
     let mut dir = parent.join(format!("아카식-내보내기-{stamp}"));
     let mut n = 2;
     while dir.exists() {
@@ -256,17 +294,47 @@ pub fn run_export(parent: &Path, stamp: &str, docs: &[ExportDoc], cats: &[Catego
     }
     let root_len = dir.to_string_lossy().chars().count();
     let rels = plan_paths(docs, cats, root_len);
+    let mut hashes: Vec<String> = Vec::new(); // 쓰인 그림(처음 나온 순서, 중복 없음)
     for (d, rel) in docs.iter().zip(rels) {
         let full = dir.join(&rel);
+        let depth = rel.components().count().saturating_sub(1);
+        let (body, used) = rewrite_images(&d.body, depth);
+        for (h, _) in used {
+            if !hashes.contains(&h) {
+                hashes.push(h);
+            }
+        }
         let r = full
             .parent()
             .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|_| std::fs::write(&full, render(d, cats).as_bytes()));
+            .and_then(|_| std::fs::write(&full, render_body(d, cats, &body).as_bytes()));
         match r {
             Ok(()) => res.ok += 1,
             Err(x) => {
                 res.failed += 1;
                 res.first_error.get_or_insert(format!("{}: {x}", rel.display()));
+            }
+        }
+    }
+    if !hashes.is_empty() {
+        let imgdir = dir.join("images");
+        match std::fs::create_dir_all(&imgdir) {
+            Err(x) => {
+                res.first_error.get_or_insert(format!("images 폴더를 만들 수 없습니다: {x}"));
+            }
+            Ok(()) => {
+                for h in &hashes {
+                    match load_image(h) {
+                        Some(bytes) => {
+                            if let Err(x) = std::fs::write(imgdir.join(format!("{h}.webp")), bytes) {
+                                res.first_error.get_or_insert(format!("이미지 {h}: {x}"));
+                            }
+                        }
+                        None => {
+                            res.first_error.get_or_insert(format!("이미지 {h}를 DB에서 읽지 못했습니다"));
+                        }
+                    }
+                }
             }
         }
     }
@@ -380,7 +448,7 @@ mod tests {
         docs.push(doc(12, "콜론: 있는 제목/슬래시", "한글 본문 ✓", Some(1)));
         docs[0].tags = vec!["예시".into(), "x y".into()];
         docs[0].pinned = true;
-        let r = run_export(&tmp, "20260101-000000", &docs, &cats);
+        let r = run_export(&tmp, "20260101-000000", &docs, &cats, &|_| None);
         assert_eq!((r.ok, r.failed), (8, 0), "{:?}", r.first_error);
         assert_eq!(r.dir.file_name().unwrap().to_string_lossy(), "아카식-내보내기-20260101-000000");
         let sub = r.dir.join("품질").join("측정기");
@@ -407,8 +475,82 @@ mod tests {
         assert!(r.dir.join("제목없음.md").exists());
         assert_eq!(std::fs::read_to_string(r.dir.join("품질").join("콜론_ 있는 제목_슬래시.md")).unwrap().ends_with("한글 본문 ✓"), true);
         // 같은 시각에 다시 내보내면 새 폴더
-        let r2 = run_export(&tmp, "20260101-000000", &docs[..1], &cats);
+        let r2 = run_export(&tmp, "20260101-000000", &docs[..1], &cats, &|_| None);
         assert_ne!(r2.dir, r.dir);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+
+    const H: &str = "0123456789abcdef";
+
+    fn line() -> String {
+        format!("![x](img:{H} 8x6)")
+    }
+
+    #[test]
+    fn rewrite_images_depth() {
+        let (s, used) = rewrite_images(&format!("{}\n", line()), 0);
+        assert_eq!(s, format!("![x](images/{H}.webp)\n"));
+        assert_eq!(used, vec![(H.to_string(), "x".to_string())]);
+        assert_eq!(rewrite_images(&format!("{}\n", line()), 2).0, format!("![x](../../images/{H}.webp)\n"));
+    }
+
+    #[test]
+    fn rewrite_images_skips_code_and_inline() {
+        let body = format!("```\n{}\n```\n글 {} 끝\n", line(), line());
+        let (s, used) = rewrite_images(&body, 1);
+        assert_eq!(s, body);
+        assert!(used.is_empty());
+    }
+
+    #[test]
+    fn rewrite_images_keeps_crlf() {
+        let (s, _) = rewrite_images(&format!("a\r\n{}\r\nb", line()), 0);
+        assert_eq!(s, format!("a\r\n![x](images/{H}.webp)\r\nb"));
+    }
+
+    fn doc(id: i64, body: &str, category: Option<i64>) -> ExportDoc {
+        ExportDoc { id, title: format!("문서{id}"), body: body.into(), category, tags: vec![], pinned: false, created: 1_700_000_000, updated: 1_700_000_100 }
+    }
+
+    #[test]
+    fn run_export_writes_shared_image_once() {
+        let tmp = std::env::temp_dir().join(format!("akashic-export-img-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let cats = vec![Category { id: 1, parent: None, name: "분류".into(), count: 0 }];
+        let docs = vec![doc(1, &format!("{}\n", line()), None), doc(2, &format!("{}\n", line()), Some(1))];
+        let calls = std::cell::Cell::new(0);
+        let r = run_export(&tmp, "20260101-000000", &docs, &cats, &|h| {
+            calls.set(calls.get() + 1);
+            (h == H).then(|| vec![1, 2, 3])
+        });
+        assert_eq!((r.ok, r.failed), (2, 0), "{:?}", r.first_error);
+        assert!(r.first_error.is_none());
+        let imgs: Vec<_> = std::fs::read_dir(r.dir.join("images")).unwrap().collect();
+        assert_eq!(imgs.len(), 1);
+        assert_eq!(std::fs::read(r.dir.join("images").join(format!("{H}.webp"))).unwrap(), vec![1, 2, 3]);
+        assert_eq!(calls.get(), 1); // 같은 그림은 한 번만 읽는다
+        let a = std::fs::read_to_string(r.dir.join("문서1.md")).unwrap();
+        let b = std::fs::read_to_string(r.dir.join("분류").join("문서2.md")).unwrap();
+        assert!(a.ends_with(&format!("![x](images/{H}.webp)\n")));
+        assert!(b.ends_with(&format!("![x](../images/{H}.webp)\n")));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn run_export_missing_image_is_reported() {
+        let tmp = std::env::temp_dir().join(format!("akashic-export-img2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let docs = vec![doc(1, &format!("{}\n", line()), None)];
+        let r = run_export(&tmp, "20260101-000000", &docs, &[], &|_| None);
+        assert_eq!((r.ok, r.failed), (1, 0));
+        assert!(r.first_error.is_some());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

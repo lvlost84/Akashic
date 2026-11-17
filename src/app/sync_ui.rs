@@ -185,6 +185,7 @@ impl App {
         self.cfg.sync_result = "불러오기 완료".into();
         self.cfg.sync_result_at = db::now();
         self.cfg.save();
+        self.img.clear(); // 이미지 캐시도 새 DB 기준으로 다시 읽는다
         self.list_dirty = true;
         self.graph_stale = true;
         self.fs_invalidate(true); // 상태바의 DB 크기·저장본 정보를 다시 읽는다

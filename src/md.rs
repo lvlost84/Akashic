@@ -350,6 +350,113 @@ pub enum BlockKind {
     Hr,
     /// 체크박스 목록 줄. col은 줄 안에서 [의 글자 위치.
     Check { done: bool, col: usize },
+    /// 이미지 줄(`![대체글](img:해시 가로x세로)`만 있는 줄). 그림은 render.rs가 그린다.
+    Image { alt: String, hash: String, w: u32, h: u32 },
+}
+
+/// 본문에 적힌 이미지 한 줄의 내용.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImageRef {
+    pub alt: String,
+    pub hash: String,
+    pub w: u32,
+    pub h: u32,
+}
+
+/// 이미지를 화면에 그릴 때의 최대 높이(논리 픽셀)와 위아래 여백 합.
+pub const IMAGE_MAX_H: f32 = 700.0;
+pub const IMAGE_PAD: f32 = 8.0;
+
+/// 본문 폭 `max_w`에 맞춰 줄인 표시 크기. 키우지 않고, 높이가 상한을 넘으면 비율대로 더 줄인다. 0 크기는 만들지 않는다.
+pub fn image_display_size(w: u32, h: u32, max_w: f32) -> (f32, f32) {
+    let (wf, hf) = (w.max(1) as f32, h.max(1) as f32);
+    let s = (max_w / wf).min(IMAGE_MAX_H / hf).min(1.0);
+    ((wf * s).max(1.0), (hf * s).max(1.0))
+}
+
+const IMG_HASH_LEN: usize = 16;
+const ALT_MAX: usize = 60;
+
+fn is_img_hash(s: &str) -> bool {
+    s.len() == IMG_HASH_LEN && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// 대체글에서 `[ ] ( )`·줄바꿈을 빼고 60자로 자른다(이미지 줄 문법을 깨지 않도록).
+pub fn clean_alt(alt: &str) -> String {
+    alt.chars().filter(|c| !matches!(c, '[' | ']' | '(' | ')') && !c.is_control()).collect::<String>().trim().chars().take(ALT_MAX).collect()
+}
+
+/// 줄 전체가 `![대체글](img:<16자리 해시> <가로>x<세로>)`일 때만 이미지 줄로 본다.
+pub fn parse_image_line(line: &str) -> Option<ImageRef> {
+    let rest = line.trim().strip_prefix("![")?;
+    let k = rest.find("](img:")?;
+    let alt = &rest[..k];
+    if alt.contains(['[', ']']) {
+        return None;
+    }
+    let body = rest[k + "](img:".len()..].strip_suffix(')')?;
+    let (hash, dims) = body.split_once(' ')?;
+    if !is_img_hash(hash) {
+        return None;
+    }
+    let (w, h) = dims.split_once('x')?;
+    let (w, h) = (w.parse::<u32>().ok()?, h.parse::<u32>().ok()?);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    Some(ImageRef { alt: alt.to_string(), hash: hash.to_string(), w, h })
+}
+
+/// 이미지 줄 한 줄(개행 없음)을 만든다.
+pub fn format_image_line(alt: &str, hash: &str, w: u32, h: u32) -> String {
+    format!("![{}](img:{hash} {w}x{h})", clean_alt(alt))
+}
+
+/// 본문 어디에서든(코드 블록·줄 중간 포함) `img:` 바로 뒤의 16자리 해시를 모은다(처음 나온 순서, 중복 없음).
+/// 정리(prune)가 쓰는 보수적 목록이라 일부러 넓게 잡는다.
+pub fn image_refs(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut rest = text;
+    while let Some(i) = rest.find("img:") {
+        rest = &rest[i + 4..];
+        if let Some(h) = rest.get(..IMG_HASH_LEN) {
+            if is_img_hash(h) && !out.iter().any(|x| x == h) {
+                out.push(h.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// `after_line`(0부터, 범위를 넘으면 마지막 줄) 다음 줄에 `line`을 넣는다. 앞뒤 줄이 비어 있지 않으면 빈 줄을 하나씩 보정한다.
+pub fn insert_block_line(text: &str, after_line: usize, line: &str) -> String {
+    if text.is_empty() {
+        return line.to_string();
+    }
+    let crlf = text.contains("\r\n");
+    let ends_nl = text.ends_with('\n');
+    let mut pieces: Vec<&str> = text.split('\n').collect();
+    if ends_nl {
+        pieces.pop();
+    }
+    let idx = after_line.min(pieces.len() - 1);
+    let p = idx + 1;
+    let blank = |s: &str| s.trim().is_empty();
+    let eol_pad = |s: &str| if crlf { format!("{s}\r") } else { s.to_string() };
+    let mut out: Vec<String> = pieces[..p].iter().map(|s| s.to_string()).collect();
+    if !blank(pieces[idx]) {
+        out.push(eol_pad(""));
+    }
+    out.push(eol_pad(line));
+    if pieces.get(p).map_or(false, |s| !blank(s)) {
+        out.push(eol_pad(""));
+    }
+    out.extend(pieces[p..].iter().map(|s| s.to_string()));
+    let mut s = out.join("\n");
+    if ends_nl {
+        s.push('\n');
+    }
+    s
 }
 
 /// 줄 번호 범위 `start..=end`를 차지하는 블록.
@@ -456,6 +563,8 @@ pub fn scan_blocks(text: &str) -> Vec<Block> {
         }
         if heading_level(line).is_none() && is_hr(line) {
             out.push(Block { kind: BlockKind::Hr, start: i, end: i });
+        } else if let Some(r) = parse_image_line(line) {
+            out.push(Block { kind: BlockKind::Image { alt: r.alt, hash: r.hash, w: r.w, h: r.h }, start: i, end: i });
         } else if let Some(m) = list_marker_len(line) {
             let rest = &line[m..];
             let done = rest.starts_with("[x] ") || rest.starts_with("[X] ");
@@ -525,6 +634,17 @@ pub fn build(text: &str, cursor_line: Option<usize>, size: f32, t: &Theme, wrap:
                 }
             } else {
                 push(&mut job, line, &St { code: true, ..plain }, &cx);
+            }
+        } else if let Some(Block { kind: BlockKind::Image { w, h, .. }, .. }) = blk {
+            if hide {
+                // 글자는 투명하고 아주 작게 두고, 줄 높이를 그림 높이로 키운다. 그림은 render.rs가 그린다.
+                let (_, dh) = image_display_size(*w, *h, wrap);
+                let mut f = hidden_fmt(4.0);
+                f.line_height = Some(dh + IMAGE_PAD);
+                job.append(line, 0.0, f.clone());
+                nl_fmt = Some(f);
+            } else {
+                push(&mut job, line, &St { dim: true, code: true, ..plain }, &cx);
             }
         } else if let Some(lv) = heading_level(line) {
             let mul = [1.0, 1.7, 1.4, 1.2, 1.1, 1.0, 1.0][lv];
@@ -826,10 +946,107 @@ mod tests {
                     BlockKind::Table { .. } => "table",
                     BlockKind::Hr => "hr",
                     BlockKind::Check { .. } => "check",
+                    BlockKind::Image { .. } => "image",
                 };
                 (k.to_string(), b.start, b.end)
             })
             .collect()
+    }
+
+    const H16: &str = "0123456789abcdef";
+
+    #[test]
+    fn image_line_parses() {
+        let r = parse_image_line("![스샷](img:0123456789abcdef 800x600)").unwrap();
+        assert_eq!(r, ImageRef { alt: "스샷".into(), hash: H16.into(), w: 800, h: 600 });
+        assert_eq!(parse_image_line("  ![](img:0123456789abcdef 8x6)  ").unwrap().alt, "");
+    }
+
+    #[test]
+    fn image_line_rejects_mixed_or_bad() {
+        for l in [
+            "글 ![a](img:0123456789abcdef 8x6)",
+            "![a](img:0123456789abcdef 8x6) 글",
+            "![a](img:XYZ 8x6)",
+            "![a](img:0123456789abcdef 0x6)",
+            "![a](img:0123456789abcdef 8x0)",
+            "![a](img:0123456789abcdef)",
+            "![a](https://x/y.png)",
+        ] {
+            assert!(parse_image_line(l).is_none(), "{l}");
+        }
+    }
+
+    #[test]
+    fn format_image_line_sanitizes_alt() {
+        let s = format_image_line("a]b(c)\nd", H16, 8, 6);
+        assert!(!s.contains('\n'));
+        let r = parse_image_line(&s).unwrap();
+        assert!(!r.alt.contains(['[', ']', '(', ')', '\n']));
+        assert_eq!((r.hash.as_str(), r.w, r.h), (H16, 8, 6));
+        let long = "가".repeat(70);
+        assert_eq!(parse_image_line(&format_image_line(&long, H16, 8, 6)).unwrap().alt.chars().count(), 60);
+    }
+
+    #[test]
+    fn scan_blocks_finds_image_only_on_own_line() {
+        let img = format!("![x](img:{H16} 8x6)");
+        assert_eq!(kinds(&format!("a\n{img}\nb")), vec![("image".into(), 1, 1)]);
+        // 코드 블록·표 안은 이미지가 아니다
+        assert_eq!(kinds(&format!("```\n{img}\n```")), vec![("code".into(), 0, 2)]);
+        assert_eq!(kinds(&format!("| a | b |\n|---|---|\n| {img} | b |")), vec![("table".into(), 0, 2)]);
+        // 줄 중간에 섞이면 블록이 아니다
+        assert!(kinds(&format!("글 {img}")).is_empty());
+    }
+
+    #[test]
+    fn image_refs_collects_unique_everywhere() {
+        let t = format!("![a](img:{H16} 8x6)\n```\n(img:aaaaaaaaaaaaaaaa)\n```\n글 img:bbbbbbbbbbbbbbbb 끝 ![a](img:{H16} 8x6) img:zz");
+        assert_eq!(image_refs(&t), vec![H16.to_string(), "aaaaaaaaaaaaaaaa".to_string(), "bbbbbbbbbbbbbbbb".to_string()]);
+    }
+
+    #[test]
+    fn image_display_size_cases() {
+        assert_eq!(image_display_size(800, 600, 400.0), (400.0, 300.0));
+        assert_eq!(image_display_size(100, 100, 400.0), (100.0, 100.0)); // 키우지 않는다
+        assert_eq!(image_display_size(500, 2000, 400.0), (175.0, 700.0)); // 높이 상한
+        let (w, h) = image_display_size(800, 600, 0.0);
+        assert!(w >= 1.0 && h >= 1.0);
+    }
+
+    #[test]
+    fn build_gives_collapsed_image_line_its_height() {
+        let t = &themes()[0];
+        let text = format!("![a](img:{H16} 800x600)\n");
+        let job = build(&text, None, 15.0, t, 400.0, true);
+        assert_eq!(job.sections[0].format.line_height, Some(300.0 + IMAGE_PAD));
+        // 커서가 있는 줄·구문 숨김 끔: 원문이 보이고 줄 높이는 그림 높이가 아니다
+        for job in [build(&text, Some(0), 15.0, t, 400.0, true), build(&text, None, 15.0, t, 400.0, false)] {
+            assert!(job.sections[0].format.line_height.map_or(true, |v| v < 100.0));
+        }
+    }
+
+    #[test]
+    fn image_line_text_is_preserved() {
+        let doc = format!("a\n![x](img:{H16} 800x600)\nb\r\n![](img:{H16} 8x6)");
+        same(&doc, None);
+        same(&doc, Some(1));
+    }
+
+    #[test]
+    fn img_scheme_is_not_external() {
+        assert!(!is_external_target("img:0123456789abcdef 8x6"));
+    }
+
+    #[test]
+    fn insert_block_line_pads_blank_lines() {
+        assert_eq!(insert_block_line("a\nb", 0, "X"), "a\n\nX\n\nb");
+        assert_eq!(insert_block_line("a\n\nb", 0, "X"), "a\n\nX\n\nb");
+        assert_eq!(insert_block_line("a\n\nb", 1, "X"), "a\n\nX\n\nb");
+        // 범위를 넘으면 끝에 붙는다(마지막 개행 유무 유지)
+        assert_eq!(insert_block_line("a\nb", 99, "X"), "a\nb\n\nX");
+        assert_eq!(insert_block_line("a\nb\n", 99, "X"), "a\nb\n\nX\n");
+        assert_eq!(insert_block_line("", 0, "X"), "X");
     }
 
     #[test]

@@ -561,6 +561,53 @@ mod tests {
         let _ = fs::remove_dir_all(&t);
     }
 
+    /// 이미지를 하나씩 추가할 때 동기화 조각이 얼마나 바뀌는지 잰다(512KB 조각).
+    /// `cargo test measure_image_churn -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn measure_image_churn() {
+        let t = tmpdir("imgchurn");
+        let src = t.join("a").join("vault.db");
+        let db = Db::open(&src).unwrap();
+        let mut docs = Vec::new();
+        for i in 0..200 {
+            let id = db.new_doc(None).unwrap();
+            let body: String = (0..40).map(|k| format!("문서 {i} 줄 {k}: 가나다라마바사 abcdefg 0123456789\n")).collect();
+            db.save_doc(id, &format!("문서 {i}"), &body).unwrap();
+            docs.push(id);
+        }
+        db.checkpoint().unwrap();
+        let snap = t.join("snap.db");
+        let dir = t.join("sync");
+        Db::snapshot_file(&src, &snap).unwrap();
+        let first = push_file(&snap, &dir, "A", 1, CHUNK).unwrap();
+        println!("그림 없음: 총 {}조각 (첫 올리기 {}개)", first.total, first.written);
+        const PRE: u32 = 40; // 먼저 그림 40장(약 3.4MB)을 넣어 둔 상태에서 한 장씩 더하는 비용을 잰다
+        for k in 0..PRE + 4 {
+            // 사진 비슷한 800×600 그림(해마다 다른 잡음)
+            let rgba: Vec<u8> = (0..800 * 600)
+                .flat_map(|p| {
+                    let (x, y) = (p % 800, p / 800);
+                    let n = ((x * 2654435761u32 as usize) ^ (y * 40503 + k as usize * 977)) % 29;
+                    [((x * 255 / 800) as u8).saturating_add(n as u8), ((y * 255 / 600) as u8).saturating_add(n as u8), 128, 255]
+                })
+                .collect();
+            let r = crate::img::process_rgba(&rgba, 800, 600, "t", 1600, 80).unwrap();
+            db.put_image(&r.hash, &r.webp, r.w, r.h).unwrap();
+            let id = docs[100];
+            let body = format!("그림 {k}\n\n{}\n", crate::md::format_image_line("t", &r.hash, r.w, r.h));
+            db.save_doc(id, "문서 100", &body).unwrap();
+            if k + 1 < PRE {
+                continue;
+            }
+            db.checkpoint().unwrap();
+            Db::snapshot_file(&src, &snap).unwrap();
+            let p = push_file(&snap, &dir, "A", 2 + k as i64, CHUNK).unwrap();
+            println!("그림 {}번째({}KB) 추가: 총 {}조각 중 {}개 갱신", k + 1, r.webp.len() / 1024, p.total, p.written);
+        }
+        let _ = fs::remove_dir_all(&t);
+    }
+
     #[test]
     fn snapshot_file_sees_unmerged_log_and_rev_counter() {
         let t = tmpdir("snapfile");

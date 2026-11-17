@@ -7,6 +7,7 @@ mod diag;
 mod export;
 mod graph;
 mod icons;
+mod img;
 mod layout;
 mod md;
 mod probe;
