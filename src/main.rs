@@ -4,6 +4,7 @@
 mod app;
 mod db;
 mod diag;
+mod editkeys;
 mod export;
 mod graph;
 mod icons;

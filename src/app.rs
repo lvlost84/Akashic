@@ -352,6 +352,13 @@ pub struct App {
     help_filter: String,
     toc_sig: u64,
     goto_line: Option<usize>,
+    /// Ctrl+G 줄 번호 막대
+    goto_open: bool,
+    goto_text: String,
+    goto_focus: bool,
+    /// PageUp/PageDown 요청(아래로?, Shift?)과, 다음 그리기에 맞출 스크롤 위치
+    page_req: Option<(bool, bool)>,
+    page_scroll: Option<Vec2>,
 
     cursor_line: Option<usize>,
     cursor_idx: usize,
@@ -395,6 +402,14 @@ pub struct App {
     ref_focus: Option<u64>,
     /// 저장·목록 갱신 때마다 올라가는 번호(참고 창이 DB 저장본을 다시 읽을 때를 안다)
     ref_rev: u64,
+}
+
+/// 수정키가 정확히 `m`일 때만 `k`를 소비한다(egui의 `consume_key`는 Shift·Alt가 더 눌려도 맞다고 본다).
+fn key_exact(ctx: &egui::Context, m: Modifiers, k: Key) -> bool {
+    ctx.input_mut(|i| {
+        let c = i.modifiers;
+        c.alt == m.alt && c.shift == m.shift && c.command == m.command && i.consume_key(m, k)
+    })
 }
 
 fn byte_of(s: &str, char_idx: usize) -> usize {
@@ -450,6 +465,11 @@ impl App {
             help_filter: String::new(),
             toc_sig: 0,
             goto_line: None,
+            goto_open: false,
+            goto_text: String::new(),
+            goto_focus: false,
+            page_req: None,
+            page_scroll: None,
             cursor_line: None,
             cursor_idx: 0,
             galley_cache: None,
@@ -1076,6 +1096,34 @@ impl App {
         }
     }
 
+    /// 편집 키로 본문을 바꾼 뒤 숫자 목록 번호를 고친다(선택이 없을 때만; 커서 위치도 맞춰 돌려준다).
+    fn renumber_after(&mut self, sel: (usize, usize)) -> (usize, usize) {
+        if self.cfg.auto_renumber && sel.0 == sel.1 {
+            if let Some((nt, nc)) = md::renumber(&self.body, sel.0) {
+                self.body = nt;
+                return (nc, nc);
+            }
+        }
+        sel
+    }
+
+    /// 편집창 밖(찾아 바꾸기 등)에서 본문을 바꾼다: 커서·저장 예약·줄 번호를 갱신한다.
+    /// 편집창을 그리기 전에 부르면 egui의 실행 취소 기록에 한 번의 변경으로 들어간다.
+    fn apply_body_edit(&mut self, ctx: &egui::Context, id: egui::Id, text: String, sel: (usize, usize)) {
+        use egui::text::{CCursor, CCursorRange};
+        self.body = text;
+        let sel = self.renumber_after(sel);
+        let n = self.body.chars().count();
+        let (x, y) = (sel.0.min(n), sel.1.min(n));
+        let mut st = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
+        st.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(x), CCursor::new(y))));
+        st.store(ctx, id);
+        self.cursor_idx = y;
+        self.cursor_line = Some(md::line_of_char(&self.body, y));
+        self.last_edit.get_or_insert_with(Instant::now);
+        ctx.request_repaint();
+    }
+
     // ------------------------------------------------------------ 편집기 키
     fn editor_keys(&mut self, ctx: &egui::Context, id: egui::Id) {
         use egui::text::{CCursor, CCursorRange};
@@ -1090,12 +1138,8 @@ impl App {
         let mut changed = false;
         let mut new_cursor: Option<(usize, usize)> = None;
 
-        let wrap = |body: &mut String, l: &str, r: &str| -> (usize, usize) {
-            let (ba, bb) = (byte_of(body, a), byte_of(body, b));
-            body.insert_str(bb, r);
-            body.insert_str(ba, l);
-            (a + l.chars().count(), b + l.chars().count())
-        };
+        let rev = pi < si; // 선택을 오른쪽→왼쪽으로 했으면 방향을 유지한다
+        let sel = |lo: usize, hi: usize| if rev { (hi, lo) } else { (lo, hi) };
         let pairs: [(Key, Modifiers, &str, &str); 4] = [
             (Key::B, Modifiers::COMMAND, "**", "**"),
             (Key::I, Modifiers::COMMAND, "*", "*"),
@@ -1103,13 +1147,16 @@ impl App {
             (Key::Backtick, Modifiers::COMMAND, "`", "`"),
         ];
         for (k, m, l, r) in pairs {
-            if ctx.input_mut(|i| i.consume_key(m, k)) {
-                new_cursor = Some(wrap(&mut self.body, l, r));
+            if key_exact(ctx, m, k) {
+                // 이미 감싸져 있으면 기호를 걷어내고, 아니면 감싼다
+                let e = crate::editkeys::toggle_wrap(&self.body, a, b, l, r);
+                self.body = e.text;
+                new_cursor = Some(sel(e.lo, e.hi));
                 changed = true;
                 break;
             }
         }
-        if !changed && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::K)) {
+        if !changed && key_exact(ctx, Modifiers::COMMAND, Key::K) {
             let (ba, bb) = (byte_of(&self.body, a), byte_of(&self.body, b));
             self.body.insert_str(bb, "](주소)");
             self.body.insert_str(ba, "[");
@@ -1134,6 +1181,44 @@ impl App {
             }
         });
         let ime_busy = composing_before || self.body_composing || ime_this_frame;
+        // 편집 키 묶음: 들여쓰기·줄 이동/복제/삭제·페이지 이동 (한글 조합 중에는 건드리지 않는다)
+        if !changed && !ime_busy {
+            use crate::editkeys as ek;
+            let edit: Option<Option<ek::Edit>> = if key_exact(ctx, Modifiers::NONE, Key::Tab) {
+                Some(ek::indent(&self.body, a, b, false))
+            } else if key_exact(ctx, Modifiers::SHIFT, Key::Tab) {
+                Some(ek::indent(&self.body, a, b, true))
+            } else if key_exact(ctx, Modifiers::ALT, Key::ArrowUp) {
+                Some(ek::move_lines(&self.body, a, b, true))
+            } else if key_exact(ctx, Modifiers::ALT, Key::ArrowDown) {
+                Some(ek::move_lines(&self.body, a, b, false))
+            } else if key_exact(ctx, Modifiers::COMMAND, Key::D) {
+                Some(Some(ek::duplicate_lines(&self.body, a, b)))
+            } else if key_exact(ctx, Modifiers::COMMAND | Modifiers::SHIFT, Key::K) {
+                Some(Some(ek::delete_lines(&self.body, a, b)))
+            } else {
+                None
+            };
+            if let Some(e) = edit {
+                // 바꿀 것이 없어도(None) 키는 소비했으므로 Tab이 글자를 지우거나 포커스를 옮기지 않는다.
+                if let Some(e) = e {
+                    self.body = e.text;
+                    new_cursor = Some(sel(e.lo, e.hi));
+                    changed = true;
+                }
+            } else if key_exact(ctx, Modifiers::NONE, Key::PageDown) {
+                self.page_req = Some((true, false));
+            } else if key_exact(ctx, Modifiers::SHIFT, Key::PageDown) {
+                self.page_req = Some((true, true));
+            } else if key_exact(ctx, Modifiers::NONE, Key::PageUp) {
+                self.page_req = Some((false, false));
+            } else if key_exact(ctx, Modifiers::SHIFT, Key::PageUp) {
+                self.page_req = Some((false, true));
+            }
+            if self.page_req.is_some() {
+                ctx.request_repaint();
+            }
+        }
         // Enter: 목록·인용·체크박스 이어쓰기
         if !changed && !ime_busy && a == b && ctx.input(|i| i.key_pressed(Key::Enter) && !i.modifiers.any()) {
             let bi = byte_of(&self.body, a);
@@ -1164,6 +1249,9 @@ impl App {
             }
         }
         if changed {
+            if let Some((x, y)) = new_cursor {
+                new_cursor = Some(self.renumber_after((x, y)));
+            }
             if let Some((x, y)) = new_cursor {
                 state.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(x), CCursor::new(y))));
             }
@@ -1551,9 +1639,16 @@ impl App {
         let ctx = ui.ctx().clone();
         #[allow(deprecated)]
         let id = egui::Id::new("body_edit");
+        // Ctrl+G: 줄 번호로 이동 막대 열기(현재 줄 번호를 미리 채워 전체 선택)
+        if !self.cur_trashed && key_exact(&ctx, Modifiers::COMMAND, Key::G) {
+            self.goto_open = true;
+            self.goto_focus = true;
+            self.goto_text = (md::line_of_char(&self.body, self.cursor_idx) + 1).to_string();
+        }
         self.editor_keys(&ctx, id);
         self.find_keys(&ctx, id);
         self.find_bar(ui, id);
+        self.goto_bar(ui, id);
         let find_jump = self.find_apply_jump(&ctx, id);
         // 목차에서 고른 줄로 커서를 옮긴다(스크롤은 아래 편집창을 그린 뒤).
         let mut scroll_to: Option<usize> = None;
@@ -1623,14 +1718,17 @@ impl App {
             g
         };
         let editable = !self.cur_trashed;
-        let area = if wrap_on { egui::ScrollArea::vertical() } else { egui::ScrollArea::both() };
+        let mut area = if wrap_on { egui::ScrollArea::vertical() } else { egui::ScrollArea::both() };
+        if let Some(o) = self.page_scroll.take() {
+            area = area.scroll_offset(o); // PageUp/PageDown으로 정한 스크롤 위치
+        }
         let blocks = crate::render::blocks_cached(&ctx, &self.body);
         let find_view: Option<(&[(usize, usize)], usize)> = if self.find.open { Some((&self.find.matches[..], self.find.cur)) } else { None };
         let bg = ui.visuals().extreme_bg_color;
         let avail_h = ui.available_height();
         self.img.begin_frame();
         let (img_cache, db_ref) = (&mut self.img, &self.db);
-        let out = area
+        let sa = area
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 // 표·코드 박스는 글자 뒤에 깔아야 하므로 자리를 먼저 잡고, 편집창 바탕은 투명하게 한다.
@@ -1659,8 +1757,12 @@ impl App {
                     ui.scroll_to_rect(rect.expand2(egui::vec2(0.0, 28.0)), Some(egui::Align::TOP));
                 }
                 out
-            })
-            .inner;
+            });
+        let (scroll_off, view_h) = (sa.state.clamped_offset(), sa.inner_rect.height());
+        let out = sa.inner;
+        if let Some((down, shift)) = self.page_req.take() {
+            self.page_move_caret(&ctx, id, &out, scroll_off, view_h, down, shift);
+        }
         if out.response.changed() {
             self.last_edit.get_or_insert_with(Instant::now);
             // 숫자 목록 번호 자동 고침(실행 취소 직후에는 되돌린 모양을 존중해 건드리지 않는다)
@@ -1699,6 +1801,90 @@ impl App {
                 self.body = nb;
                 self.last_edit.get_or_insert_with(Instant::now);
             }
+        }
+    }
+
+    /// PageUp/PageDown: 캐럿과 화면을 한 화면 높이만큼 같이 옮긴다(캐럿의 화면상 위치 유지).
+    /// 줄 높이가 제각각(표·그림·수식)이라 줄 수가 아니라 글 배치(galley)의 실제 y 좌표로 계산한다.
+    #[allow(clippy::too_many_arguments)]
+    fn page_move_caret(&mut self, ctx: &egui::Context, id: egui::Id, out: &egui::text_edit::TextEditOutput, off: Vec2, view_h: f32, down: bool, shift: bool) {
+        use egui::text::CCursorRange;
+        let Some(r) = out.cursor_range else { return };
+        let caret = out.galley.pos_from_cursor(r.primary);
+        let content_h = out.galley.rect.bottom();
+        let (ny, ns) = crate::editkeys::page_move(caret.top(), off.y, view_h, content_h, down);
+        let target = out.galley.cursor_from_pos(Vec2::new(caret.min.x, ny));
+        let mut st = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
+        let range = if shift { CCursorRange::two(r.secondary, target) } else { CCursorRange::one(target) };
+        st.cursor.set_char_range(Some(range));
+        st.store(ctx, id);
+        let idx: usize = target.index.into();
+        self.cursor_idx = idx;
+        self.cursor_line = Some(md::line_of_char(&self.body, idx));
+        self.page_scroll = Some(Vec2::new(off.x, ns));
+        ctx.request_repaint();
+    }
+
+    /// Ctrl+G 줄 번호 막대. Enter로 이동(범위를 넘으면 맨 끝 줄), 숫자가 아니면 안내, Esc로 닫기.
+    fn goto_bar(&mut self, ui: &mut egui::Ui, body_id: egui::Id) {
+        if !self.goto_open {
+            return;
+        }
+        let ctx = ui.ctx().clone();
+        #[allow(deprecated)]
+        let eid = egui::Id::new("goto_edit");
+        if self.goto_focus {
+            let mut st = egui::TextEdit::load_state(&ctx, eid).unwrap_or_default();
+            let len = self.goto_text.chars().count();
+            st.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(len))));
+            st.store(&ctx, eid);
+        }
+        let (enter, esc) = ctx.input(|i| (i.key_pressed(Key::Enter), i.key_pressed(Key::Escape)));
+        let total = crate::editkeys::line_count(&self.body);
+        let dim = self.theme.dim;
+        let mut go = false;
+        let mut close = false;
+        ui.horizontal(|ui| {
+            ui.label("줄 번호로 이동");
+            let r = ui.add(egui::TextEdit::singleline(&mut self.goto_text).id(eid).desired_width(80.0).hint_text("번호"));
+            if self.goto_focus {
+                r.request_focus();
+                self.goto_focus = false;
+            }
+            if r.lost_focus() && enter {
+                go = true;
+            }
+            if r.has_focus() && esc {
+                close = true;
+            }
+            ui.label(egui::RichText::new(format!("(1~{total})")).color(dim));
+            if ui.button("이동").clicked() {
+                go = true;
+            }
+            if ui.button("닫기").on_hover_text("Esc").clicked() {
+                close = true;
+            }
+        });
+        ui.add_space(2.0);
+        if go {
+            match crate::editkeys::parse_goto(&self.goto_text, total) {
+                Some(line) => {
+                    let asked: Option<usize> = self.goto_text.trim().parse().ok();
+                    if asked.is_none_or(|n| n > total) {
+                        self.say(&format!("{total}줄이 끝입니다 — 맨 끝 줄로 이동했습니다"));
+                    }
+                    self.goto_line = Some(line);
+                    close = true;
+                }
+                None => {
+                    self.say("줄 번호는 숫자로 입력하세요");
+                    self.goto_focus = true;
+                }
+            }
+        }
+        if close {
+            self.goto_open = false;
+            ctx.memory_mut(|m| m.request_focus(body_id));
         }
     }
 

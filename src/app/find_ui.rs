@@ -18,6 +18,16 @@ pub(super) struct Find {
     composing: bool,
     /// 다음 그리기에서 현재 일치로 이동
     pub jump: bool,
+    /// 찾아 바꾸기(Ctrl+H) 줄 표시, 바꿀 글
+    pub replace_open: bool,
+    pub repl: String,
+    /// 하나 바꾼 직후: 이 글자 위치 뒤의 첫 일치로 이동(다음 갱신 때 한 번)
+    after_replace: Option<usize>,
+}
+
+#[allow(deprecated)]
+fn repl_id() -> egui::Id {
+    egui::Id::new("find_repl")
 }
 
 #[allow(deprecated)]
@@ -42,6 +52,22 @@ impl App {
                 }
             }
             self.find.open = true;
+            self.find.want_focus = true;
+        }
+        if !self.cur_trashed && super::key_exact(ctx, Modifiers::COMMAND, Key::H) {
+            // Ctrl+H: 찾기 막대를 바꾸기 줄과 함께 연다(선택한 글이 있으면 검색어로 채운다)
+            if let Some(r) = egui::TextEdit::load_state(ctx, body_id).and_then(|s| s.cursor.char_range()) {
+                let (a, b) = (usize::from(r.primary.index), usize::from(r.secondary.index));
+                let (lo, hi) = (a.min(b), a.max(b));
+                if hi > lo && hi - lo <= 100 {
+                    let t: String = self.body.chars().skip(lo).take(hi - lo).collect();
+                    if !t.contains('\n') {
+                        self.find.query = t;
+                    }
+                }
+            }
+            self.find.open = true;
+            self.find.replace_open = true;
             self.find.want_focus = true;
         }
         if !self.find.open {
@@ -96,6 +122,37 @@ impl App {
         } else {
             self.find.cur = self.find.cur.min(n.saturating_sub(1));
         }
+        if let Some(p) = self.find.after_replace.take() {
+            // 하나 바꾼 뒤: 바꾼 글 바로 뒤의 첫 일치(없으면 처음)로 간다.
+            self.find.cur = self.find.matches.iter().position(|m| m.0 >= p).unwrap_or(0);
+            self.find.jump = n > 0;
+        }
+    }
+
+    /// 바꾸기(현재 일치 하나) 또는 모두 바꾸기. 편집창을 그리기 전에 본문을 바꾸므로 Ctrl+Z 한 번으로 되돌아간다.
+    fn find_replace(&mut self, ctx: &egui::Context, body_id: egui::Id, all: bool) {
+        if self.cur_trashed || self.find.query.is_empty() {
+            return;
+        }
+        // 이 프레임에 본문이 바뀌었을 수 있으니 일치 위치를 새로 구한다.
+        let matches = md::find_all(&self.body, &self.find.query, self.find.case);
+        if matches.is_empty() {
+            self.say("바꿀 글이 없습니다");
+            return;
+        }
+        let repl = self.find.repl.clone();
+        let rl = repl.chars().count();
+        if all {
+            let (text, n, cur) = crate::editkeys::replace_matches(&self.body, &matches, &repl, self.cursor_idx);
+            self.apply_body_edit(ctx, body_id, text, (cur, cur));
+            self.find.jump = false;
+            self.say(&format!("{n}건을 바꿨습니다"));
+        } else {
+            let (s, e) = matches[self.find.cur.min(matches.len() - 1)];
+            let (text, _, _) = crate::editkeys::replace_matches(&self.body, &[(s, e)], &repl, s);
+            self.apply_body_edit(ctx, body_id, text, (s + rl, s + rl));
+            self.find.after_replace = Some(s + rl);
+        }
     }
 
     pub(super) fn find_step(&mut self, forward: bool) {
@@ -145,6 +202,7 @@ impl App {
         let dim = self.theme.dim;
         let mut close = false;
         let mut step: Option<bool> = None;
+        let mut rep: Option<bool> = None;
         if self.find.want_focus {
             // 열 때 기존 검색어를 전부 선택해 바로 덮어쓸 수 있게 한다.
             let mut st = egui::TextEdit::load_state(&ctx, edit_id()).unwrap_or_default();
@@ -189,7 +247,22 @@ impl App {
                 close = true;
             }
         });
+        if self.find.replace_open {
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.find.repl).id(repl_id()).hint_text("바꿀 글").desired_width(220.0));
+                let on = !self.cur_trashed && !self.find.query.is_empty() && !self.find.matches.is_empty();
+                if ui.add_enabled(on, egui::Button::new("바꾸기")).on_hover_text("현재 일치 하나를 바꾸고 다음으로").clicked() {
+                    rep = Some(false);
+                }
+                if ui.add_enabled(on, egui::Button::new("모두 바꾸기")).on_hover_text("일치를 전부 바꿉니다 (Ctrl+Z 한 번으로 되돌림)").clicked() {
+                    rep = Some(true);
+                }
+            });
+        }
         ui.add_space(2.0);
+        if let Some(all) = rep {
+            self.find_replace(&ctx, body_id, all);
+        }
         if let Some(fwd) = step {
             self.find_step(fwd);
         }
