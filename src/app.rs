@@ -353,6 +353,8 @@ pub struct App {
     cursor_line: Option<usize>,
     cursor_idx: usize,
     galley_cache: Option<(u64, Arc<egui::Galley>)>,
+    /// 글꼴을 바꾼 패스 번호. egui는 새 글꼴을 다음 패스부터 쓰므로, 그 뒤에 한 번 더 글자 배치 캐시를 비운다.
+    font_swap_pass: Option<u64>,
     /// 문서 안 이미지의 화면용 텍스처 캐시
     img: crate::img::ImgCache<egui::TextureHandle>,
     stats: status_ui::DocStats,
@@ -441,6 +443,7 @@ impl App {
             cursor_line: None,
             cursor_idx: 0,
             galley_cache: None,
+            font_swap_pass: None,
             img: crate::img::ImgCache::new(),
             stats: status_ui::DocStats::unset(),
             storage: Default::default(),
@@ -1525,6 +1528,11 @@ impl App {
         // 아주 큰 문서는 줄마다 서식 기호를 숨겼다 보이는 방식이 전체 글자 배치를 다시 하게 만들어 느리므로 끈다.
         let big = self.body.len() > 300_000;
         let (size, hide, wrap_on, cl) = (self.cfg.font_size, self.cfg.hide_syntax && !big, self.cfg.wrap, self.cursor_line);
+        // 글꼴을 방금 바꿨으면: 바꾼 패스에서는 옛 글꼴로 배치된 글자가 캐시에 들어갔을 수 있어, 새 글꼴이 적용된 패스에서 한 번 비운다.
+        if self.font_swap_pass.is_some_and(|p| ctx.cumulative_pass_nr() > p) {
+            self.font_swap_pass = None;
+            self.galley_cache = None;
+        }
         let cache = &mut self.galley_cache;
         let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, width: f32| -> Arc<egui::Galley> {
             let text = buf.as_str();

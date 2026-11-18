@@ -170,6 +170,8 @@ impl App {
         self.cfg.font_korean_loc = k.map(theme::FontPaths::from_family).unwrap_or_default();
         theme::install_with(ctx, l, k);
         self.galley_cache = None;
+        self.font_swap_pass = Some(ctx.cumulative_pass_nr());
+        ctx.request_repaint(); // 새 글꼴은 다음 패스부터 적용되므로 한 번 더 그린다
         self.cfg.save();
     }
 

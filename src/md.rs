@@ -661,6 +661,20 @@ pub fn scan_blocks(text: &str) -> Vec<Block> {
                 }
             }
         }
+        if line.trim() == "$$" {
+            // 여러 줄 수식: 다음 `$$`만 있는 줄까지. 빈 줄·코드 펜스를 만나면 짝이 없는 것으로 보고(문서 뒤쪽을 삼키지 않는다) 그냥 글로 둔다.
+            let mut j = i + 1;
+            while j < lines.len() && lines[j].trim() != "$$" && !lines[j].trim().is_empty() && !lines[j].trim_start().starts_with("```") {
+                j += 1;
+            }
+            if j < lines.len() && lines[j].trim() == "$$" {
+                if let Some(node) = crate::math::parse_multi(&lines[i + 1..j].join(" ")) {
+                    out.push(Block { kind: BlockKind::Math { node }, start: i, end: j });
+                }
+                i = j + 1; // 틀린 수식이어도 닫는 `$$`가 다음 수식의 여는 줄이 되지 않게 한다
+                continue;
+            }
+        }
         if heading_level(line).is_none() && is_hr(line) {
             out.push(Block { kind: BlockKind::Hr, start: i, end: i });
         } else if let Some(items) = parse_image_row(line) {
@@ -755,11 +769,11 @@ pub fn build(text: &str, cursor_line: Option<usize>, size: f32, t: &Theme, wrap:
             } else {
                 push(&mut job, line, &St { dim: true, code: true, ..plain }, &cx);
             }
-        } else if let Some(Block { kind: BlockKind::Math { node }, .. }) = blk {
-            if hide {
-                // 글자는 투명하고 아주 작게 두고, 줄 높이를 수식 높이로 키운다. 수식은 render.rs가 그린다.
+        } else if let Some(Block { kind: BlockKind::Math { node }, start, .. }) = blk {
+            if collapsed {
+                // 글자는 투명하고 아주 작게 두고, 첫 줄의 높이를 수식 높이로 키운다(나머지 줄은 거의 0). 수식은 render.rs가 그린다.
                 let mut f = hidden_fmt(4.0);
-                f.line_height = Some(crate::math::height_em(node) * size + MATH_PAD);
+                f.line_height = Some(if n == *start { crate::math::height_em(node) * size + MATH_PAD } else { 1.0 });
                 job.append(line, 0.0, f.clone());
                 nl_fmt = Some(f);
             } else {
@@ -1171,6 +1185,60 @@ mod tests {
         assert_eq!(k, vec![("math".to_string(), 1, 1)]); // 틀린 수식은 블록이 아니다
         // 코드 블록 안의 $$...$$는 수식이 아니다
         assert!(kinds("```\n$$x$$\n```\n").iter().all(|(k, ..)| k != "math"));
+    }
+
+    #[test]
+    fn multiline_math_block_spans_dollar_lines() {
+        let k = kinds("앞\n$$\nx = \\frac{a}\n   {b}\n$$\n뒤\n");
+        assert_eq!(k, vec![("math".to_string(), 1, 4)]);
+        let k = kinds("  $$  \n\\begin{aligned}a&=b\\\\\n&=c\\end{aligned}\n $$\n");
+        assert_eq!(k, vec![("math".to_string(), 0, 3)]);
+        // 한 줄 수식은 그대로
+        assert_eq!(kinds("$$x$$\n"), vec![("math".to_string(), 0, 0)]);
+    }
+
+    #[test]
+    fn unclosed_or_invalid_multiline_math_is_not_a_block() {
+        // 닫는 $$ 가 없으면 뒤쪽 문서를 삼키지 않는다(표·체크박스는 그대로 인식).
+        let k = kinds("$$\nx = 1\n\n- [ ] 할 일\n\n| a | b |\n|---|---|\n| 1 | 2 |\n");
+        assert_eq!(k.iter().map(|(k, ..)| k.as_str()).collect::<Vec<_>>(), vec!["check", "table"]);
+        // 빈 줄을 넘어 먼 $$ 와 짝지어지지 않는다.
+        assert!(kinds("$$\nx\n\n문단\n$$\n").is_empty());
+        // 문법이 틀리면 블록이 아니고, 닫는 $$ 가 다음 수식의 여는 줄이 되지도 않는다.
+        assert!(kinds("$$\n\\frac{1}\n$$\n").is_empty());
+        assert_eq!(kinds("$$\n\\frac{1}\n$$\n$$\nx\n$$\n"), vec![("math".to_string(), 3, 5)]);
+        // 빈 수식
+        assert!(kinds("$$\n$$\n").is_empty());
+    }
+
+    #[test]
+    fn multiline_math_inside_code_block_is_not_math() {
+        assert!(kinds("```\n$$\nx\n$$\n```\n").iter().all(|(k, ..)| k != "math"));
+        // 코드 펜스가 사이에 끼면 짝을 짓지 않는다.
+        assert!(kinds("$$\nx\n```\n$$\n").iter().all(|(k, ..)| k != "math"));
+    }
+
+    #[test]
+    fn multiline_math_height_on_first_line_and_cursor_shows_source() {
+        let t = &themes()[0];
+        let text = "a\n$$\n\\frac{a}\n{b}\n$$\nz\n";
+        let lh = |job: &LayoutJob, needle: &str| job.sections.iter().find(|s| job.text[s.byte_range.start.0..s.byte_range.end.0].contains(needle)).unwrap().format.line_height;
+        let job = build(text, None, 15.0, t, 600.0, true);
+        assert_eq!(job.text, text); // 글자는 원문 그대로
+        let first = job.sections.iter().find(|s| job.text[s.byte_range.start.0..s.byte_range.end.0].starts_with("$$")).unwrap().format.line_height.expect("첫 줄이 수식 높이를 가진다");
+        let inner = lh(&job, "frac").expect("안쪽 줄도 높이를 직접 정한다(작게)");
+        assert!(first > 15.0 * 1.5 && inner < 6.0, "{first} {inner}");
+        // 커서가 블록 안 어느 줄이든 모든 줄이 원문(줄 높이를 키우지 않음).
+        for c in 1..=4 {
+            let job = build(text, Some(c), 15.0, t, 600.0, true);
+            assert_eq!(job.text, text);
+            for s in &job.sections {
+                assert!(s.format.line_height.map_or(true, |v| v < first), "cursor {c}");
+            }
+        }
+        // 블록 밖 커서는 수식으로 그린다.
+        let job = build(text, Some(5), 15.0, t, 600.0, true);
+        assert!(lh(&job, "frac").map_or(false, |v| v < 6.0));
     }
 
     #[test]
