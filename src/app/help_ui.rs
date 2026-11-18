@@ -13,6 +13,8 @@ enum Kind {
     Rule,
     /// "단축키\t설명" 줄들을 표로(## 로 시작하는 줄은 소제목)
     Keys,
+    /// 예시의 `$$` 줄(블록)을 수식으로 그려 결과를 보인다
+    Math,
 }
 
 struct Topic {
@@ -34,7 +36,12 @@ const TOPICS: &[Topic] = &[
     Topic {
         group: "기본",
         title: "화면 구성",
-        desc: "• 왼쪽: 새 문서, 검색, 보기(전체·미분류·★·휴지통), 분류 트리, 태그, 문서 목록\n• 가운데: 제목, 태그, 본문(쓰는 즉시 서식)\n• 오른쪽: 연결 그래프 ↔ 목차 (위쪽 \"연결\"·\"목차\" 버튼으로 열고 전환)\n• 아래: 상태바 — Num/Caps/Scroll 잠금 키 상태, 저장·병합 막대, DB·캐시 정보, 메모리(5분마다 갱신), 글자 배율, 백업, 동기화 상태, 글자·줄·단어 수, 커서 위치\n\n상태바의 동기화·백업·데이터 칸을 누르면 옵션의 해당 탭이 열립니다.",
+        desc: "• 왼쪽: 새 문서, 검색, 보기(전체·미분류·★·휴지통), 분류 트리, 태그, 문서 목록\n• 가운데: 제목, 태그, 본문(쓰는 즉시 서식)\n• 오른쪽: 연결 그래프 ↔ 목차 (위쪽 \"연결\"·\"목차\" 버튼으로 열고 전환)\n• 아래: 상태바 — Num/Caps/Scroll 잠금 키 상태, 저장·병합 막대, DB·캐시 정보, 메모리(5분마다 갱신), 글자 배율, 백업, 동기화 상태, 글자·줄·단어 수, 커서 위치\n\n상태바의 동기화·백업·데이터 칸을 누르면 옵션의 해당 탭이 열립니다.
+
+■ 참고 창(새 창)
+• 도구줄의 \"새 창\" 단추(뒤로·앞으로 오른쪽) 또는 문서 목록 우클릭 \"새 창으로 열기\"로 문서를 별도 창에 읽기 전용으로 띄워, 보면서 본창에서 작업할 수 있습니다(최대 8개, 같은 문서는 한 창만).
+• 서식은 본창과 같게 보이고 편집은 되지 않습니다. 본창에서 그 문서를 고치면 참고 창에도 바로 반영됩니다.
+• 참고 창 안의 [[문서 링크]]를 누르면 그 창의 문서만 바뀌고(본창은 그대로), \"뒤로\"(Alt+←)로 돌아옵니다. Esc나 X로 닫습니다.",
         example: "",
         kind: Kind::Plain,
     },
@@ -109,11 +116,87 @@ const TOPICS: &[Topic] = &[
         kind: Kind::Table,
     },
     Topic {
-        group: "마크다운 문법",
+        group: "수식(LaTeX)",
         title: "수식",
-        desc: "한 줄에 $$수식$$만 쓰면 그 줄이 수식으로 그려집니다(커서가 그 줄에 있으면 원문). 예: $$x=\\frac{a \\times b}{1-c}$$\n\n쓸 수 있는 것: \\frac{분자}{분모} 분수, ^ 위첨자, _ 아래첨자, \\sqrt{} 제곱근, \\text{한글 글자}, { } 묶기, \\times \\div \\pm \\cdot \\le \\ge \\ne \\approx \\infty \\sum \\int \\to, 그리스 문자(\\alpha \\beta \\pi …), \\sin \\cos \\log 등, \\quad 빈칸.\n\n여러 줄 수식: 위아래 줄에 $$만 쓰고 그 사이에 수식을 쓰면 됩니다. 줄바꿈은 공백으로 읽고, \\\\ 가 새 줄입니다(여러 줄을 가운데 정렬로 쌓음). \\begin{aligned} … \\end{aligned} (또는 align, align*) 안에서는 & 자리에 맞춰 정렬합니다(보통 = 앞에 &: a &= b \\\\ &= c). 커서가 블록 안에 있으면 모든 줄이 원문으로 보입니다. 닫는 $$가 없거나 사이에 빈 줄이 있으면 수식이 아니라 그냥 글입니다.\n\n구조 명령: \\dfrac \\tfrac \\binom{n}{k}, \\sqrt[n]{x}(n제곱근), \\sum \\prod \\int \\lim 의 한계(블록 수식에서는 기호 위·아래, 분수·첨자 안에서는 옆 첨자. \\limits \\nolimits 로 바꿈), 장식 \\hat \\bar \\vec \\dot \\ddot \\tilde \\widehat \\overline \\underline, \\boxed \\cancel, \\overset{위}{기호} \\underset{아래}{기호} \\stackrel, \\left( … \\right) 처럼 괄호를 내용 높이에 맞춰 키움(\\left. 는 없음 / ( ) [ ] \\{ \\} \n \\\n \\langle \\rangle \\lfloor \\rceil 등).\n\n기호 300여 개: 관계(\\sim \\simeq \\cong \\propto \\perp), 연산(\\oplus \\otimes \\circ \\cup \\cap \\wedge \\vee), 화살표(\\leftrightarrow \\Rightarrow \\mapsto \\iff), 집합·논리(\\in \\notin \\subset \\emptyset \\forall \\exists \\neg), 점(\\ldots \\cdots \\vdots \\ddots), 그리스 문자 대·소문자와 \\varepsilon \\varphi \\vartheta 등. 쓰는 글꼴에 없는 기호는 네모(□)로 보일 수 있습니다(기본 글꼴에서는 약 150개).\n\n문법이 틀리면(예: 중괄호가 닫히지 않음) 수식으로 그리지 않고 원문 그대로 둡니다. 문장 중간의 $x$ 같은 줄 안 수식은 아직 지원하지 않습니다.",
-        example: "",
-        kind: Kind::Plain,
+        desc: r#"한 줄에 $$수식$$만 쓰면 그 줄이 수식으로 그려집니다. 커서가 그 줄에 들어오면 원문이 보이고, 벗어나면 다시 수식으로 그려집니다.
+
+• 수식 안의 공백과 줄바꿈은 무시됩니다. 띄어 쓰거나 한글을 넣으려면 \text{...} 안에 씁니다(예: \text{목표 비율}).
+• 문법이 틀리면(중괄호가 안 맞음, 지원하지 않는 명령 등) 수식으로 그리지 않고 원문 그대로 보입니다. 그 줄을 클릭해 원문을 고치세요.
+• 수식은 줄 단위입니다. 문장 중간에 끼우는 $x$ 같은 줄 안 수식은 지원하지 않습니다.
+• 본문보다 수식이 넓으면 통째로 줄여서 맞춥니다.
+• 내보내기에서는 수식이 $$ 원문 그대로 나갑니다.
+• 여러 줄 수식·정렬은 "여러 줄·정렬" 항목, 쓸 수 있는 기호는 "수식 기호 표" 항목을 보세요."#,
+        example: r#"$$x=\frac{a \times b}{1-c}$$
+$$\text{추가해야 하는 양 }x=\frac{\text{목표 비율} \times \text{기존 무게}}{1 - \text{목표 비율}}$$"#,
+        kind: Kind::Math,
+    },
+    Topic {
+        group: "수식(LaTeX)",
+        title: "분수·첨자·근호",
+        desc: r#"• \frac{분자}{분모}: 분수. 분수 안에 분수를 넣을 수 있고 안쪽은 작게 그려집니다. \dfrac \tfrac 로 분수 크기를 정해 쓸 수도 있습니다.
+• ^ 위첨자, _ 아래첨자: 한 글자면 그대로(x^2, a_i), 두 글자 이상이면 { }로 묶습니다(x^{10}, a_{ij}). 둘 다 쓸 수 있습니다(x_i^2).
+• \sqrt{x} 제곱근, \sqrt[3]{x} n제곱근(차수는 [ ] 안).
+• \binom{n}{k}: 조합.
+• { }는 묶기만 하고 화면에는 나타나지 않습니다. 중괄호 글자 자체는 \{ \} 로 씁니다."#,
+        example: r#"$$\frac{a+b}{c}$$
+$$\frac{1}{1+\frac{1}{x}}$$
+$$x^2 + y_i + z_i^2 + e^{-x^2}$$
+$$\sqrt{a^2+b^2} \qquad \sqrt[3]{x}$$
+$$\binom{n}{k} = \frac{n!}{k!(n-k)!}$$"#,
+        kind: Kind::Math,
+    },
+    Topic {
+        group: "수식(LaTeX)",
+        title: "합·적분·극한",
+        desc: r#"\sum(합) \prod(곱) \int(적분) \iint \oint \lim(극한)에 _ ^ 로 범위를 붙입니다. 한 줄 단독 수식(블록)에서는 범위가 기호 위·아래에 붙고, 분수나 첨자 안에서는 옆에 붙습니다. \limits 를 붙이면 위·아래로, \nolimits 를 붙이면 옆으로 바꿉니다.
+
+\sin \cos \tan \log \ln \exp \min \max 같은 함수 이름은 그대로 쓰면 곧은 글자로 그려집니다."#,
+        example: r#"$$\sum_{i=1}^{n} i = \frac{n(n+1)}{2}$$
+$$\prod_{k=1}^{n} k = n!$$
+$$\int_0^1 x^2 \, dx = \frac{1}{3}$$
+$$\lim_{x \to 0} \frac{\sin x}{x} = 1$$"#,
+        kind: Kind::Math,
+    },
+    Topic {
+        group: "수식(LaTeX)",
+        title: "괄호·장식",
+        desc: r#"• \left( ... \right): 괄호가 안의 내용 높이에 맞춰 커집니다. ( ) [ ] \{ \} | \langle \rangle 등을 쓸 수 있고, \left. 처럼 점(.)을 쓰면 그쪽 괄호는 그리지 않습니다.
+• \hat \bar \vec \dot \ddot \tilde (위에 붙는 표시), \widehat \widetilde \overline(위줄) \underline(밑줄).
+• \boxed{...} 네모 테두리, \cancel{...} 줄 긋기(\bcancel \xcancel).
+• \overset{위}{기호} \underset{아래}{기호}: 기호의 위·아래에 작은 글자를 붙입니다. \stackrel 은 \overset 과 같습니다."#,
+        example: r#"$$\left( \frac{a}{b} \right)^2 \qquad \left[ \frac{1}{2} \right]$$
+$$\hat{x} \quad \bar{y} \quad \vec{v} \quad \dot{a} \quad \tilde{z}$$
+$$\overline{AB} \quad \underline{CD}$$
+$$\boxed{E = mc^2}$$
+$$\cancel{a}b \qquad \overset{def}{=} \qquad \underset{n \to \infty}{\lim} a_n$$"#,
+        kind: Kind::Math,
+    },
+    Topic {
+        group: "수식(LaTeX)",
+        title: "여러 줄·정렬",
+        desc: r#"위아래 줄에 $$만 쓰고 그 사이에 수식을 쓰면 여러 줄 수식입니다. 줄바꿈은 공백으로 읽으므로 긴 식을 보기 좋게 나눠 써도 됩니다. \\ 가 새 줄이며, 여러 줄은 가운데 정렬로 쌓입니다.
+
+\begin{aligned} ... \end{aligned} (또는 align, align*) 안에서는 & 자리에 맞춰 정렬합니다. 보통 = 앞에 &를 씁니다: a &= b \\ &= c
+
+커서가 블록 안에 있으면 모든 줄이 원문으로 보입니다. 닫는 $$가 없거나 사이에 빈 줄이 있으면 수식이 아니라 그냥 글입니다."#,
+        example: r#"$$
+a + b = c \\
+d = e + f
+$$
+$$
+\begin{aligned}
+y &= (x+1)^2 \\
+  &= x^2 + 2x + 1
+\end{aligned}
+$$"#,
+        kind: Kind::Math,
+    },
+    Topic {
+        group: "수식(LaTeX)",
+        title: "수식 기호 표",
+        desc: r#"명령어를 그대로 쓰면 오른쪽 기호가 됩니다. 앱 글꼴에 없는 드문 기호는 □로 보일 수 있습니다(영문·한글 글꼴을 바꿔 보세요). 표에 없는 명령도 많이 지원하며, 모르는 명령이 있으면 수식 대신 원문이 그대로 보입니다."#,
+        example: "## 그리스 문자\n\\alpha \\beta \\gamma \\delta\tα β γ δ\n\\varepsilon \\zeta \\eta \\theta\tε ζ η θ\n\\lambda \\mu \\nu \\xi\tλ μ ν ξ\n\\pi \\rho \\sigma \\tau\tπ ρ σ τ\n\\varphi \\chi \\psi \\omega\tφ χ ψ ω\n\\Gamma \\Delta \\Theta \\Lambda\tΓ Δ Θ Λ\n\\Pi \\Sigma \\Phi \\Psi \\Omega\tΠ Σ Φ Ψ Ω\n## 연산·관계\n\\times \\div \\pm \\cdot\t× ÷ ± ·\n\\le \\ge \\ne \\approx \\equiv\t≤ ≥ ≠ ≈ ≡\n## 화살표·논리·집합\n\\to \\leftarrow \\leftrightarrow\t→ ← ↔\n\\Rightarrow \\Leftarrow \\Leftrightarrow \\mapsto\t⇒ ⇐ ⇔ ↦\n\\in \\subset \\cup \\cap\t∈ ⊂ ∪ ∩\n\\forall \\exists \\neg \\therefore\t∀ ∃ ¬ ∴\n## 기타\n\\infty \\partial \\nabla \\degree\t∞ ∂ ∇ °\n\\ldots\t…\n\\sum \\prod \\int \\iint \\oint\t∑ ∏ ∫ ∬ ∮\n## 함수 이름·빈칸·특수 글자\n\\sin \\cos \\tan \\log \\ln \\exp\t곧은 글자로 그려지는 함수 이름\n\\quad \\qquad\t넓은 빈칸\n\\% \\$ \\& \\# \\_ \\{ \\}\t% $ & # _ { } 를 글자 그대로",
+        kind: Kind::Keys,
     },
     Topic {
         group: "마크다운 문법",
@@ -153,7 +236,7 @@ const TOPICS: &[Topic] = &[
     Topic {
         group: "사용법",
         title: "끌어 놓기 · 마우스",
-        desc: "• 문서 → 분류: 목록의 문서를 왼쪽 분류에 놓으면 그 분류로 이동\n• 문서 → \"미분류\": 분류 해제  /  문서 → 🗑: 휴지통으로\n• 문서 → 태그: 그 태그가 달림\n• 분류 → 다른 분류: 하위 분류가 됨  /  \"분류\" 머리글에 놓으면 최상위로\n• 직접 정렬: 목록 위 정렬 상자에서 \"직접 정렬\"을 고르면 문서를 끌어 순서를 바꿀 수 있음 (고정(★)된 문서는 항상 맨 위)\n• 분류 우클릭: 하위 분류 만들기, 이름 바꾸기, 최상위로 옮기기, 삭제\n• 문서 우클릭: 즐겨찾기, 분류로 이동, 휴지통(휴지통에서는 복원·영구 삭제)\n• 탐색기에서 .md / .txt 파일을 창에 끌어다 놓으면 가져오기",
+        desc: "• 문서 → 분류: 목록의 문서를 왼쪽 분류에 놓으면 그 분류로 이동\n• 문서 → \"미분류\": 분류 해제  /  문서 → 🗑: 휴지통으로\n• 문서 → 태그: 그 태그가 달림\n• 분류 → 다른 분류: 하위 분류가 됨  /  \"분류\" 머리글에 놓으면 최상위로\n• 직접 정렬: 목록 위 정렬 상자에서 \"직접 정렬\"을 고르면 문서를 끌어 순서를 바꿀 수 있음 (고정(★)된 문서는 항상 맨 위)\n• 분류 우클릭: 하위 분류 만들기, 이름 바꾸기, 최상위로 옮기기, 삭제\n• 문서 우클릭: 즐겨찾기, 문서 링크 복사([[제목]]을 클립보드에 복사 → 다른 문서에 붙여넣으면 연결), 분류로 이동(대분류 → 소분류 순서로 펼쳐지는 메뉴), 휴지통(휴지통에서는 복원·영구 삭제)\n• 탐색기에서 .md / .txt 파일을 창에 끌어다 놓으면 가져오기",
         example: "",
         kind: Kind::Plain,
     },
@@ -292,9 +375,43 @@ fn show_result(ui: &mut egui::Ui, t: &Topic, theme: &Theme, size: f32) {
                     }
                 });
             }
+            Kind::Math => {
+                for b in md::scan_blocks(t.example) {
+                    if let md::BlockKind::Math { node } = &b.kind {
+                        draw_formula(ui, node, size, theme);
+                    }
+                }
+            }
             Kind::Plain | Kind::Keys => {}
         }
     });
+}
+
+/// 수식 하나를 결과 칸에 그린다(편집창의 수식 블록과 같은 배치·그리기).
+fn draw_formula(ui: &mut egui::Ui, node: &crate::math::Node, size: f32, theme: &Theme) {
+    use crate::math::{self, Item};
+    let font = |sc: f32| egui::FontId::new(size * sc, egui::FontFamily::Proportional);
+    let mut measure = |s: &str, sc: f32| ui.ctx().fonts_mut(|f| f.layout_no_wrap(s.to_string(), font(sc), theme.text)).size().x / size;
+    let lay = math::layout(node, &mut measure);
+    let avail = ui.available_width();
+    let k = ((avail - 16.0).max(40.0) / (lay.w * size).max(1.0)).min(1.0);
+    let h = (lay.asc + lay.desc) * size * k + 12.0;
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(avail, h), Sense::hover());
+    let x0 = rect.center().x - lay.w * size * k / 2.0;
+    let base_y = rect.center().y - (lay.asc + lay.desc) * size * k / 2.0 + lay.asc * size * k;
+    for it in &lay.items {
+        match it {
+            Item::Glyph { x, y, text, scale } => {
+                let g = ui.ctx().fonts_mut(|f| f.layout_no_wrap(text.clone(), egui::FontId::new(size * scale * k, egui::FontFamily::Proportional), theme.text));
+                let base = g.rows.first().and_then(|r| r.glyphs.first().map(|gl| r.pos.y + gl.pos.y)).unwrap_or(g.size().y * 0.8);
+                ui.painter().galley(egui::pos2(x0 + x * size * k, base_y + y * size * k - base), g, theme.text);
+            }
+            Item::Line { a, b } => {
+                let p = |q: &(f32, f32)| egui::pos2(x0 + q.0 * size * k, base_y + q.1 * size * k);
+                ui.painter().line_segment([p(a), p(b)], Stroke::new((math::RULE * size * k).max(1.0), theme.text));
+            }
+        }
+    }
 }
 
 fn show_keys(ui: &mut egui::Ui, t: &Topic, theme: &Theme) {
@@ -455,6 +572,14 @@ mod tests {
             assert!(!t.title.is_empty() && !t.group.is_empty());
             match t.kind {
                 Kind::Plain => assert!(!t.desc.is_empty(), "{}: 설명이 있어야 함", t.title),
+                Kind::Math => {
+                    assert!(!t.desc.is_empty(), "{}: 설명이 있어야 함", t.title);
+                    // 예시의 모든 줄이 수식 블록으로 읽혀야 한다(문법 오류가 있으면 도움말에서 수식이 안 그려진다).
+                    let blocks = md::scan_blocks(t.example);
+                    let covered: usize = blocks.iter().filter(|b| matches!(b.kind, md::BlockKind::Math { .. })).map(|b| b.end - b.start + 1).sum();
+                    let nonblank = t.example.lines().filter(|l| !l.trim().is_empty()).count();
+                    assert!(covered > 0 && covered == nonblank, "{}: 수식으로 읽히지 않는 줄이 있음 ({covered}/{nonblank})", t.title);
+                }
                 Kind::Keys => {
                     for l in t.example.lines() {
                         assert!(l.starts_with("## ") || l.contains('\t'), "{}: 단축키 줄 형식 오류: {l:?}", t.title);

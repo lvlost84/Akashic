@@ -901,6 +901,22 @@ pub fn is_external_target(t: &str) -> bool {
     b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')
 }
 
+/// 문서 제목으로 만든 링크 글자 `[[제목]]`. 링크 문법으로 그 제목을 가리킬 수 없으면 이유를 돌려준다
+/// (`|`·`]]`는 링크 문법과 겹치고, 외부 주소·각주처럼 보이는 제목은 문서 링크로 읽히지 않는다).
+pub fn wiki_tag(title: &str) -> Result<String, String> {
+    let t = title.trim();
+    if t.is_empty() {
+        return Err("제목이 없는 문서는 링크로 만들 수 없습니다".into());
+    }
+    if t.contains('|') || t.contains("]]") || t.contains('\n') || t.contains('\r') {
+        return Err("제목에 |, ]] 또는 줄바꿈이 있어 링크로 만들 수 없습니다".into());
+    }
+    if is_external_target(t) {
+        return Err("주소나 각주처럼 보이는 제목이라 문서 링크로 쓸 수 없습니다".into());
+    }
+    Ok(format!("[[{t}]]"))
+}
+
 /// 한 줄에서 백틱(`)으로 감싼 인라인 코드 구간을 공백으로 바꾼다(화면에서 코드로 그리는 부분은 링크가 아니므로).
 fn blank_code_spans(line: &str) -> String {
     let mut in_code = false;
@@ -1177,6 +1193,22 @@ mod tests {
         let job = build(text, Some(2), 15.0, t, 600.0, true);
         let s = job.sections.iter().find(|s| job.text[s.byte_range.start.0..s.byte_range.end.0].contains("1<br>2<br>3")).unwrap();
         assert!(s.format.line_height.map_or(true, |v| v < tall));
+    }
+
+    #[test]
+    fn wiki_tag_round_trips_through_wiki_links() {
+        for title in ["측정기 점검", "03. 일기 / 2026", "A [b] c", "  앞뒤 공백  "] {
+            let tag = wiki_tag(title).unwrap();
+            assert_eq!(wiki_links(&tag), vec![title.trim().to_string()], "{tag}");
+        }
+        assert_eq!(wiki_tag(" x ").unwrap(), "[[x]]");
+    }
+
+    #[test]
+    fn wiki_tag_rejects_titles_that_cannot_be_linked() {
+        for bad in ["", "   ", "a|b", "a]]b", "줄\n바꿈", "http://x.y", "C:\\temp", "^1", "www.a.kr"] {
+            assert!(wiki_tag(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

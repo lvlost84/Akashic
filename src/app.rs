@@ -5,6 +5,7 @@ mod find_ui;
 mod graph_ui;
 mod help_ui;
 mod image_ui;
+mod ref_window;
 mod status_ui;
 mod sync_ui;
 mod toc_ui;
@@ -282,6 +283,8 @@ enum Act {
     InsertImage,
     Back,
     Forward,
+    /// 문서를 읽기 전용 참고 창으로 연다
+    OpenRef(i64),
     Follow(String),
     AddTag,
     RemoveTag(String),
@@ -385,6 +388,13 @@ pub struct App {
     boot_done: bool,
     win_seen: Option<((f32, f32), bool)>,
     win_changed: Option<Instant>,
+    /// 참고 창(읽기 전용 새 창) 목록과 창별 그리기 캐시
+    refs: ref_window::RefWins,
+    ref_views: std::collections::HashMap<u64, ref_window::RefView>,
+    /// 다음 프레임에 앞으로 가져올 참고 창
+    ref_focus: Option<u64>,
+    /// 저장·목록 갱신 때마다 올라가는 번호(참고 창이 DB 저장본을 다시 읽을 때를 안다)
+    ref_rev: u64,
 }
 
 fn byte_of(s: &str, char_idx: usize) -> usize {
@@ -467,6 +477,10 @@ impl App {
             boot_done: false,
             win_seen: None,
             win_changed: None,
+            refs: Default::default(),
+            ref_views: Default::default(),
+            ref_focus: None,
+            ref_rev: 0,
             cfg,
         };
         let days = a.cfg.trash_days;
@@ -568,6 +582,7 @@ impl App {
             match self.db.save_doc(id, &self.title, &self.body) {
                 Ok(true) => {
                     self.list_dirty = true;
+                    self.ref_rev += 1;
                     self.last_saved_ts = now();
                 }
                 Ok(false) => {}
@@ -694,6 +709,27 @@ impl App {
                 self.refresh();
             }
             Err(x) => self.say(&format!("새 문서 실패: {x}")),
+        }
+    }
+
+    /// "분류로 이동" 메뉴: 대분류 → 소분류 순서로 단계마다 하위 메뉴를 펼친다.
+    /// 형제는 이름순(왼쪽 분류 트리와 같은 순서)이고, 하위 분류가 있는 분류는 하위 메뉴 맨 위의 "~에 넣기"로 그 분류 자체에도 옮길 수 있다.
+    fn move_menu(&self, ui: &mut egui::Ui, parent: Option<i64>, doc: i64, depth: usize, acts: &mut Vec<Act>) {
+        for c in self.cats.iter().filter(|c| c.parent == parent) {
+            let has_kids = depth < 8 && self.cats.iter().any(|k| k.parent == Some(c.id));
+            if has_kids {
+                ui.menu_button(c.name.as_str(), |ui| {
+                    if ui.button(format!("{} 에 넣기", c.name)).clicked() {
+                        acts.push(Act::MoveDoc(doc, Some(c.id)));
+                        ui.close();
+                    }
+                    ui.separator();
+                    self.move_menu(ui, Some(c.id), doc, depth + 1, acts);
+                });
+            } else if ui.button(c.name.as_str()).clicked() {
+                acts.push(Act::MoveDoc(doc, Some(c.id)));
+                ui.close();
+            }
         }
     }
 
@@ -987,6 +1023,10 @@ impl App {
                             break;
                         }
                     }
+                }
+                Act::OpenRef(id) => {
+                    self.flush();
+                    self.open_ref_window(id);
                 }
                 Act::Follow(title) => {
                     self.flush();
@@ -1378,11 +1418,21 @@ impl App {
                                 if crate::icons::btn(ui, crate::icons::Icon::Cross, "영구 삭제").clicked() { acts.push(Act::Purge(r.id)); ui.close(); }
                             } else {
                                 if crate::icons::btn(ui, crate::icons::Icon::Star, if r.pinned { "즐겨찾기 해제" } else { "즐겨찾기" }).clicked() { acts.push(Act::Pin(r.id)); ui.close(); }
+                                if crate::icons::btn(ui, crate::icons::Icon::Copy, "문서 링크 복사").on_hover_text("[[제목]] 형태로 클립보드에 복사합니다. 다른 문서에 붙여넣으면 이 문서로 연결됩니다").clicked() {
+                                    match md::wiki_tag(&r.title) {
+                                        Ok(tag) => {
+                                            ui.ctx().copy_text(tag.clone());
+                                            acts.push(Act::Say(format!("복사했습니다: {tag}")));
+                                        }
+                                        Err(m) => acts.push(Act::Say(m)),
+                                    }
+                                    ui.close();
+                                }
+                                if crate::icons::btn(ui, crate::icons::Icon::Detach, "새 창으로 열기").on_hover_text("읽기 전용 참고 창으로 엽니다").clicked() { acts.push(Act::OpenRef(r.id)); ui.close(); }
                                 ui.menu_button("분류로 이동", |ui| {
                                     if ui.button("미분류").clicked() { acts.push(Act::MoveDoc(r.id, None)); ui.close(); }
-                                    for c in &self.cats {
-                                        if ui.button(self.cat_path(Some(c.id))).clicked() { acts.push(Act::MoveDoc(r.id, Some(c.id))); ui.close(); }
-                                    }
+                                    ui.separator();
+                                    self.move_menu(ui, None, r.id, 0, acts);
                                 });
                                 if crate::icons::btn(ui, crate::icons::Icon::Trash, "휴지통").clicked() { acts.push(Act::Trash(r.id)); ui.close(); }
                             }
@@ -1406,6 +1456,11 @@ impl App {
             }
             if crate::icons::btn_ex(ui, crate::icons::Icon::Forward, "앞으로", !self.fwd.is_empty(), None).on_hover_text("Alt+→").clicked() {
                 acts.push(Act::Forward);
+            }
+            if crate::icons::btn_ex(ui, crate::icons::Icon::Detach, "새 창", self.cur.is_some(), None).on_hover_text("지금 문서를 읽기 전용 참고 창으로 엽니다(여러 개 가능)").clicked() {
+                if let Some(c) = self.cur {
+                    acts.push(Act::OpenRef(c));
+                }
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if crate::icons::btn(ui, crate::icons::Icon::Options, "옵션").on_hover_text("Ctrl+,").clicked() {
@@ -2194,6 +2249,7 @@ impl eframe::App for App {
             self.update_on_close();
         }
         if self.list_dirty {
+            self.ref_rev += 1;
             self.refresh();
         }
         self.sync_tick();
@@ -2263,8 +2319,13 @@ impl eframe::App for App {
             self.graph_window(&ctx, &mut a2);
             acts.extend(a2);
         }
+        self.ref_windows(&ctx);
         self.prompt_window(&ctx);
+        let nrefs = self.refs.wins.len();
         self.apply(acts);
+        if self.refs.wins.len() != nrefs || self.ref_focus.is_some() {
+            ctx.request_repaint(); // 새 참고 창을 바로 만들도록 다음 프레임을 요청
+        }
     }
 }
 
