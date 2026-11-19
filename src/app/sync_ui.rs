@@ -214,7 +214,8 @@ impl App {
                 if self.is_wd() {
                     self.cfg.wd_etag = etag.clone();
                 }
-                self.cfg.sync_result = format!("올리기 완료 · 조각 {total}개 중 {written}개 갱신");
+                let place = if self.is_wd() { "WebDAV 서버" } else { "동기화 폴더" };
+                self.cfg.sync_result = format!("{place}에 올리기 완료 · 조각 {total}개 중 {written}개 갱신");
             }
             Ok(Job::Foreign { .. }) => {} // 호출한 쪽(sync_tick)이 따로 처리한다
             Err(x) => {
@@ -223,7 +224,8 @@ impl App {
                 } else {
                     self.cfg.sync_failed = true;
                 }
-                self.cfg.sync_result = format!("올리기 실패 · {x}");
+                let place = if self.is_wd() { "WebDAV 서버" } else { "동기화 폴더" };
+                self.cfg.sync_result = format!("{place} 올리기 실패 · {x}");
             }
         }
         self.cfg.save();
@@ -364,7 +366,7 @@ impl App {
         }
         self.cfg.sync_skip.clear();
         self.cfg.sync_failed = false;
-        self.cfg.sync_result = "불러오기 완료".into();
+        self.cfg.sync_result = format!("{}에서 불러오기 완료", if self.is_wd() { "WebDAV 서버" } else { "동기화 폴더" });
         self.cfg.sync_result_at = db::now();
         self.cfg.save();
         self.img.clear(); // 이미지 캐시도 새 DB 기준으로 다시 읽는다
@@ -932,7 +934,7 @@ impl App {
                     }
                 }
                 Err(x) => {
-                    self.cfg.sync_result = format!("받아오기 실패 · {x}");
+                    self.cfg.sync_result = format!("{} 받아오기 실패 · {x}", if self.is_wd() { "WebDAV 서버" } else { "동기화 폴더" });
                     self.cfg.sync_result_at = db::now();
                     self.cfg.sync_failed = true;
                     self.cfg.save();

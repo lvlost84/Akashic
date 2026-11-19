@@ -99,8 +99,10 @@ pub struct Config {
     pub auto_renumber: bool,
     pub sidebar: bool,
     pub links_panel: bool,
-    /// 오른쪽 사이드바 모드: 0 = 연결 그래프, 1 = 목차
+    /// 오른쪽 사이드바 모드: 0 = 연결 그래프, 1 = 목차, 2 = 함께(그래프 위·목차 아래, 기본)
     pub right_mode: u8,
+    /// "함께"를 기본으로 바꾼 뒤 한 번만 모드를 "함께"로 옮겼는지(옛 설정에 남은 0을 기본값과 구별할 수 없어서)
+    pub right_default_v2: bool,
     /// 목차에 보일 제목 단계(1~6)
     pub toc_depth: u8,
     pub sort: u8,
@@ -182,7 +184,9 @@ impl Default for Config {
             auto_renumber: true,
             sidebar: true,
             links_panel: false,
-            right_mode: 0,
+            right_mode: 2,
+            // 설정 파일에 이 항목이 없으면(옛 설정) false 로 읽혀 한 번 "함께"로 옮겨진다. 새 설정은 load()에서 true 로 시작한다.
+            right_default_v2: false,
             toc_depth: 6,
             sort: 0,
             autosave_min: 5,
@@ -245,10 +249,14 @@ fn config_path() -> PathBuf {
 impl Config {
     pub fn load() -> Config {
         let path = config_path();
-        let Ok(raw) = std::fs::read_to_string(&path) else { return Config::default() };
+        let Ok(raw) = std::fs::read_to_string(&path) else { return Config { right_default_v2: true, ..Config::default() } };
         // 메모장 등으로 저장한 BOM 있는 파일도 읽는다.
         match serde_json::from_str::<Config>(raw.trim_start_matches('\u{feff}')) {
             Ok(mut c) => {
+                if !c.right_default_v2 {
+                    c.right_mode = 2;
+                    c.right_default_v2 = true;
+                }
                 // 비밀값은 파일에서 Windows 계정에 묶여 암호화돼 있다(표식 없는 옛 평문은 그대로 읽고 다음 저장 때 보호된다).
                 for v in [&mut c.wd_pass, &mut c.wd_key] {
                     match crate::secret::unprotect(v) {
@@ -266,7 +274,7 @@ impl Config {
                 // (옮겨 둔 DB 위치·동기화 폴더 같은 설정을 사용자가 되살릴 수 있도록).
                 let _ = std::fs::copy(&path, path.with_extension("bad.json"));
                 CONFIG_RESET.store(true, std::sync::atomic::Ordering::Relaxed);
-                Config::default()
+                Config { right_default_v2: true, ..Config::default() }
             }
         }
     }
@@ -1963,15 +1971,15 @@ impl App {
     fn links_panel(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         let t = self.theme.clone();
         ui.add_space(4.0);
-        // 모드 전환 탭: 연결 그래프 ↔ 목차
+        // 모드 전환 탭: 연결 그래프 / 목차 / 함께(그래프를 위, 목차를 아래에 한 화면으로)
         ui.horizontal(|ui| {
-            for (mode, name) in [(0u8, "연결 그래프"), (1u8, "목차")] {
-                if ui.selectable_label(self.cfg.right_mode == mode, name).clicked() && self.cfg.right_mode != mode {
+            for (mode, name, tip) in [(2u8, "함께", "연결 그래프(위)와 목차(아래)를 한 화면에 봅니다"), (0u8, "그래프", "연결 그래프를 크게, 연결된 문서 목록과 함께 자세히 봅니다"), (1u8, "목차", "목차를 전체 높이로 자세히 봅니다")] {
+                if ui.selectable_label(self.cfg.right_mode == mode, name).on_hover_text(tip).clicked() && self.cfg.right_mode != mode {
                     self.cfg.right_mode = mode;
                     self.graph_cfg_dirty = true; // 설정 저장
                 }
             }
-            if self.cfg.right_mode == 0 {
+            if self.cfg.right_mode != 1 {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let (txt, tip) = if self.graph_window { ("붙이기", "분리된 그래프 창을 닫고 여기에 다시 표시합니다") } else { ("분리", "연결 그래프를 별도 창으로 띄워 크게 보고 문서를 찾습니다") };
                     if crate::icons::btn(ui, if self.graph_window { crate::icons::Icon::Attach } else { crate::icons::Icon::Detach }, txt).on_hover_text(tip).clicked() {
@@ -1988,27 +1996,16 @@ impl App {
             self.toc_panel(ui, acts);
             return;
         }
-        ui.add_space(2.0);
-        let gh = (ui.available_height() * 0.5).max(180.0);
-        let gsize = Vec2::new(ui.available_width(), gh);
-        if self.graph_window {
-            let (rect, _) = ui.allocate_exact_size(gsize, Sense::hover());
-            ui.painter().rect_stroke(rect, egui::CornerRadius::ZERO, egui::Stroke::new(1.0, t.border), egui::StrokeKind::Inside);
-            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "연결 그래프를\n별도 창에서 보는 중", egui::FontId::proportional(crate::theme::ui(0.0)), t.dim);
-        } else if let Some(g) = self.graph.as_mut() {
-            let out = g.show(ui, gsize, &t, &mut self.cfg.graph);
-            match out.act {
-                Some(GraphAct::Open(id)) => acts.push(Act::Open(id)),
-                Some(GraphAct::Create(title)) => acts.push(Act::Follow(title)),
-                None => {}
-            }
-            if out.rebuild {
-                self.graph_stale = true; // 표시 조건이 바뀌면 다시 만든다
-            }
-            if out.changed {
-                self.graph_cfg_dirty = true; // 슬라이더를 놓은 뒤 저장
-            }
+        if self.cfg.right_mode == 2 {
+            // 함께: 그래프는 위쪽 45%, 나머지는 목차(연결된 문서 목록은 "연결 그래프" 탭에서 본다)
+            let gh = (ui.available_height() * 0.45).max(150.0);
+            self.graph_view(ui, gh, acts);
+            ui.separator();
+            self.toc_panel(ui, acts);
+            return;
         }
+        let gh = (ui.available_height() * 0.5).max(180.0);
+        self.graph_view(ui, gh, acts);
         ui.add_space(4.0);
         ui.label(egui::RichText::new("이 문서가 가리키는 문서").size(crate::theme::ui(0.0)).color(t.dim));
         egui::ScrollArea::vertical().id_salt("outl").max_height(ui.available_height() / 2.0 - 20.0).show(ui, |ui| {
@@ -2035,6 +2032,31 @@ impl App {
                 }
             }
         });
+    }
+
+    /// 연결 그래프 상자(높이 gh). 별도 창으로 분리돼 있으면 안내만 그린다.
+    fn graph_view(&mut self, ui: &mut egui::Ui, gh: f32, acts: &mut Vec<Act>) {
+        let t = self.theme.clone();
+        ui.add_space(2.0);
+        let gsize = Vec2::new(ui.available_width(), gh);
+        if self.graph_window {
+            let (rect, _) = ui.allocate_exact_size(gsize, Sense::hover());
+            ui.painter().rect_stroke(rect, egui::CornerRadius::ZERO, egui::Stroke::new(1.0, t.border), egui::StrokeKind::Inside);
+            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "연결 그래프를\n별도 창에서 보는 중", egui::FontId::proportional(crate::theme::ui(0.0)), t.dim);
+        } else if let Some(g) = self.graph.as_mut() {
+            let out = g.show(ui, gsize, &t, &mut self.cfg.graph);
+            match out.act {
+                Some(GraphAct::Open(id)) => acts.push(Act::Open(id)),
+                Some(GraphAct::Create(title)) => acts.push(Act::Follow(title)),
+                None => {}
+            }
+            if out.rebuild {
+                self.graph_stale = true; // 표시 조건이 바뀌면 다시 만든다
+            }
+            if out.changed {
+                self.graph_cfg_dirty = true; // 슬라이더를 놓은 뒤 저장
+            }
+        }
     }
 
     // ------------------------------------------------------------ 옵션
@@ -2505,7 +2527,7 @@ impl eframe::App for App {
             self.graph_cfg_dirty = false;
         }
         // 연결 그래프: 사이드바가 열려 있을 때만 유지한다(레이아웃은 저장하지 않음).
-        if !((self.cfg.links_panel && self.cfg.right_mode == 0) || self.graph_window) {
+        if !((self.cfg.links_panel && self.cfg.right_mode != 1) || self.graph_window) {
             self.graph = None;
         } else if self.graph.is_none() || self.graph_stale {
             self.rebuild_graph();
