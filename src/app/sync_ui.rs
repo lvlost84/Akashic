@@ -84,15 +84,21 @@ fn fmt_ts(ts: i64) -> String {
 }
 
 impl App {
-    fn sync_busy(&self) -> bool {
+    pub(super) fn sync_busy(&self) -> bool {
         ST.with(|s| {
             let s = s.borrow();
             s.rx.is_some() || s.rrx.is_some()
-        })
+        }) || Self::ds_busy()
     }
 
+    /// WebDAV 연결 설정을 쓰는 방식인가(전체 스냅숏 "webdav" 또는 문서 단위 "webdoc").
     fn is_wd(&self) -> bool {
-        self.cfg.sync_mode == "webdav"
+        matches!(self.cfg.sync_mode.as_str(), "webdav" | "webdoc")
+    }
+
+    /// 문서 단위 동기화(WebDAV)인가.
+    pub(super) fn is_doc(&self) -> bool {
+        self.cfg.sync_mode == "webdoc"
     }
 
     /// 동기화 대상이 설정되어 있는가(폴더 방식: 폴더, WebDAV: 주소·사용자·복구 문자열).
@@ -105,12 +111,13 @@ impl App {
     }
 
     /// 설정으로 WebDAV 전송과 키를 만든다.
-    fn wd_remote(&self) -> Result<(WebDavRemote, VaultKey), String> {
+    pub(super) fn wd_remote(&self) -> Result<(WebDavRemote, VaultKey), String> {
         if self.cfg.wd_key.trim().is_empty() {
             return Err("저장소가 없습니다. '새 저장소 만들기' 또는 '기존 저장소 연결'을 먼저 하세요".into());
         }
         let key = VaultKey::from_recovery(&self.cfg.wd_key)?;
-        let remote = WebDavRemote::new(&self.cfg.wd_url, self.cfg.wd_user.trim(), &self.cfg.wd_pass, &key.folder_name())?;
+        let folder = if self.is_doc() { super::docsync_ui::doc_folder(&key) } else { key.folder_name() };
+        let remote = WebDavRemote::new(&self.cfg.wd_url, self.cfg.wd_user.trim(), &self.cfg.wd_pass, &folder)?;
         Ok((remote, key))
     }
 
@@ -236,6 +243,9 @@ impl App {
         if self.sync_busy() {
             return Err("이미 동기화 중입니다".into());
         }
+        if self.is_doc() {
+            return self.ds_start(auto, None);
+        }
         if self.is_wd() {
             return self.wd_start(auto, force);
         }
@@ -334,6 +344,10 @@ impl App {
     /// 닫을 때: 마지막 동기화 이후 바뀐 것이 있으면 바로 올린다(바뀐 조각만 쓰므로 짧다). 충돌이면 올리지 않는다.
     pub(super) fn sync_on_close(&mut self) {
         if !(self.cfg.sync_auto && self.cfg.sync_on_close) || self.sync_busy() || self.db.rev() == self.cfg.sync_rev {
+            return;
+        }
+        if self.is_doc() {
+            self.ds_on_close();
             return;
         }
         let dev = sync::device_id();
@@ -518,10 +532,17 @@ impl App {
     /// 옵션 창의 "동기화 저장소" 구역.
     pub(super) fn sync_options(&mut self, ui: &mut egui::Ui, notes: &mut Vec<String>) {
         ST.with(|s| s.borrow_mut().ctx = Some(ui.ctx().clone()));
+        Self::ds_set_ctx(ui.ctx());
         ui.separator();
         ui.label(egui::RichText::new("동기화 저장소").strong());
         ui.horizontal(|ui| {
-            let sub = if self.is_wd() { "NAS의 WebDAV 서버에 암호화해서 올려 다른 PC와 맞춥니다" } else { "폴더에 조각으로 저장해 다른 PC와 맞춥니다" };
+            let sub = if self.is_doc() {
+                "바뀐 문서만 암호화해서 주고받고, 서로 다른 문서의 동시 편집은 자동으로 합칩니다"
+            } else if self.is_wd() {
+                "NAS의 WebDAV 서버에 암호화해서 올려 다른 PC와 맞춥니다"
+            } else {
+                "폴더에 조각으로 저장해 다른 PC와 맞춥니다"
+            };
             ui.label(egui::RichText::new(sub).color(self.theme.dim));
             if crate::icons::icon_only(ui, crate::icons::Icon::Help).on_hover_text("동기화 사용법 (도움말)").clicked() {
                 self.show_help = true;
@@ -530,12 +551,13 @@ impl App {
         });
         ui.horizontal(|ui| {
             ui.label("방식:");
-            let was = self.is_wd();
-            let mut wd = was;
-            ui.radio_value(&mut wd, false, "폴더 (동기화 프로그램 사용)");
-            ui.radio_value(&mut wd, true, "WebDAV (종단간 암호화)");
-            if wd != was {
-                self.cfg.sync_mode = if wd { "webdav".into() } else { "folder".into() };
+            let was = self.cfg.sync_mode.clone();
+            let mut m = if was == "webdav" || was == "webdoc" { was.clone() } else { "folder".to_string() };
+            ui.radio_value(&mut m, "folder".to_string(), "폴더 (동기화 프로그램 사용)");
+            ui.radio_value(&mut m, "webdoc".to_string(), "문서 단위 (WebDAV, 권장)");
+            ui.radio_value(&mut m, "webdav".to_string(), "전체 스냅숏 (WebDAV)");
+            if m != was {
+                self.cfg.sync_mode = m;
                 self.sync_reset_state();
             }
         });
@@ -639,6 +661,16 @@ impl App {
     /// WebDAV 방식 입력·단추.
     fn wd_options(&mut self, ui: &mut egui::Ui, notes: &mut Vec<String>) {
         ui.label(egui::RichText::new("서버에는 암호화된 조각만 올라갑니다. 주소는 https:// 여야 합니다.").color(self.theme.dim));
+        if self.is_doc() {
+            ui.label(
+                egui::RichText::new(format!(
+                    "문서 단위: 바뀐 문서·분류·태그만 주고받습니다. 두 PC가 같은 문서를 같은 시간대에 고치면 줄 단위로 자동 병합하고, 같은 줄이 겹치면 한쪽을 '제목 (충돌 · PC · 시각)' 사본(태그 '{}')으로 남깁니다. 삭제와 수정이 겹치면 수정이 남습니다.",
+                    crate::docsync::CONFLICT_TAG
+                ))
+                .color(self.theme.dim)
+                .small(),
+            );
+        }
         // 입력칸: 고치는 동안은 표시만 하고, 포커스를 잃을 때 저장한다(글자마다 파일을 쓰지 않도록).
         let mut dirty = ST.with(|s| s.borrow().wd_dirty);
         let mut url_edited = false;
@@ -749,7 +781,7 @@ impl App {
                     Err(x) => notes.push(x),
                 }
             }
-            if crate::icons::btn_ex(ui, crate::icons::Icon::Import, "서버에서 받아오기…", ready && !busy, None).clicked() {
+            if !self.is_doc() && crate::icons::btn_ex(ui, crate::icons::Icon::Import, "서버에서 받아오기…", ready && !busy, None).clicked() {
                 let ask = rfd::MessageDialog::new()
                     .set_title("받아오기")
                     .set_description("서버의 저장본으로 현재 문서 전체를 바꿉니다.\n바꾸기 전 현재 DB는 backup 폴더에 보관됩니다.\n계속할까요?")
@@ -766,7 +798,11 @@ impl App {
     }
 
     fn sync_due(&self) -> bool {
-        self.cfg.sync_auto && self.sync_configured() && db::now() - self.cfg.last_sync >= self.cfg.sync_hours.max(1) as i64 * 3600
+        let waited = db::now() - self.cfg.last_sync;
+        let by_hours = waited >= self.cfg.sync_hours.max(1) as i64 * 3600;
+        // 문서 단위는 다른 PC의 변경을 일찍 받아야 하므로, 이 PC에 바뀐 것이 있으면 10분마다도 맞춘다.
+        let by_edit = self.is_doc() && waited >= 600 && self.db.rev() != self.cfg.sync_rev;
+        self.cfg.sync_auto && self.sync_configured() && (by_hours || by_edit)
     }
 
     fn sync_auto_try(&mut self) {
@@ -801,7 +837,7 @@ impl App {
         };
         let wd = self.is_wd();
         if self.sync_busy() {
-            let tip = if wd { "서버와 주고받는 중입니다" } else { "동기화 폴더에 바뀐 조각을 쓰는 중입니다" };
+            let tip = if self.is_doc() { "바뀐 문서를 서버와 주고받는 중입니다" } else if wd { "서버와 주고받는 중입니다" } else { "동기화 폴더에 바뀐 조각을 쓰는 중입니다" };
             return ("동기화 중…".into(), tip.into(), false);
         }
         if !self.sync_configured() {
@@ -845,7 +881,7 @@ impl App {
             }
         };
         let short = if last > 0 { format!("동기화 {} · {}", hhmm(last), next_short) } else { format!("동기화 안 함 · {next_short}") };
-        let target = if wd { format!("서버: {} (암호화)", self.cfg.wd_url) } else { format!("폴더: {}", self.cfg.sync_dir) };
+        let target = if self.is_doc() { format!("서버: {} (암호화 · 문서 단위)", self.cfg.wd_url) } else if wd { format!("서버: {} (암호화)", self.cfg.wd_url) } else { format!("폴더: {}", self.cfg.sync_dir) };
         let tip = format!(
             "{target}\n마지막 저장: {}\n자동 동기화: {}{}{}\n\n클릭: 옵션 > 백업·동기화",
             fmt_ts(last),
@@ -864,6 +900,7 @@ impl App {
             s.ctx = Some(ctx.clone());
             s.last_check = Some(Instant::now());
         });
+        Self::ds_set_ctx(ctx);
         self.sync_auto_try();
     }
 
@@ -891,7 +928,14 @@ impl App {
                 self.cfg.wd_key = key;
                 self.sync_reset_state();
                 ST.with(|s| s.borrow_mut().wd_input.clear());
-                (format!("{t}. 이 PC의 문서와 합치려면 '서버에서 받아오기'를 먼저 하세요"), false)
+                (
+                    if self.is_doc() {
+                        format!("{t}. [지금 동기화]를 누르면 서버에 이미 문서가 있을 때 첫 연결 방식(서버 내용으로 교체 / 합치기)을 고르게 됩니다")
+                    } else {
+                        format!("{t}. 이 PC의 문서와 합치려면 '서버에서 받아오기'를 먼저 하세요")
+                    },
+                    false,
+                )
             }
             WdMsg::Connect { res: Err(e), .. } => (format!("연결 실패: {e}"), true),
         };
@@ -905,6 +949,7 @@ impl App {
     /// 매 프레임 호출된다(가벼워야 함).
     pub(super) fn sync_tick(&mut self) {
         self.wd_poll_ops();
+        self.ds_poll();
         // WebDAV 불러오기: 내려받기가 끝나면 화면 스레드에서 검증·반영한다.
         let restored = ST.with(|s| {
             let mut s = s.borrow_mut();

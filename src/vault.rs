@@ -360,6 +360,23 @@ fn open(key: &VaultKey, aad: &[u8], data: &[u8]) -> Option<Vec<u8>> {
     key.cipher().decrypt((&nonce).into(), Payload { msg: &data[1 + NONCE_LEN..], aad }).ok()
 }
 
+/// 문서 단위 동기화용: 파일 이름에 묶인 암호화(이름을 바꾸거나 다른 저장소로 옮기면 복호화가 실패한다).
+pub(crate) fn seal_named(key: &VaultKey, name: &str, plain: &[u8]) -> Result<Vec<u8>, VaultError> {
+    seal(key, &named_aad(key, name), plain)
+}
+
+pub(crate) fn open_named(key: &VaultKey, name: &str, data: &[u8]) -> Option<Vec<u8>> {
+    open(key, &named_aad(key, name), data)
+}
+
+fn named_aad(key: &VaultKey, name: &str) -> Vec<u8> {
+    let mut a = Vec::with_capacity(17 + name.len());
+    a.extend_from_slice(&key.vault_id_bytes());
+    a.push(b'D');
+    a.extend_from_slice(name.as_bytes());
+    a
+}
+
 // ───────────────────────── manifest ─────────────────────────
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]

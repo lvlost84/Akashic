@@ -10,7 +10,7 @@ fn e<E: std::fmt::Display>(x: E) -> String {
 }
 
 pub const MAX_DEPTH: usize = 6;
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 /// 직접 정렬 위치 값 사이의 기본 간격.
 pub const POS_GAP: i64 = 1024;
 
@@ -126,6 +126,28 @@ CREATE TRIGGER IF NOT EXISTS rev_dt_d AFTER DELETE ON doc_tags BEGIN UPDATE meta
 CREATE TRIGGER IF NOT EXISTS rev_img_i AFTER INSERT ON images BEGIN UPDATE meta SET value=CAST(value AS INTEGER)+1 WHERE key='rev'; END;
 CREATE TRIGGER IF NOT EXISTS rev_img_d AFTER DELETE ON images BEGIN UPDATE meta SET value=CAST(value AS INTEGER)+1 WHERE key='rev'; END;";
 
+
+/// 문서 단위 동기화용 변경 표시(스키마 v4). 모든 쓰기 경로(앱 코드·FK 연쇄·불러오기)를 트리거로 잡아 `dirty`를 세운다.
+/// `meta.applying='1'`인 동안(원격 변경을 적용하는 중)에는 표시하지 않는다.
+/// 동기화되지 않는 열(pos 등)이 바뀔 때는 반응하지 않는다.
+const SYNC_SQL: &str = "INSERT OR IGNORE INTO meta(key,value) VALUES('applying','0');
+CREATE TRIGGER IF NOT EXISTS ds_docs_i AFTER INSERT ON docs WHEN new.uid IS NULL BEGIN UPDATE docs SET uid=lower(hex(randomblob(16))) WHERE id=new.id; END;
+CREATE TRIGGER IF NOT EXISTS ds_docs_u AFTER UPDATE OF title, body, category_id, pinned, trashed_at ON docs
+  WHEN (SELECT value FROM meta WHERE key='applying')<>'1' BEGIN UPDATE docs SET dirty=1 WHERE id=new.id AND dirty=0; END;
+CREATE TRIGGER IF NOT EXISTS ds_docs_d AFTER DELETE ON docs
+  WHEN old.base_json IS NOT NULL AND (SELECT value FROM meta WHERE key='applying')<>'1'
+  BEGIN INSERT OR REPLACE INTO tombstones(uid,kind,base_json,dirty) VALUES(old.uid,'d',old.base_json,1); END;
+CREATE TRIGGER IF NOT EXISTS ds_dt_i AFTER INSERT ON doc_tags
+  WHEN (SELECT value FROM meta WHERE key='applying')<>'1' BEGIN UPDATE docs SET dirty=1 WHERE id=new.doc_id AND dirty=0; END;
+CREATE TRIGGER IF NOT EXISTS ds_dt_d AFTER DELETE ON doc_tags
+  WHEN (SELECT value FROM meta WHERE key='applying')<>'1' BEGIN UPDATE docs SET dirty=1 WHERE id=old.doc_id AND dirty=0; END;
+CREATE TRIGGER IF NOT EXISTS ds_cat_i AFTER INSERT ON categories WHEN new.uid IS NULL BEGIN UPDATE categories SET uid=lower(hex(randomblob(16))) WHERE id=new.id; END;
+CREATE TRIGGER IF NOT EXISTS ds_cat_u AFTER UPDATE OF name, parent_id ON categories
+  WHEN (SELECT value FROM meta WHERE key='applying')<>'1' BEGIN UPDATE categories SET dirty=1 WHERE id=new.id AND dirty=0; END;
+CREATE TRIGGER IF NOT EXISTS ds_cat_d AFTER DELETE ON categories
+  WHEN old.base_json IS NOT NULL AND (SELECT value FROM meta WHERE key='applying')<>'1'
+  BEGIN INSERT OR REPLACE INTO tombstones(uid,kind,base_json,dirty) VALUES(old.uid,'c',old.base_json,1); END;";
+
 /// 스키마 v1(처음 만들 때와 v1 파일 시험에 쓴다).
 pub const SCHEMA_V1: &str = "BEGIN;
 CREATE TABLE categories(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES categories(id) ON DELETE SET NULL, name TEXT NOT NULL);
@@ -232,6 +254,43 @@ COMMIT;",
                 )
                 .map_err(e)?;
         }
+        if (1..4).contains(&ver) {
+            // 되돌릴 수 없는 승급(옛 버전은 새 스키마를 열지 못함) 직전에 자동 백업. 실패하면 승급하지 않는다.
+            let dir = self.path.parent().unwrap_or(Path::new(".")).join("backup");
+            std::fs::create_dir_all(&dir).map_err(|x| format!("승급 전 백업 폴더를 만들 수 없어 승급하지 않았습니다: {x}"))?;
+            let bak = dir.join(format!("vault-before-v4-{}.db", chrono::Local::now().format("%Y%m%d-%H%M%S%3f")));
+            self.snapshot_to(&bak).map_err(|x| format!("승급 전 백업에 실패해 승급하지 않았습니다: {x}"))?;
+        }
+        if ver < 4 {
+            // v4: 문서 단위 동기화. 전역 uid(문서·분류), 변경 표시 dirty, 마지막 동기화 상태 base_json, 삭제 표식.
+            // 열이 이미 있으면(되돌린 schema 값으로 다시 올릴 때) 건너뛴다.
+            let mut sql = String::from("BEGIN;
+");
+            for t in ["docs", "categories"] {
+                for (col, def) in [("uid", "TEXT"), ("dirty", "INTEGER NOT NULL DEFAULT 1"), ("base_json", "TEXT")] {
+                    let has: i64 = self
+                        .conn
+                        .query_row(&format!("SELECT COUNT(*) FROM pragma_table_info('{t}') WHERE name='{col}'"), [], |r| r.get(0))
+                        .map_err(e)?;
+                    if has == 0 {
+                        sql.push_str(&format!("ALTER TABLE {t} ADD COLUMN {col} {def};
+"));
+                    }
+                }
+                sql.push_str(&format!("UPDATE {t} SET uid=lower(hex(randomblob(16))) WHERE uid IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS {t}_uid ON {t}(uid);
+"));
+            }
+            sql.push_str(
+                "CREATE TABLE IF NOT EXISTS tombstones(uid TEXT PRIMARY KEY, kind TEXT NOT NULL, base_json TEXT, dirty INTEGER NOT NULL DEFAULT 1);
+INSERT OR REPLACE INTO meta(key,value) VALUES('schema','4');
+COMMIT;",
+            );
+            self.conn.execute_batch(&sql).map_err(e)?;
+        }
+        self.conn.execute_batch("UPDATE meta SET value='0' WHERE key='applying'").ok();
+        self.conn.execute_batch(SYNC_SQL).map_err(e)?;
+        self.conn.execute_batch("UPDATE meta SET value='0' WHERE key='applying'").map_err(e)?;
         self.conn.execute_batch(REV_SQL).map_err(e)?;
         Ok(())
     }
@@ -1078,7 +1137,7 @@ mod tests {
         }
         let db = Db::open(&path).unwrap();
         let v: String = db.conn.query_row("SELECT value FROM meta WHERE key='schema'", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, "3");
+        assert_eq!(v, "4");
         assert_eq!(order(&db), vec![2, 3, 1]); // 최근 수정순 순위
         let n = db.new_doc(None).unwrap();
         assert_eq!(order(&db)[0], n);
@@ -1132,7 +1191,7 @@ mod tests {
         }
         let db = Db::open(&path).unwrap();
         let v: String = db.conn.query_row("SELECT value FROM meta WHERE key='schema'", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, "3");
+        assert_eq!(v, "4");
         db.put_image(HA, &[1], 1, 1).unwrap();
         assert_eq!(db.list_docs(&filter("")).unwrap().len(), 1);
     }
@@ -1238,6 +1297,167 @@ mod tests {
         assert!(ps.windows(2).all(|w| w[1] - w[0] >= 2));
         db.renumber().unwrap();
         assert_eq!(order(&db), vec![a, c, b]);
+    }
+
+    // ---------- 스키마 v4(문서 단위 동기화) ----------
+    fn clean_all(db: &Db) {
+        db.conn.execute_batch("UPDATE docs SET dirty=0, base_json='{}'; UPDATE categories SET dirty=0, base_json='{}';").unwrap();
+    }
+    fn dirty_of(db: &Db, id: i64) -> bool {
+        db.conn.query_row("SELECT dirty FROM docs WHERE id=?", [id], |r| r.get::<_, i64>(0)).unwrap() != 0
+    }
+
+    #[test]
+    fn v3_db_migrates_to_v4_keeping_data() {
+        let path = tmp("v3-v4");
+        {
+            let db = Db::open(&path).unwrap();
+            let a = doc_with(&db, "첫째");
+            db.add_tag(a, "x").unwrap();
+            db.add_category(None, "분류").unwrap();
+            doc_with(&db, "둘째");
+            // v3 모양으로 되돌린다: 새 열·표·트리거를 없애고 schema=3
+            db.conn
+                .execute_batch(
+                    "DROP TRIGGER ds_docs_i; DROP TRIGGER ds_docs_u; DROP TRIGGER ds_docs_d; DROP TRIGGER ds_dt_i; DROP TRIGGER ds_dt_d;
+                     DROP TRIGGER ds_cat_i; DROP TRIGGER ds_cat_u; DROP TRIGGER ds_cat_d; DROP INDEX docs_uid; DROP INDEX categories_uid;
+                     ALTER TABLE docs DROP COLUMN uid; ALTER TABLE docs DROP COLUMN dirty; ALTER TABLE docs DROP COLUMN base_json;
+                     ALTER TABLE categories DROP COLUMN uid; ALTER TABLE categories DROP COLUMN dirty; ALTER TABLE categories DROP COLUMN base_json;
+                     DROP TABLE tombstones; UPDATE meta SET value='3' WHERE key='schema';",
+                )
+                .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let v: String = db.conn.query_row("SELECT value FROM meta WHERE key='schema'", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, "4");
+        assert_eq!(db.list_docs(&filter("")).unwrap().len(), 2);
+        let baks: Vec<_> = std::fs::read_dir(path.parent().unwrap().join("backup")).unwrap().flatten().filter(|f| f.file_name().to_string_lossy().starts_with("vault-before-v4-")).collect();
+        assert_eq!(baks.len(), 1, "승급 직전 자동 백업");
+        let bdb = Connection::open(baks[0].path()).unwrap();
+        let sv: String = bdb.query_row("SELECT value FROM meta WHERE key='schema'", [], |r| r.get(0)).unwrap();
+        assert_eq!(sv, "3", "백업은 옛 스키마 그대로");
+        assert_eq!(db.list_docs(&filter("첫째")).unwrap().len(), 1, "검색 보존");
+        assert_eq!(db.all_tags().unwrap(), vec!["x".to_string()]);
+        assert_eq!(db.categories().unwrap().len(), 1);
+        let (n, distinct, nulls): (i64, i64, i64) = db
+            .conn
+            .query_row("SELECT COUNT(*), COUNT(DISTINCT uid), SUM(uid IS NULL OR dirty=0) FROM docs", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap();
+        assert_eq!((n, distinct, nulls), (2, 2, 0), "기존 문서마다 서로 다른 uid, 아직 동기화 안 됨(dirty)");
+        let cu: i64 = db.conn.query_row("SELECT COUNT(*) FROM categories WHERE uid IS NOT NULL AND dirty=1", [], |r| r.get(0)).unwrap();
+        assert_eq!(cu, 1);
+        // 다시 열어도 그대로(되돌아가지 않고 uid도 안 바뀐다)
+        let u1: String = db.conn.query_row("SELECT uid FROM docs ORDER BY id LIMIT 1", [], |r| r.get(0)).unwrap();
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        let u2: String = db.conn.query_row("SELECT uid FROM docs ORDER BY id LIMIT 1", [], |r| r.get(0)).unwrap();
+        assert_eq!(u1, u2);
+    }
+
+    #[test]
+    fn upgrade_is_refused_when_backup_fails() {
+        let path = tmp("v3-nobak");
+        {
+            let db = Db::open(&path).unwrap();
+            doc_with(&db, "본문");
+            db.conn.execute_batch("DROP TABLE tombstones; UPDATE meta SET value='3' WHERE key='schema';").unwrap();
+        }
+        // backup 자리를 파일로 막아 백업을 불가능하게 한다
+        let bdir = path.parent().unwrap().join("backup");
+        let _ = std::fs::remove_dir_all(&bdir);
+        std::fs::write(&bdir, b"x").unwrap();
+        assert!(Db::open(&path).is_err(), "백업 실패 시 승급하지 않고 오류");
+        let c = Connection::open(&path).unwrap();
+        let v: String = c.query_row("SELECT value FROM meta WHERE key='schema'", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, "3");
+    }
+
+    #[test]
+    fn new_rows_get_uid_and_every_write_path_marks_dirty() {
+        let db = Db::open(&tmp("dirty-paths")).unwrap();
+        let a = db.new_doc(None).unwrap();
+        let uid: Option<String> = db.conn.query_row("SELECT uid FROM docs WHERE id=?", [a], |r| r.get(0)).unwrap();
+        assert!(uid.is_some_and(|u| u.len() == 32), "새 문서는 uid를 받는다");
+        let cat = db.add_category(None, "가").unwrap();
+        let cat2 = db.add_category(Some(cat), "나").unwrap();
+        let cu: Option<String> = db.conn.query_row("SELECT uid FROM categories WHERE id=?", [cat], |r| r.get(0)).unwrap();
+        assert!(cu.is_some());
+        // 각 쓰기 경로 뒤 dirty 가 선다
+        let check = |name: &str, f: &dyn Fn(&Db)| {
+            clean_all(&db);
+            assert!(!dirty_of(&db, a));
+            f(&db);
+            assert!(dirty_of(&db, a), "{name} 이후 dirty");
+        };
+        check("저장", &|d| {
+            d.save_doc(a, "제목", "본문").unwrap();
+        });
+        check("고정", &|d| d.set_pinned(a, true).unwrap());
+        check("분류 이동", &|d| d.set_doc_category(a, Some(cat)).unwrap());
+        check("태그 추가", &|d| d.add_tag(a, "t1").unwrap());
+        check("태그 제거", &|d| d.remove_tag(a, "t1").unwrap());
+        check("휴지통", &|d| d.trash(a).unwrap());
+        check("복원", &|d| d.restore(a).unwrap());
+        db.set_pinned(a, false).unwrap();
+        check("분류 삭제로 문서 분류 바뀜", &|d| {
+            d.set_doc_category(a, Some(cat2)).unwrap();
+            d.conn.execute_batch("UPDATE docs SET dirty=0").unwrap();
+            d.delete_category(cat2).unwrap();
+        });
+        // 직접 정렬(pos)은 동기화 대상이 아니다
+        clean_all(&db);
+        let b = db.new_doc(None).unwrap();
+        clean_all(&db);
+        db.reorder(b, Some(a)).unwrap();
+        assert!(!dirty_of(&db, a) && !dirty_of(&db, b), "순서만 바뀌면 dirty 아님");
+        // 분류 변경
+        clean_all(&db);
+        db.rename_category(cat, "가2").unwrap();
+        let d: i64 = db.conn.query_row("SELECT dirty FROM categories WHERE id=?", [cat], |r| r.get(0)).unwrap();
+        assert_eq!(d, 1);
+        clean_all(&db);
+        db.add_category(None, "다").unwrap();
+        db.move_category(cat, None).unwrap();
+    }
+
+    #[test]
+    fn purge_leaves_tombstone_only_for_synced_rows_and_apply_flag_suppresses() {
+        let db = Db::open(&tmp("tomb")).unwrap();
+        let a = db.new_doc(None).unwrap();
+        let b = db.new_doc(None).unwrap();
+        let cat = db.add_category(None, "분류").unwrap();
+        db.conn.execute_batch("UPDATE docs SET dirty=0, base_json='{\"x\":1}' WHERE id=1").unwrap();
+        db.conn.execute_batch("UPDATE categories SET dirty=0, base_json='{\"c\":1}'").unwrap();
+        db.trash(a).unwrap();
+        db.trash(b).unwrap();
+        db.purge(a).unwrap();
+        db.purge(b).unwrap();
+        db.delete_category(cat).unwrap();
+        let rows: Vec<(String, i64)> = db
+            .conn
+            .prepare("SELECT kind, dirty FROM tombstones ORDER BY kind")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert_eq!(rows, vec![("c".to_string(), 1), ("d".to_string(), 1)], "동기화된 문서 1개와 분류 1개만 표식");
+        // 적용 중에는 표시하지 않는다
+        let c = db.new_doc(None).unwrap();
+        db.conn.execute_batch("UPDATE docs SET dirty=0, base_json='{}'; UPDATE meta SET value='1' WHERE key='applying'").unwrap();
+        db.save_doc(c, "원격", "내용").unwrap();
+        db.add_tag(c, "z").unwrap();
+        assert!(!dirty_of(&db, c));
+        db.conn.execute_batch("DELETE FROM tombstones").unwrap();
+        db.conn.execute("DELETE FROM docs WHERE id=?", [c]).unwrap();
+        let n: i64 = db.conn.query_row("SELECT COUNT(*) FROM tombstones", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 0);
+        // 다시 열면 applying 이 0 으로 돌아온다(적용 도중 꺼졌을 때)
+        let path = db.path.clone();
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        let ap: String = db.conn.query_row("SELECT value FROM meta WHERE key='applying'", [], |r| r.get(0)).unwrap();
+        assert_eq!(ap, "0");
     }
 }
 

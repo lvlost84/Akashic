@@ -291,7 +291,7 @@ impl App {
             self.storage.rx = Some(rx);
         }
         if sync_due {
-            let wd = self.cfg.sync_mode == "webdav";
+            let wd = matches!(self.cfg.sync_mode.as_str(), "webdav" | "webdoc");
             let empty = if wd { self.cfg.wd_url.trim().is_empty() || self.cfg.wd_key.trim().is_empty() } else { self.cfg.sync_dir.trim().is_empty() };
             if empty {
                 // 설정이 없으면 확인할 것이 없으므로 시각만 갱신한다.

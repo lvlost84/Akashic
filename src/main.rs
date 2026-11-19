@@ -15,6 +15,7 @@ mod md;
 mod probe;
 mod render;
 mod secret;
+mod docsync;
 mod sync;
 mod webdav;
 mod theme;

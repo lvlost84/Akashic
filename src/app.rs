@@ -3,6 +3,7 @@ mod about_ui;
 mod export_ui;
 mod find_ui;
 mod graph_ui;
+mod docsync_ui;
 mod help_ui;
 mod image_ui;
 mod ref_window;
@@ -142,7 +143,7 @@ pub struct Config {
     /// 자동 동기화를 건너뛴 이유(비어 있으면 정상). 다음에 올리거나 불러오면 지워진다.
     pub sync_skip: String,
     // --- WebDAV 암호화 동기화(sync_mode 가 "webdav" 일 때). 비밀번호·복구 문자열은 파일에 Windows 계정 암호화(DPAPI)로 저장 ---
-    /// 동기화 방식: "folder"(기본, 폴더) / "webdav"
+    /// 동기화 방식: "folder"(기본, 폴더) / "webdav"(전체 스냅숏) / "webdoc"(문서 단위)
     pub sync_mode: String,
     pub wd_url: String,
     pub wd_user: String,
