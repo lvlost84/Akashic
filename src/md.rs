@@ -1014,8 +1014,8 @@ pub fn continue_list(line: &str) -> Option<Enter> {
     Some(Enter::Insert(format!("{ind}{next_marker}{}", if check { "[ ] " } else { "" })))
 }
 
-/// 목록 줄의 `[ ]`/`[x]` 위에서 눌렀으면 켜고 끈 새 본문을 돌려준다.
-pub fn toggle_checkbox_at(text: &str, char_idx: usize) -> Option<String> {
+/// 글자 위치 `char_idx`가 목록 줄의 `[ ]`/`[x]` 위인지 본다. 맞으면 (줄 시작 바이트, 목록 기호 길이, 지금 체크됨 여부).
+fn checkbox_hit(text: &str, char_idx: usize) -> Option<(usize, usize, bool)> {
     let at = text.char_indices().nth(char_idx).map(|(b, _)| b).unwrap_or(text.len());
     let ls = text[..at].rfind('\n').map_or(0, |p| p + 1);
     let le = text[at..].find('\n').map_or(text.len(), |p| at + p);
@@ -1029,12 +1029,23 @@ pub fn toggle_checkbox_at(text: &str, char_idx: usize) -> Option<String> {
     if col < m || col > m + 3 {
         return None;
     }
-    let flip = if rest.starts_with("[ ]") { "[x]" } else { "[ ]" };
     // 코드 블록 안은 체크박스가 아니다.
     let fences = text[..ls].lines().filter(|l| l.trim_start().starts_with("```")).count();
     if fences % 2 == 1 {
         return None;
     }
+    Some((ls, m, !rest.starts_with("[ ]")))
+}
+
+/// 글자 위치가 눌러서 켜고 끌 수 있는 체크박스 위인지(마우스를 올렸을 때 손가락 모양을 보이는 데 쓴다).
+pub fn is_checkbox_at(text: &str, char_idx: usize) -> bool {
+    checkbox_hit(text, char_idx).is_some()
+}
+
+/// 목록 줄의 `[ ]`/`[x]` 위에서 눌렀으면 켜고 끈 새 본문을 돌려준다.
+pub fn toggle_checkbox_at(text: &str, char_idx: usize) -> Option<String> {
+    let (ls, m, checked) = checkbox_hit(text, char_idx)?;
+    let flip = if checked { "[ ]" } else { "[x]" };
     let mut out = String::with_capacity(text.len());
     out.push_str(&text[..ls + m]);
     out.push_str(flip);
@@ -1193,6 +1204,37 @@ mod tests {
         let job = build(text, Some(2), 15.0, t, 600.0, true);
         let s = job.sections.iter().find(|s| job.text[s.byte_range.start.0..s.byte_range.end.0].contains("1<br>2<br>3")).unwrap();
         assert!(s.format.line_height.map_or(true, |v| v < tall));
+    }
+
+    #[test]
+    fn is_checkbox_at_matches_toggle() {
+        let text = "- [ ] 할 일\n- [x] 끝\n일반 글 [ ]\n```\n- [ ] 코드 안\n```\n";
+        let n = text.chars().count();
+        for i in 0..=n {
+            assert_eq!(is_checkbox_at(text, i), toggle_checkbox_at(text, i).is_some(), "idx {i}");
+        }
+        assert!(is_checkbox_at(text, 3)); // `[ ]` 위
+        assert!(!is_checkbox_at(text, 9)); // 글자 위
+        let code = text.find("코드 안").unwrap();
+        assert!(!is_checkbox_at(text, text[..code].chars().count() - 3), "코드 블록 안은 아니다");
+        assert_eq!(toggle_checkbox_at("- [ ] a", 3).unwrap(), "- [x] a");
+        assert_eq!(toggle_checkbox_at("- [x] a", 3).unwrap(), "- [ ] a");
+    }
+
+    #[test]
+    fn chained_footnote_defs_on_one_line_do_not_panic() {
+        let t = &themes()[0];
+        for text in ["[^9]:[^10]: 설명\n", "[^9]:[^10]:\n", "[^9]:[^10]", "[^9]:[^10]: 설명 [^11]", "본문 [^9][^10]\n\n[^9]:[^10]: 설명\n", "[^9]:[^10]:[^11]: 가나다\n"] {
+            for hide in [true, false] {
+                for cur in [None, Some(0), Some(1)] {
+                    let job = build(text, cur, 15.0, t, 400.0, hide);
+                    assert_eq!(job.text, text, "{text:?}");
+                }
+            }
+            for i in 0..=text.chars().count() {
+                let _ = footnote_jump(text, i);
+            }
+        }
     }
 
     #[test]

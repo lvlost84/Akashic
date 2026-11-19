@@ -1788,6 +1788,22 @@ impl App {
                 ctx.request_repaint();
             }
         }
+        // 마우스를 올린 곳이 누를 수 있는 곳이면 알려 준다: 체크박스는 손가락 모양, [[문서 링크]]·각주는 Ctrl을 누른 동안 손가락 모양
+        // (Ctrl 없이 누르면 동작하지 않으므로, 누르지 않은 때는 "Ctrl+클릭" 안내 말풍선만 띄운다).
+        if editable && out.response.hovered() {
+            if let Some(p) = ctx.input(|i| i.pointer.hover_pos()) {
+                let hidx: usize = out.galley.cursor_from_pos(p - out.galley_pos).index.into();
+                if md::is_checkbox_at(&self.body, hidx) {
+                    ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                } else if md::wiki_at(&self.body, hidx).is_some() || md::footnote_jump(&self.body, hidx).is_some() {
+                    if ctx.input(|i| i.modifiers.command) {
+                        ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                    } else {
+                        let _ = egui::Response::clone(&out.response).on_hover_text("Ctrl+클릭: 이동");
+                    }
+                }
+            }
+        }
         if out.response.clicked() && editable {
             let ctrl = ctx.input(|i| i.modifiers.command);
             if ctrl {
