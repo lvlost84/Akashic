@@ -69,6 +69,20 @@ fn collect_sync(dir: &str) -> (bool, Option<(i64, String)>) {
     }
 }
 
+/// WebDAV 서버 확인(접속·키가 맞는지, 서버의 저장본). 실패하면 접근 불가로 본다.
+fn collect_wd(url: &str, user: &str, pass: &str, key: &str) -> (bool, Option<(i64, String)>) {
+    crate::diag::count("sync_wd_check");
+    let r = (|| {
+        let k = crate::vault::VaultKey::from_recovery(key).ok()?;
+        let remote = crate::webdav::WebDavRemote::new(url, user.trim(), pass, &k.folder_name()).ok()?;
+        crate::vault::read_state(&remote, &k).ok()
+    })();
+    match r {
+        Some(st) => (true, st.map(|s| (s.manifest.saved_at, s.manifest.device))),
+        None => (false, None),
+    }
+}
+
 /// 동기화 폴더 확인을 이 시간(초) 안에 끝내지 못하면 "접근 불가"로 본다.
 const SYNC_CHECK_LIMIT_SECS: u64 = 15;
 /// 저장소 정보(파일 시스템을 매 프레임 읽지 않도록 5초마다 갱신).
@@ -277,17 +291,20 @@ impl App {
             self.storage.rx = Some(rx);
         }
         if sync_due {
-            if self.cfg.sync_dir.trim().is_empty() {
-                // 폴더 설정이 없으면 확인할 것이 없으므로 시각만 갱신한다.
+            let wd = self.cfg.sync_mode == "webdav";
+            let empty = if wd { self.cfg.wd_url.trim().is_empty() || self.cfg.wd_key.trim().is_empty() } else { self.cfg.sync_dir.trim().is_empty() };
+            if empty {
+                // 설정이 없으면 확인할 것이 없으므로 시각만 갱신한다.
                 self.storage.sync_ok = None;
                 self.storage.remote = None;
                 self.storage.sync_at = Some(Instant::now());
             } else {
                 let dir = self.cfg.sync_dir.clone();
+                let (url, user, pass, key) = (self.cfg.wd_url.clone(), self.cfg.wd_user.clone(), self.cfg.wd_pass.clone(), self.cfg.wd_key.clone());
                 let (tx, rx) = std::sync::mpsc::channel();
                 let ctx2 = ctx.clone();
                 std::thread::spawn(move || {
-                    let _ = tx.send(collect_sync(&dir));
+                    let _ = tx.send(if wd { collect_wd(&url, &user, &pass, &key) } else { collect_sync(&dir) });
                     ctx2.request_repaint();
                 });
                 self.storage.sync_rx = Some((rx, Instant::now()));

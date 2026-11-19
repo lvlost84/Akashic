@@ -311,7 +311,17 @@ pub fn restore_from_dir(db: &mut Db, dir: &Path) -> Result<(PathBuf, i64), Strin
     fs::create_dir_all(&base).map_err(|x| x.to_string())?;
     let tmp = base.join("sync-restore.tmp.db");
     assemble(dir, &m, &tmp)?;
-    let res = (|| {
+    let res = restore_from_file(db, &tmp);
+    let _ = fs::remove_file(&tmp);
+    res.map(|bak| (bak, m.saved_at))
+}
+
+/// 이미 받아 둔 DB 파일(`tmp`)을 검증해 현재 DB 에 반영한다(WebDAV 불러오기도 이것을 쓴다). 반영 전 DB 를 backup 에 보관하고 그 경로를 돌려준다.
+/// `tmp` 파일은 지우지 않는다(호출한 쪽이 정리).
+pub fn restore_from_file(db: &mut Db, tmp: &Path) -> Result<PathBuf, String> {
+    let base = db.path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let tmp = tmp.to_path_buf();
+    {
         check_db_file(&tmp)?;
         let bdir = base.join("backup");
         // 밀리초까지 넣어 같은 초에 두 번 불러와도 먼저 만든 백업을 지우지 않는다.
@@ -323,10 +333,8 @@ pub fn restore_from_dir(db: &mut Db, dir: &Path) -> Result<(PathBuf, i64), Strin
         // 구버전(v1) 저장본이면 지금 실행 중인 연결의 구조를 최신으로 올린다(다시 시작하지 않아도 새 문서·정렬이 동작하도록).
         db.migrate().map_err(|x| format!("불러온 DB를 최신 구조로 바꾸지 못했습니다: {x} (불러오기 전 상태: {})", bak.display()))?;
         prune_restore_backups(&bdir, RESTORE_BACKUPS_KEEP);
-        Ok((bak, m.saved_at))
-    })();
-    let _ = fs::remove_file(&tmp);
-    res
+        Ok(bak)
+    }
 }
 
 /// 다른 기기가 우리의 마지막 동기화 이후에 올린 manifest 인가.

@@ -14,9 +14,12 @@ mod math;
 mod md;
 mod probe;
 mod render;
+mod secret;
 mod sync;
+mod webdav;
 mod theme;
 mod update;
+mod vault;
 
 use eframe::egui;
 
@@ -61,6 +64,12 @@ fn main() -> eframe::Result {
         let mut n = NOTICE.lock().unwrap();
         if n.is_none() {
             *n = Some("설정 파일을 읽을 수 없어 기본값으로 시작했습니다(원본은 config.bad.json으로 보관)".into());
+        }
+    }
+    if app::SECRET_UNREADABLE.load(std::sync::atomic::Ordering::Relaxed) {
+        let mut n = NOTICE.lock().unwrap();
+        if n.is_none() {
+            *n = Some("WebDAV 비밀번호·복구 문자열을 이 PC·계정에서 풀 수 없어 비웠습니다. 옵션에서 다시 입력하세요".into());
         }
     }
     let path = std::path::PathBuf::from(&cfg.db_path);

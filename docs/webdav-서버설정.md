@@ -1,0 +1,106 @@
+# NAS WebDAV 서버 설정 가이드 (아카식 암호화 동기화용)
+
+아카식이 NAS의 WebDAV 서버에 문서 DB를 **암호화해서** 올릴 때 필요한 서버 쪽 설정입니다.
+앱 사용법은 앱 도움말의 "WebDAV 암호화 동기화"를 보세요.
+
+## 먼저 알아 둘 한계
+- **"아카식만 접속"하게 만들 수는 없습니다.** WebDAV는 표준 프로토콜이라 사용자 이름·비밀번호를 아는 누구든 접속할 수 있습니다. 대신 **내용은 암호화**되어 있어(XChaCha20-Poly1305) 계정이 털려도 문서를 읽지는 못합니다. 서버에는 암호문과 폴더 이름(`akashic-<무작위>`)만 있습니다.
+- 다만 계정을 가진 사람은 **파일을 지우거나 망가뜨릴 수는 있습니다.** (망가진 조각은 앱이 "손상됨"으로 거부하고 덮어쓰지 않습니다.) 그래서 아래 **NAS 스냅숏 백업**이 필요합니다.
+- 서버 쪽 로그인 보호(요청 제한·실패 차단)는 이 문서의 리버스 프록시/NAS 설정으로 합니다. 앱은 비밀번호를 PC의 `config.json`에 평문으로 저장합니다(나중에 보호 방식을 바꿀 수 있음).
+
+## 서버가 만족해야 할 조건
+충돌(두 PC가 동시에 올림)을 막으려면 서버가 다음을 지켜야 하며, 앱의 **[연결 시험]** 이 임시 파일로 확인하고 못 지키면 설정을 거부합니다.
+- 파일마다 **ETag**를 주고, 파일이 바뀌면 ETag가 바뀐다.
+- `If-Match: <ETag>` 와 `If-None-Match: *` 조건부 PUT을 지킨다(맞지 않으면 412).
+
+확인된 경향(서버마다 다를 수 있으니 반드시 [연결 시험]으로 확인):
+- Apache `mod_dav`(예: `bytemark/webdav` 이미지): 조건부 PUT 지원 — **권장**.
+- WsgiDAV: 지원하지만 ETag 해상도가 초 단위라, 같은 크기로 1초 안에 두 번 올리면 구분하지 못할 수 있음(실사용에서는 드묾).
+- nginx `ngx_http_dav_module` 단독: ETag·조건부 PUT 미지원 → **연결 시험에서 거부됩니다.**
+- 일부 리버스 프록시의 압축(gzip)·재작성은 ETag를 약한 형태(`W/`)로 바꿀 수 있으니 WebDAV 경로는 압축을 끄세요.
+
+## 1. 도커 WebDAV 서버 (compose 예시)
+NAS에 전용 폴더를 만들고(예: `/volume1/docker/akashic-dav/data`), **그 폴더만** 컨테이너에 연결합니다. 컨테이너 안의 계정은 그 폴더 밖을 볼 수 없으므로 "경로 한정 전용 계정"이 됩니다. 다른 용도의 WebDAV 계정과 섞지 마세요.
+
+```yaml
+# docker-compose.yml
+services:
+  akashic-dav:
+    image: bytemark/webdav
+    restart: unless-stopped
+    environment:
+      AUTH_TYPE: Basic
+      USERNAME: akashic            # 아카식 전용 계정 이름
+      PASSWORD: "긴-무작위-비밀번호"   # 20자 이상 무작위 권장
+      LOCATION: /dav               # 서버 주소 경로가 /dav 가 된다
+    volumes:
+      - /volume1/docker/akashic-dav/data:/var/lib/dav
+    ports:
+      - "127.0.0.1:8080:80"        # 내부에서만 열고, 바깥에는 리버스 프록시로만 노출
+```
+
+- 이 컨테이너 포트(8080)는 **인터넷에 직접 열지 마세요.** 공유기 포트포워딩은 리버스 프록시(443)만.
+- 비밀번호는 `config.json`에 평문이므로 **다른 서비스와 다른 값**을 쓰세요.
+
+## 2. HTTPS 리버스 프록시
+아카식은 `https://` 주소만 받습니다(같은 PC의 `http://localhost` 시험용만 예외). 인증서는 Let's Encrypt 등 **공인 인증서**를 쓰세요(자체 서명 인증서는 연결이 거부됩니다).
+
+### Caddy 예시 (HTTPS 자동 발급 · 요청 크기 제한)
+```caddyfile
+dav.example.com {
+    # 아카식은 512KB 조각을 올린다. 1MB 면 충분하다.
+    request_body {
+        max_size 1MB
+    }
+    reverse_proxy 127.0.0.1:8080
+    log {
+        output file /var/log/caddy/akashic-dav.log
+    }
+}
+```
+앱의 서버 주소는 `https://dav.example.com/dav` 입니다.
+
+### nginx 예시
+```nginx
+server {
+    listen 443 ssl;
+    server_name dav.example.com;
+    # ssl_certificate / ssl_certificate_key 는 환경에 맞게
+
+    client_max_body_size 1m;          # 요청 크기 제한 (413 이면 앱이 안내합니다)
+    gzip off;                         # ETag 가 약해지지 않도록
+    location /dav/ {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_request_buffering on;
+    }
+}
+server { listen 80; server_name dav.example.com; return 301 https://$host$request_uri; }  # HTTPS 강제
+```
+Synology DSM이면 제어판 > 로그인 포털 > 고급 > 역방향 프록시에서 같은 구성을 만들고, 인증서는 제어판 > 보안 > 인증서에서 발급합니다. 요청 크기 제한은 사용자 지정 헤더/설정 파일에서 지정합니다.
+
+## 3. 로그인 실패 제한 (무차별 대입 방어)
+- **fail2ban**: 프록시 로그에서 `401` 응답이 짧은 시간에 반복되는 IP를 차단합니다(예: 10분에 10회 → 1시간 차단).
+- **Synology**: 제어판 > 보안 > 보호 > 자동 차단을 켜고 시도 횟수를 낮게 설정합니다. 프록시 앞단에서 차단하려면 위의 fail2ban 방식을 쓰세요.
+- 비밀번호는 20자 이상 무작위로. 가능하면 서버를 특정 국가·IP 대역에서만 받도록 제한하세요.
+
+## 4. NAS 스냅숏 백업 (꼭 권장)
+계정이 털리거나 실수로 지워져도 되돌릴 수 있게, 데이터 폴더(`/volume1/docker/akashic-dav/data`)에 **스냅숏**(Btrfs 공유 폴더의 스냅숏 복제, 또는 Hyper Backup)을 매일 걸고 최근 7~30개를 보관하세요. 복원은 스냅숏에서 폴더를 되돌리면 되고, 앱은 다음 동기화 때 서버 상태를 다시 읽습니다. (내용은 암호화되어 있어도 파일 삭제 자체는 막을 수 없습니다.)
+
+## 5. 앱에서 연결하기
+1. 옵션 > 백업·동기화 > 방식을 **WebDAV**로, 서버 주소·사용자·비밀번호 입력.
+2. **[연결 시험]**: ETag·If-Match를 지키는 서버인지 확인합니다. 임시 파일을 만들었다가 지웁니다.
+3. 첫 PC에서 **[새 저장소 만들기]** → 표시되는 **복구 문자열(AKS1-…)을 반드시 보관**.
+4. 다른 PC에서는 같은 주소·계정을 넣고 **[기존 저장소 연결]** 에 복구 문자열을 넣은 뒤 **[서버에서 받아오기]**.
+
+## 문제 해결
+| 앱 메시지 | 원인·조치 |
+|---|---|
+| 인증에 실패했습니다 | 사용자·비밀번호 확인, 계정에 그 폴더 쓰기 권한이 있는지 확인 |
+| 서버에 연결할 수 없습니다 / 서버 이름을 찾을 수 없습니다 | 주소·DDNS·포트포워딩·방화벽, 컨테이너 실행 여부 |
+| HTTPS 인증서 확인에 실패했습니다 | 공인 인증서 사용, 인증서 만료·PC 시계 확인 |
+| 서버(프록시)가 요청 크기를 거부했습니다 (413) | 요청 크기 제한을 1MB 이상으로 |
+| ETag를 주지 않습니다 / If-Match를 지키지 않습니다 | 서버 소프트웨어 교체(Apache mod_dav 권장) |
+| 다른 기기가 먼저 올렸습니다 | [서버에서 받아오기]로 먼저 받기 |
+| 키가 다릅니다 | 복구 문자열이 그 저장소의 것이 아님. 서버에는 아무것도 쓰지 않았음 |

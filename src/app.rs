@@ -139,6 +139,16 @@ pub struct Config {
     pub sync_failed: bool,
     /// 자동 동기화를 건너뛴 이유(비어 있으면 정상). 다음에 올리거나 불러오면 지워진다.
     pub sync_skip: String,
+    // --- WebDAV 암호화 동기화(sync_mode 가 "webdav" 일 때). 비밀번호·복구 문자열은 파일에 Windows 계정 암호화(DPAPI)로 저장 ---
+    /// 동기화 방식: "folder"(기본, 폴더) / "webdav"
+    pub sync_mode: String,
+    pub wd_url: String,
+    pub wd_user: String,
+    pub wd_pass: String,
+    /// 저장소 복구 문자열(AKS1-…). 비어 있으면 아직 저장소를 만들거나 연결하지 않은 것
+    pub wd_key: String,
+    /// 마지막으로 올리거나 받은 manifest 의 ETag(서버가 그 뒤 바뀌었는지 알아내는 기준)
+    pub wd_etag: String,
     // --- 자동 업데이트(GitHub 릴리스) ---
     pub update_check: bool,
     pub update_auto: bool,
@@ -197,6 +207,12 @@ impl Default for Config {
             sync_result_at: 0,
             sync_failed: false,
             sync_skip: String::new(),
+            sync_mode: "folder".into(),
+            wd_url: String::new(),
+            wd_user: String::new(),
+            wd_pass: String::new(),
+            wd_key: String::new(),
+            wd_etag: String::new(),
             update_check: true,
             update_auto: true,
             update_last: 0,
@@ -221,6 +237,8 @@ pub fn default_db_path() -> PathBuf {
 }
 /// 설정 파일을 읽지 못해 기본값으로 시작했는지(시작 알림용)
 pub static CONFIG_RESET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 설정의 WebDAV 비밀번호·복구 문자열이 보호된 채로 있는데 이 PC·계정에서 풀 수 없었는지(시작 알림용)
+pub static SECRET_UNREADABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 fn config_path() -> PathBuf {
     app_dir().join("config.json")
 }
@@ -229,8 +247,20 @@ impl Config {
         let path = config_path();
         let Ok(raw) = std::fs::read_to_string(&path) else { return Config::default() };
         // 메모장 등으로 저장한 BOM 있는 파일도 읽는다.
-        match serde_json::from_str(raw.trim_start_matches('\u{feff}')) {
-            Ok(c) => c,
+        match serde_json::from_str::<Config>(raw.trim_start_matches('\u{feff}')) {
+            Ok(mut c) => {
+                // 비밀값은 파일에서 Windows 계정에 묶여 암호화돼 있다(표식 없는 옛 평문은 그대로 읽고 다음 저장 때 보호된다).
+                for v in [&mut c.wd_pass, &mut c.wd_key] {
+                    match crate::secret::unprotect(v) {
+                        Some(p) => *v = p,
+                        None => {
+                            v.clear();
+                            SECRET_UNREADABLE.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                }
+                c
+            }
             Err(_) => {
                 // 손상되었거나 알 수 없는 형식: 기본값으로 시작하되, 이후 저장이 원본을 덮어쓰기 전에 사본을 남긴다
                 // (옮겨 둔 DB 위치·동기화 폴더 같은 설정을 사용자가 되살릴 수 있도록).
@@ -242,7 +272,19 @@ impl Config {
     }
     pub fn save(&self) {
         let _ = std::fs::create_dir_all(app_dir());
-        if let Ok(s) = serde_json::to_string_pretty(self) {
+        // 비밀번호·복구 문자열은 암호화해서 쓴다. 암호화에 실패하면 평문으로 쓰지 않고 이번 저장을 건너뛴다.
+        let mut c = self.clone();
+        match (crate::secret::protect(&self.wd_pass), crate::secret::protect(&self.wd_key)) {
+            (Some(p), Some(k)) => {
+                c.wd_pass = p;
+                c.wd_key = k;
+            }
+            _ => {
+                crate::diag::log("설정 저장 건너뜀: 비밀값을 암호화하지 못했습니다");
+                return;
+            }
+        }
+        if let Ok(s) = serde_json::to_string_pretty(&c) {
             let tmp = config_path().with_extension("tmp");
             if std::fs::write(&tmp, s).is_ok() {
                 let _ = std::fs::rename(&tmp, config_path());
