@@ -312,7 +312,7 @@ impl WebDavRemote {
         if let Some(e) = status_error(r.status) {
             return Err(RemoteError::Other(e));
         }
-        r.header("etag").map(String::from).ok_or_else(|| RemoteError::Other("서버가 ETag를 주지 않습니다".into()))
+        r.header("etag").map(|e| make_token(e, r.header("last-modified"))).ok_or_else(|| RemoteError::Other("서버가 ETag를 주지 않습니다".into()))
     }
 }
 
@@ -325,7 +325,7 @@ impl Remote for WebDavRemote {
         if let Some(e) = status_error(r.status) {
             return Err(RemoteError::Other(e));
         }
-        let etag = r.header("etag").unwrap_or("").to_string();
+        let etag = make_token(r.header("etag").unwrap_or(""), r.header("last-modified"));
         Ok(Some((r.body, etag)))
     }
 
@@ -334,7 +334,23 @@ impl Remote for WebDavRemote {
         let mut headers = vec!["Content-Type: application/octet-stream".to_string()];
         match &cond {
             PutCond::Any => {}
-            PutCond::IfMatch(e) => headers.push(format!("If-Match: {e}")),
+            PutCond::IfMatch(tok) => {
+                let (etag, lm) = split_token(tok);
+                if is_weak(etag) {
+                    // 약한 ETag(W/"…")는 If-Match 가 받아 주지 않는다(강한 비교만 허용). 올리기 직전에 지금 값이 내가 본 값과
+                    // 같은지 직접 확인하고, 서버가 지켜 주는 If-Unmodified-Since(마지막으로 본 수정 시각 + 1초)를 함께 건다.
+                    // 서버의 수정 시각은 마이크로초라 같은 초를 그대로 주면 맞는 값도 거절되므로 1초를 더한다.
+                    let cur = self.head_etag(name)?;
+                    if split_token(&cur).0 != etag {
+                        return Err(RemoteError::Conflict);
+                    }
+                    if let Some(l) = lm.and_then(plus_one_second) {
+                        headers.push(format!("If-Unmodified-Since: {l}"));
+                    }
+                } else {
+                    headers.push(format!("If-Match: {etag}"));
+                }
+            }
             PutCond::IfNoneMatch => headers.push("If-None-Match: *".to_string()),
         }
         let mut r = self.run(Req { method: "PUT", url: url.clone(), headers: headers.clone(), body: Some(data) })?;
@@ -349,11 +365,15 @@ impl Remote for WebDavRemote {
         if let Some(e) = status_error(r.status) {
             return Err(RemoteError::Other(e));
         }
-        match r.header("etag") {
-            Some(e) => Ok(e.to_string()),
-            // PUT 응답에 ETag 가 없는 서버: 바로 읽어 온다. 조각(Any)은 ETag 를 쓰지 않으므로 건너뛴다.
-            None if matches!(cond, PutCond::Any) => Ok(String::new()),
-            None => self.head_etag(name),
+        // 조각(Any)은 ETag 를 쓰지 않으므로 응답 값을 그대로 둔다.
+        if matches!(cond, PutCond::Any) {
+            return Ok(r.header("etag").unwrap_or("").to_string());
+        }
+        // 아파치 계열(시놀로지 WebDAV 등)은 PUT 응답의 ETag 가 나중에 읽을 때의 ETag 와 다를 수 있어
+        // 그 값으로 If-Match 를 걸면 맞는 값도 412 가 된다. 올린 직후 다시 읽은 값을 쓰고, 읽기에 실패할 때만 응답 값을 쓴다.
+        match self.head_etag(name) {
+            Ok(e) => Ok(e),
+            Err(x) => r.header("etag").map(String::from).ok_or(x),
         }
     }
 
@@ -378,6 +398,35 @@ impl Remote for WebDavRemote {
         }
         Ok(parse_propfind(&String::from_utf8_lossy(&r.body)))
     }
+}
+
+// ───────────────────────── ETag 토큰 ─────────────────────────
+// `Remote` 가 주고받는 ETag 는 앱에게 불투명한 문자열이다. 약한 ETag(W/"…")를 주는 서버에서는 마지막 수정 시각을
+// 뒤에 공백으로 붙여 `W/"3-abc" Thu, 19 Nov 2026 06:49:50 GMT` 처럼 만든다(ETag 문자에는 공백이 없으므로 처음 공백에서 나눈다).
+
+fn is_weak(etag: &str) -> bool {
+    etag.starts_with("W/")
+}
+
+fn make_token(etag: &str, last_modified: Option<&str>) -> String {
+    match last_modified.map(str::trim).filter(|l| !l.is_empty()) {
+        Some(l) if is_weak(etag) => format!("{etag} {l}"),
+        _ => etag.to_string(),
+    }
+}
+
+fn split_token(token: &str) -> (&str, Option<&str>) {
+    match token.split_once(' ') {
+        Some((e, l)) => (e, Some(l.trim()).filter(|l| !l.is_empty())),
+        None => (token, None),
+    }
+}
+
+/// HTTP 날짜(`Thu, 19 Nov 2026 06:49:50 GMT`)에 1초를 더해 같은 형식으로 돌려준다. 읽을 수 없으면 None.
+fn plus_one_second(http_date: &str) -> Option<String> {
+    let t = chrono::DateTime::parse_from_rfc2822(http_date).ok()?;
+    let t = t.with_timezone(&chrono::Utc) + chrono::Duration::seconds(1);
+    Some(t.format("%a, %d %b %Y %H:%M:%S GMT").to_string())
 }
 
 // ───────────────────────── 연결 시험 ─────────────────────────
@@ -411,7 +460,12 @@ fn run_test(remote: &dyn Remote, name: &str) -> Result<String, String> {
         Ok(_) => return Err("이 서버는 If-None-Match 조건을 지키지 않아 다른 기기의 저장소를 덮어쓸 수 있습니다. 다른 WebDAV 서버를 쓰세요".into()),
         Err(x) => return Err(e(x)),
     }
-    let e2 = remote.put(name, b"two-2", PutCond::IfMatch(e1.clone())).map_err(e)?;
+    let e2 = remote
+        .put(name, b"two-2", PutCond::IfMatch(e1.clone()))
+        .map_err(|x| match x {
+            RemoteError::Conflict => "서버가 올바른 ETag의 If-Match 갱신을 412로 거부했습니다. 이 서버는 올리고 나서 읽은 ETag가 일정하지 않아 충돌 감지에 쓸 수 없습니다".to_string(),
+            RemoteError::Other(s) => s,
+        })?;
     if e2 == e1 {
         return Err("이 서버는 파일을 바꿔도 ETag가 바뀌지 않아 충돌을 감지할 수 없습니다. 다른 WebDAV 서버를 쓰세요".into());
     }
@@ -426,12 +480,33 @@ fn run_test(remote: &dyn Remote, name: &str) -> Result<String, String> {
         _ => return Err("올린 시험 파일을 다시 읽어 확인하지 못했습니다".into()),
     }
     remote.list().map_err(e)?;
-    Ok("연결 성공: ETag와 조건부 올리기(If-Match)를 지키는 서버입니다".into())
+    Ok("연결 성공: 충돌 감지(ETag 확인과 조건부 올리기)가 동작하는 서버입니다".into())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn 약한_etag는_수정_시각을_붙여_토큰으로_만들고_다시_나눈다() {
+        let lm = "Thu, 19 Nov 2026 06:49:50 GMT";
+        let t = make_token("W/\"3-6609b829758a6\"", Some(lm));
+        assert_eq!(t, format!("W/\"3-6609b829758a6\" {lm}"));
+        assert_eq!(split_token(&t), ("W/\"3-6609b829758a6\"", Some(lm)));
+        // 강한 ETag·시각 없음·옛 설정(시각 없이 저장된 값)은 그대로
+        assert_eq!(make_token("\"abc\"", Some(lm)), "\"abc\"");
+        assert_eq!(make_token("W/\"x\"", None), "W/\"x\"");
+        assert_eq!(split_token("W/\"x\""), ("W/\"x\"", None));
+        assert_eq!(split_token("\"abc\""), ("\"abc\"", None));
+        assert!(is_weak("W/\"x\"") && !is_weak("\"x\""));
+    }
+
+    #[test]
+    fn 수정_시각에_1초를_더한다() {
+        assert_eq!(plus_one_second("Thu, 19 Nov 2026 06:49:50 GMT").as_deref(), Some("Thu, 19 Nov 2026 06:49:51 GMT"));
+        assert_eq!(plus_one_second("Thu, 19 Nov 2026 23:59:59 GMT").as_deref(), Some("Fri, 20 Nov 2026 00:00:00 GMT"));
+        assert_eq!(plus_one_second("엉터리"), None);
+    }
 
     #[test]
     fn 주소는_https만_허용하고_로컬_http만_예외() {
