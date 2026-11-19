@@ -155,7 +155,7 @@ impl App {
         let ans = rfd::MessageDialog::new()
             .set_title("문서 단위 동기화 · 첫 연결")
             .set_description(format!(
-                "서버에 이미 다른 PC가 올린 문서가 있습니다.\n\n• {BTN_REPLACE}(권장): 이 PC의 문서를 모두 비우고 서버 내용으로 채웁니다. 지금 DB는 backup 폴더에 보관됩니다.\n• {BTN_MERGE}: 이 PC의 문서를 그대로 두고 서버 문서를 더합니다. 두 PC에 같은 문서가 있으면 중복됩니다."
+                "서버에 이미 다른 PC가 올린 문서가 있습니다.\n\n• [예] = {BTN_REPLACE}(권장): 이 PC의 문서를 모두 비우고 서버 내용으로 채웁니다. 지금 DB는 backup 폴더에 보관됩니다.\n• [아니요] = {BTN_MERGE}: 이 PC의 문서를 그대로 두고 서버 문서를 더합니다. 두 PC에 같은 문서가 있으면 중복됩니다.\n• [취소] = 연결하지 않습니다."
             ))
             .set_buttons(rfd::MessageButtons::YesNoCancelCustom(BTN_REPLACE.into(), BTN_MERGE.into(), "취소".into()))
             .show();

@@ -449,6 +449,7 @@ impl App {
             return;
         }
         let (url, user, pass) = (self.cfg.wd_url.clone(), self.cfg.wd_user.trim().to_string(), self.cfg.wd_pass.clone());
+        let doc = self.is_doc();
         let (tx, rx) = channel();
         let ctx = ST.with(|s| s.borrow().ctx.clone());
         std::thread::spawn(move || {
@@ -457,6 +458,15 @@ impl App {
                 Some(k) => {
                     let res = (|| -> Result<String, String> {
                         let key = VaultKey::from_recovery(&k)?;
+                        if doc {
+                            // 문서 단위는 스냅숏과 다른 서버 폴더(akashic2-…)를 쓴다.
+                            let remote = WebDavRemote::new(&url, &user, &pass, &super::docsync_ui::doc_folder(&key))?;
+                            return if crate::docsync::remote_has_data(&remote)? {
+                                Ok("연결했습니다 · 서버에 문서 단위 저장소가 있습니다".to_string())
+                            } else {
+                                Err("서버에 이 복구 문자열의 문서 단위 저장소가 없습니다. 서버 주소·계정이 맞는지, 다른 PC에서 [지금 동기화]를 한 번 했는지 확인하세요(스냅숏 방식으로 만든 저장소는 문서 단위에서 보이지 않습니다)".into())
+                            };
+                        }
                         let remote = WebDavRemote::new(&url, &user, &pass, &key.folder_name())?;
                         match vault::read_state(&remote, &key).map_err(vault_err)? {
                             Some(s) => Ok(format!("연결했습니다 · 서버의 저장본: {} ({})", fmt_ts(s.manifest.saved_at), s.manifest.device)),
@@ -576,17 +586,32 @@ impl App {
         });
         ui.horizontal(|ui| {
             ui.label("주기");
-            let cur = self.cfg.sync_hours;
-            egui::ComboBox::from_id_salt("sync_hours").selected_text(format!("{cur}시간")).show_ui(ui, |ui| {
-                for h in [1u32, 3, 6, 24] {
-                    if ui.selectable_label(cur == h, format!("{h}시간")).clicked() {
-                        self.cfg.sync_hours = h;
-                        self.cfg.save();
-                        self.fs_invalidate(true);
-                        ui.close();
+            if self.is_doc() {
+                // 문서 단위: 다른 PC의 변경을 이 주기로 확인하고, 이 PC에서 고친 것은 2분 뒤에 올린다.
+                let cur = self.cfg.sync_mins;
+                egui::ComboBox::from_id_salt("sync_mins").selected_text(mins_text(cur)).show_ui(ui, |ui| {
+                    for m in [5u32, 15, 60] {
+                        if ui.selectable_label(cur == m, mins_text(m)).clicked() {
+                            self.cfg.sync_mins = m;
+                            self.cfg.save();
+                            self.fs_invalidate(true);
+                            ui.close();
+                        }
                     }
-                }
-            });
+                });
+            } else {
+                let cur = self.cfg.sync_hours;
+                egui::ComboBox::from_id_salt("sync_hours").selected_text(format!("{cur}시간")).show_ui(ui, |ui| {
+                    for h in [1u32, 3, 6, 24] {
+                        if ui.selectable_label(cur == h, format!("{h}시간")).clicked() {
+                            self.cfg.sync_hours = h;
+                            self.cfg.save();
+                            self.fs_invalidate(true);
+                            ui.close();
+                        }
+                    }
+                });
+            }
         });
         // 저장본 정보는 백그라운드에서 읽어 둔 값을 쓴다.
         let place = if self.is_wd() { "서버" } else { "폴더" };
@@ -736,7 +761,8 @@ impl App {
             }
         });
         if let Ok(k) = VaultKey::from_recovery(&self.cfg.wd_key) {
-            ui.label(egui::RichText::new(format!("연결된 저장소의 서버 폴더: {} (폴더 이름일 뿐 복구 문자열이 아닙니다)", k.folder_name())).color(self.theme.dim).small());
+            let folder = if self.is_doc() { super::docsync_ui::doc_folder(&k) } else { k.folder_name() };
+            ui.label(egui::RichText::new(format!("연결된 저장소의 서버 폴더: {folder} (폴더 이름일 뿐 복구 문자열이 아닙니다)")).color(self.theme.dim).small());
         } else {
             ui.label(egui::RichText::new("연결된 저장소: 없음 — 새로 만들거나 아래에 복구 문자열을 넣어 기존 저장소에 연결하세요").color(self.theme.dim).small());
         }
@@ -799,9 +825,10 @@ impl App {
 
     fn sync_due(&self) -> bool {
         let waited = db::now() - self.cfg.last_sync;
-        let by_hours = waited >= self.cfg.sync_hours.max(1) as i64 * 3600;
-        // 문서 단위는 다른 PC의 변경을 일찍 받아야 하므로, 이 PC에 바뀐 것이 있으면 10분마다도 맞춘다.
-        let by_edit = self.is_doc() && waited >= 600 && self.db.rev() != self.cfg.sync_rev;
+        let period = if self.is_doc() { self.cfg.sync_mins.max(1) as i64 * 60 } else { self.cfg.sync_hours.max(1) as i64 * 3600 };
+        let by_hours = waited >= period;
+        // 문서 단위는 이 PC에 바뀐 것이 있으면 주기를 기다리지 않고 2분 뒤에 올린다.
+        let by_edit = self.is_doc() && waited >= 120 && self.db.rev() != self.cfg.sync_rev;
         self.cfg.sync_auto && self.sync_configured() && (by_hours || by_edit)
     }
 
@@ -865,13 +892,13 @@ impl App {
         if self.cfg.sync_failed {
             return ("동기화 실패".into(), format!("{}\n클릭: 옵션 > 백업·동기화", self.cfg.sync_result), true);
         }
-        let hours = self.cfg.sync_hours.max(1) as i64;
+        let period_secs = if self.is_doc() { self.cfg.sync_mins.max(1) as i64 * 60 } else { self.cfg.sync_hours.max(1) as i64 * 3600 };
         let next_short = if !self.cfg.sync_auto {
             "수동".to_string()
         } else if last <= 0 {
             "곧".to_string()
         } else {
-            let due = last + hours * 3600 - db::now();
+            let due = last + period_secs - db::now();
             if due <= 0 {
                 "곧".to_string()
             } else if due < 3600 {
@@ -886,7 +913,13 @@ impl App {
             "{target}\n마지막 저장: {}\n자동 동기화: {}{}{}\n\n클릭: 옵션 > 백업·동기화",
             fmt_ts(last),
             if self.cfg.sync_auto { "켜짐" } else { "꺼짐" },
-            if self.cfg.sync_auto { format!(" ({hours}시간마다)") } else { String::new() },
+            if !self.cfg.sync_auto {
+                String::new()
+            } else if self.is_doc() {
+                format!(" ({}마다 확인 · 고친 것은 2분 뒤 올림)", mins_text(self.cfg.sync_mins.max(1)))
+            } else {
+                format!(" ({}시간마다)", self.cfg.sync_hours.max(1))
+            },
             result
         );
         (short, tip, false)
@@ -1043,4 +1076,9 @@ impl App {
             self.sync_auto_try();
         }
     }
+}
+
+/// 문서 단위 동기화 주기 표시("5분", "1시간").
+fn mins_text(m: u32) -> String {
+    if m >= 60 && m % 60 == 0 { format!("{}시간", m / 60) } else { format!("{m}분") }
 }

@@ -126,6 +126,8 @@ pub struct Config {
     pub sync_dir: String,
     pub sync_auto: bool,
     pub sync_hours: u32,
+    /// 문서 단위 동기화의 확인 주기(분)
+    pub sync_mins: u32,
     pub last_sync: i64,
     /// 마지막으로 열었던 문서 id(다시 시작할 때 그 문서를 연다)
     pub last_doc: i64,
@@ -190,7 +192,7 @@ impl Default for Config {
             right_default_v2: false,
             toc_depth: 6,
             sort: 0,
-            autosave_min: 5,
+            autosave_min: 2,
             merge_min: 60,
             renderer: "directx".into(),
             renderer_pending: String::new(),
@@ -202,6 +204,7 @@ impl Default for Config {
             sync_dir: String::new(),
             sync_auto: false,
             sync_hours: 24,
+            sync_mins: 5,
             last_sync: 0,
             last_doc: 0,
             sync_rev: 0,
