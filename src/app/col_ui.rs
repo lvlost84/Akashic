@@ -93,7 +93,10 @@ impl App {
         });
         self.col.open = open;
         match apply {
-            Some(Ok(r)) => self.edit_req = Some(EditReq::Cols(self.col.unit, r, self.col.keep)),
+            Some(Ok(r)) => {
+                self.edit_sel = Some(self.last_sel); // 이 창을 누르는 동안 풀린 선택 대신 편집창의 마지막 선택을 쓴다
+                self.edit_req = Some(EditReq::Cols(self.col.unit, r, self.col.keep));
+            }
             Some(Err(m)) => self.say(&m),
             None => {}
         }
