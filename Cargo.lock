@@ -141,7 +141,7 @@ dependencies = [
 
 [[package]]
 name = "akashic"
-version = "2.12.0"
+version = "2.12.1"
 dependencies = [
  "chacha20poly1305",
  "chrono",
