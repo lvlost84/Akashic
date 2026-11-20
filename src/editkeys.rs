@@ -309,6 +309,131 @@ pub fn toggle_wrap(text: &str, lo: usize, hi: usize, l: &str, r: &str) -> Edit {
     Edit { text: s, lo: lo + ln, hi: hi + ln }
 }
 
+/// 공백 정리 방식.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpaceMode {
+    /// 글자 사이의 공백(연속 포함)을 탭 하나로
+    ToTab,
+    /// 글자 사이의 공백을 모두 지움
+    Remove,
+}
+
+/// 공백으로 보는 글자: 보통 공백·전각 공백·NBSP(탭은 `ToTab`에서만 함께 묶는다)
+fn is_gap(c: char) -> bool {
+    matches!(c, ' ' | '\u{3000}' | '\u{00A0}')
+}
+
+/// 한 줄의 공백을 바꾼다. 줄 앞 들여쓰기는 그대로 두고, 줄 끝 공백은 지운다.
+fn respace_line(line: &str, mode: SpaceMode) -> String {
+    let body_start = line.find(|c: char| !(is_gap(c) || c == '\t')).unwrap_or(line.len());
+    let (lead, rest) = line.split_at(body_start);
+    let mut out = String::from(lead);
+    let mut run = false; // 공백 덩어리 안
+    for c in rest.chars() {
+        if is_gap(c) || (mode == SpaceMode::ToTab && c == '\t') {
+            run = true;
+            continue;
+        }
+        if run && mode == SpaceMode::ToTab {
+            out.push('\t');
+        }
+        run = false;
+        out.push(c);
+    }
+    out // 줄 끝에 남은 공백 덩어리는 버린다(탭을 끝에 남기지 않는다)
+}
+
+/// 선택이 걸친 줄들(선택이 없으면 문서 전체)의 글자 사이 공백을 탭으로 바꾸거나 지운다.
+/// 바뀐 줄 범위를 선택으로 돌려준다. 바뀔 것이 없으면 None.
+pub fn respace(text: &str, lo: usize, hi: usize, mode: SpaceMode) -> Option<Edit> {
+    let mut ls = Lines::parse(text);
+    let (l0, l1) = if lo == hi { (0, ls.len() - 1) } else { ls.block(lo, hi) };
+    let mut changed = false;
+    for k in l0..=l1 {
+        let n = respace_line(&ls.content[k], mode);
+        if n != ls.content[k] {
+            ls.content[k] = n;
+            changed = true;
+        }
+    }
+    if !changed {
+        return None;
+    }
+    let start = ls.start(l0);
+    let end = ls.start(l1) + ls.content[l1].chars().count();
+    Some(Edit { text: ls.join(), lo: start, hi: end })
+}
+
+/// 열 자르기의 단위.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColUnit {
+    /// 줄 안의 글자 위치
+    Char,
+    /// 탭으로 나뉜 칸(열)
+    Tab,
+}
+
+/// 열 자르기의 범위(번호는 1부터, 끝 번호 포함).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColRange {
+    /// A번째부터 B번째까지(A>B이면 맞바꿈)
+    Span(usize, usize),
+    /// 처음부터 N번째까지
+    First(usize),
+    /// 끝에서 N번째까지(끝의 N개)
+    Last(usize),
+}
+
+/// 한 줄의 단위 목록에서 범위가 고른 구간 `[s, e)`. 범위가 줄 밖이면 빈 구간(s == e).
+fn col_span(len: usize, r: ColRange) -> (usize, usize) {
+    let (s, e) = match r {
+        ColRange::Span(a, b) => {
+            let (a, b) = (a.max(1), b.max(1));
+            let (a, b) = if a > b { (b, a) } else { (a, b) };
+            (a - 1, b)
+        }
+        ColRange::First(n) => (0, n),
+        ColRange::Last(n) => (len.saturating_sub(n), len),
+    };
+    let e = e.min(len);
+    (s.min(e), e)
+}
+
+/// 선택이 걸친 줄들(선택이 없으면 문서 전체)에서 각 줄의 `range`로 고른 열만 남기거나(`keep`) 지운다.
+/// 단위가 `Tab`이면 탭으로 나뉜 칸 단위이고 남은 칸은 탭으로 다시 잇는다. 줄 끝 모양은 보존한다.
+/// 바뀐 줄 범위를 선택으로 돌려준다. 바뀔 것이 없으면 None.
+pub fn cut_columns(text: &str, lo: usize, hi: usize, unit: ColUnit, range: ColRange, keep: bool) -> Option<Edit> {
+    let mut ls = Lines::parse(text);
+    let (l0, l1) = if lo == hi { (0, ls.len() - 1) } else { ls.block(lo, hi) };
+    let mut changed = false;
+    for k in l0..=l1 {
+        let line = &ls.content[k];
+        let new = match unit {
+            ColUnit::Char => {
+                let ch: Vec<char> = line.chars().collect();
+                let (s, e) = col_span(ch.len(), range);
+                let pick = |from: usize, to: usize| ch[from..to].iter().collect::<String>();
+                if keep { pick(s, e) } else { pick(0, s) + &pick(e, ch.len()) }
+            }
+            ColUnit::Tab => {
+                let cols: Vec<&str> = line.split('\t').collect();
+                let (s, e) = col_span(cols.len(), range);
+                if keep { cols[s..e].join("\t") } else { cols[..s].iter().chain(&cols[e..]).copied().collect::<Vec<_>>().join("\t") }
+            }
+        };
+        if new != ls.content[k] {
+            ls.content[k] = new;
+            changed = true;
+        }
+    }
+    if !changed {
+        return None;
+    }
+    let start = ls.start(l0);
+    let end = ls.start(l1) + ls.content[l1].chars().count();
+    Some(Edit { text: ls.join(), lo: start, hi: end })
+}
+
 /// PageUp/PageDown: 화면 높이만큼 움직인 뒤의 (캐럿 y, 스크롤 위치).
 /// `caret_y` 캐럿 줄 윗선(글 좌표), `scroll` 현재 스크롤 위쪽 오프셋, `view_h` 보이는 높이, `content_h` 전체 높이.
 /// 캐럿이 화면에서 있던 자리를 유지하도록 같은 만큼 옮기되, 문서 끝·처음에서 넘치지 않게 자른다.
@@ -611,5 +736,76 @@ mod tests {
         assert_eq!(parse_goto("", 10), None);
         assert_eq!(parse_goto("-3", 10), None);
         assert_eq!(line_count("a\nb\n"), 3);
+    }
+
+    // ---- 열 자르기 ----
+    fn cut(t: &str, u: ColUnit, r: ColRange, keep: bool) -> Option<String> {
+        cut_columns(t, 0, 0, u, r, keep).map(|e| e.text)
+    }
+
+    #[test]
+    fn cut_chars_span_first_last() {
+        use ColRange::*;
+        let c = ColUnit::Char;
+        assert_eq!(cut("abcdef", c, Span(2, 4), true).unwrap(), "bcd");
+        assert_eq!(cut("abcdef", c, Span(4, 2), true).unwrap(), "bcd"); // 거꾸로 써도 같게
+        assert_eq!(cut("abcdef", c, Last(3), true).unwrap(), "def");
+        assert_eq!(cut("abcdef", c, First(2), true).unwrap(), "ab");
+        assert_eq!(cut("abcdef", c, First(2), false).unwrap(), "cdef");
+        assert_eq!(cut("abcdef", c, Last(2), false).unwrap(), "abcd");
+        assert_eq!(cut("abcdef", c, Span(2, 4), false).unwrap(), "aef");
+        assert_eq!(cut("가나다라", c, Span(2, 3), true).unwrap(), "나다"); // 한글은 한 글자씩
+    }
+
+    #[test]
+    fn cut_tab_columns() {
+        use ColRange::*;
+        let t = ColUnit::Tab;
+        assert_eq!(cut("a\tb\tc\td", t, Span(2, 3), true).unwrap(), "b\tc");
+        assert_eq!(cut("a\tb\tc\td", t, Last(1), true).unwrap(), "d");
+        assert_eq!(cut("a\tb\tc\td", t, First(1), false).unwrap(), "b\tc\td");
+        assert_eq!(cut("a\tb\tc\td", t, Last(2), false).unwrap(), "a\tb");
+    }
+
+    #[test]
+    fn cut_short_lines_and_scope_and_crlf() {
+        use ColRange::*;
+        let c = ColUnit::Char;
+        assert_eq!(cut("ab", c, Span(5, 9), true).unwrap(), ""); // 줄 밖이면 남길 것이 없음
+        assert!(cut("ab", c, Span(5, 9), false).is_none()); // 지울 것도 없음
+        assert!(cut("ab", c, Last(5), true).is_none()); // 전부 남김 = 변화 없음
+        let e = cut_columns("abc\r\ndef\r\nghi", 5, 8, c, First(1), true).unwrap(); // 둘째 줄만
+        assert_eq!(e.text, "abc\r\nd\r\nghi");
+        assert_eq!((e.lo, e.hi), (5, 6));
+    }
+
+    // ---- 공백 정리 ----
+    #[test]
+    fn respace_to_tab_collapses_runs_and_keeps_indent() {
+        let e = respace("A   10  20\n  - 가 나\n", 0, 0, SpaceMode::ToTab).unwrap();
+        assert_eq!(e.text, "A\t10\t20\n  -\t가\t나\n"); // 줄 앞 들여쓰기만 유지, 목록 기호 뒤 공백도 글자 사이로 본다
+    }
+
+    #[test]
+    fn respace_remove_keeps_newlines_and_indent() {
+        let e = respace("A 1 2\r\n  b  c\n", 0, 0, SpaceMode::Remove).unwrap();
+        assert_eq!(e.text, "A12\r\n  bc\n");
+    }
+
+    #[test]
+    fn respace_handles_fullwidth_nbsp_and_trailing() {
+        let e = respace("a\u{3000}b\u{00A0}c   \nx", 0, 0, SpaceMode::ToTab).unwrap();
+        assert_eq!(e.text, "a\tb\tc\nx");
+        let e = respace("a \t b\t", 0, 0, SpaceMode::ToTab).unwrap();
+        assert_eq!(e.text, "a\tb");
+    }
+
+    #[test]
+    fn respace_selection_limits_to_lines_and_none_when_unchanged() {
+        let e = respace("a b\nc d\ne f", 4, 7, SpaceMode::ToTab).unwrap(); // 둘째 줄만
+        assert_eq!(e.text, "a b\nc\td\ne f");
+        assert_eq!((e.lo, e.hi), (4, 7));
+        assert!(respace("ab\ncd", 0, 0, SpaceMode::ToTab).is_none());
+        assert!(respace("a\tb", 0, 0, SpaceMode::Remove).is_none()); // 탭은 공백으로 지우지 않음
     }
 }

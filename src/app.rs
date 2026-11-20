@@ -1,5 +1,6 @@
 use crate::db::*;
 mod about_ui;
+mod col_ui;
 mod export_ui;
 mod find_ui;
 mod graph_ui;
@@ -316,6 +317,21 @@ enum ListRow {
     Doc(usize),
 }
 
+/// 편집창 우클릭·… 메뉴의 편집 요청
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditReq {
+    Cut,
+    Copy,
+    Paste,
+    SelectAll,
+    /// 감싸기 토글(왼쪽, 오른쪽)
+    Wrap(&'static str, &'static str),
+    Link,
+    Respace(crate::editkeys::SpaceMode),
+    /// 열 자르기(단위, 범위, 남기기 여부)
+    Cols(crate::editkeys::ColUnit, crate::editkeys::ColRange, bool),
+}
+
 enum Act {
     NewDoc,
     Open(i64),
@@ -335,6 +351,8 @@ enum Act {
     Import,
     Export,
     InsertImage,
+    Edit(EditReq),
+    ColDialog,
     Back,
     Forward,
     /// 문서를 읽기 전용 참고 창으로 연다
@@ -412,6 +430,9 @@ pub struct App {
     goto_focus: bool,
     /// PageUp/PageDown 요청(아래로?, Shift?)과, 다음 그리기에 맞출 스크롤 위치
     page_req: Option<(bool, bool)>,
+    /// 우클릭·… 메뉴에서 고른 편집(다음에 편집창을 그리기 전에 적용)
+    edit_req: Option<EditReq>,
+    col: col_ui::ColCut,
     page_scroll: Option<Vec2>,
 
     cursor_line: Option<usize>,
@@ -523,6 +544,8 @@ impl App {
             goto_text: String::new(),
             goto_focus: false,
             page_req: None,
+            edit_req: None,
+            col: Default::default(),
             page_scroll: None,
             cursor_line: None,
             cursor_idx: 0,
@@ -1040,6 +1063,10 @@ impl App {
                     }
                 }
                 Act::InsertImage => self.insert_image_dialog(),
+                Act::ColDialog => self.col.open = true,
+                Act::Edit(r) => {
+                    self.edit_req = Some(r);
+                }
                 Act::Import => {
                     if let Some(p) = rfd::FileDialog::new().add_filter("마크다운/텍스트", &["md", "txt"]).pick_files() {
                         self.import_paths(p);
@@ -1159,6 +1186,74 @@ impl App {
             }
         }
         sel
+    }
+
+    /// 편집창의 선택 범위(작은 쪽, 큰 쪽). 상태가 없으면 (0, 0).
+    fn sel_range(ctx: &egui::Context, id: egui::Id) -> (usize, usize) {
+        egui::TextEdit::load_state(ctx, id).and_then(|st| st.cursor.char_range()).map_or((0, 0), |r| {
+            let (p, s): (usize, usize) = (r.primary.index.into(), r.secondary.index.into());
+            (p.min(s), p.max(s))
+        })
+    }
+
+    /// 우클릭·… 메뉴에서 고른 편집을 적용한다. 편집창을 그리기 전에 본문을 바꿔 Ctrl+Z 한 번으로 되돌아간다.
+    fn apply_edit_req(&mut self, ctx: &egui::Context, id: egui::Id) {
+        use egui::text::{CCursor, CCursorRange};
+        let Some(req) = self.edit_req.take() else { return };
+        if self.cur_trashed && !matches!(req, EditReq::Copy | EditReq::SelectAll) {
+            return;
+        }
+        ctx.memory_mut(|m| m.request_focus(id)); // 메뉴를 누르면 편집창이 포커스를 잃으므로 되돌린다
+        let (lo, hi) = Self::sel_range(ctx, id);
+        match req {
+            EditReq::Copy | EditReq::Cut => {
+                if lo == hi {
+                    return;
+                }
+                let picked: String = self.body.chars().skip(lo).take(hi - lo).collect();
+                ctx.copy_text(picked);
+                if req == EditReq::Cut {
+                    let mut t: String = self.body.chars().take(lo).collect();
+                    t.extend(self.body.chars().skip(hi));
+                    self.apply_body_edit(ctx, id, t, (lo, lo));
+                }
+            }
+            EditReq::Paste => ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste),
+            EditReq::SelectAll => {
+                let n = self.body.chars().count();
+                let mut st = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
+                st.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(0), CCursor::new(n))));
+                st.store(ctx, id);
+                ctx.request_repaint();
+            }
+            EditReq::Wrap(l, r) => {
+                let e = crate::editkeys::toggle_wrap(&self.body, lo, hi, l, r);
+                self.apply_body_edit(ctx, id, e.text, (e.lo, e.hi));
+            }
+            EditReq::Link => {
+                let (ba, bb) = (byte_of(&self.body, lo), byte_of(&self.body, hi));
+                self.body.insert_str(bb, "](주소)");
+                self.body.insert_str(ba, "[");
+                let t = std::mem::take(&mut self.body);
+                self.apply_body_edit(ctx, id, t, (lo + 1, hi + 1));
+            }
+            EditReq::Cols(unit, range, keep) => match crate::editkeys::cut_columns(&self.body, lo, hi, unit, range, keep) {
+                Some(e) => {
+                    let scope = if lo == hi { "문서 전체" } else { "선택한 줄" };
+                    self.apply_body_edit(ctx, id, e.text, (e.lo, e.hi));
+                    self.say(&format!("{scope}에 열 자르기를 적용했습니다"));
+                }
+                None => self.say("바뀌는 내용이 없습니다"),
+            },
+            EditReq::Respace(mode) => match crate::editkeys::respace(&self.body, lo, hi, mode) {
+                Some(e) => {
+                    let scope = if lo == hi { "문서 전체" } else { "선택한 줄" };
+                    self.apply_body_edit(ctx, id, e.text, (e.lo, e.hi));
+                    self.say(&format!("{scope}의 공백을 {}", if mode == crate::editkeys::SpaceMode::ToTab { "탭으로 바꿨습니다" } else { "지웠습니다" }));
+                }
+                None => self.say("바꿀 공백이 없습니다"),
+            },
+        }
     }
 
     /// 편집창 밖(찾아 바꾸기 등)에서 본문을 바꾼다: 커서·저장 예약·줄 번호를 갱신한다.
@@ -1625,6 +1720,10 @@ impl App {
                         if crate::icons::btn(ui, crate::icons::Icon::Import, ".md/.txt 가져오기").clicked() { acts.push(Act::Import); ui.close(); }
                         if crate::icons::btn_ex(ui, crate::icons::Icon::Import, "이미지 삽입…", !self.cur_trashed, None).on_hover_text("그림을 WebP로 줄여 문서에 넣습니다(붙여넣기·끌어놓기도 됩니다)").clicked() { acts.push(Act::InsertImage); ui.close(); }
                         ui.separator();
+                        if crate::icons::btn_ex(ui, crate::icons::Icon::Import, "공백을 탭으로", !self.cur_trashed, None).on_hover_text("선택한 줄(선택이 없으면 문서 전체)의 글자 사이 공백을 탭 하나로 바꿉니다. 줄 앞 들여쓰기는 그대로 둡니다").clicked() { acts.push(Act::Edit(EditReq::Respace(crate::editkeys::SpaceMode::ToTab))); ui.close(); }
+                        if crate::icons::btn_ex(ui, crate::icons::Icon::Import, "공백 제거", !self.cur_trashed, None).on_hover_text("선택한 줄(선택이 없으면 문서 전체)의 글자 사이 공백을 모두 지웁니다. 줄 앞 들여쓰기·줄바꿈은 그대로 둡니다").clicked() { acts.push(Act::Edit(EditReq::Respace(crate::editkeys::SpaceMode::Remove))); ui.close(); }
+                        if crate::icons::btn_ex(ui, crate::icons::Icon::Edit, "열 자르기…", !self.cur_trashed, None).on_hover_text("각 줄에서 A~B번째·처음 N개·끝 N개만 남기거나 지웁니다(글자 위치 또는 탭 열 기준)").clicked() { acts.push(Act::ColDialog); ui.close(); }
+                        ui.separator();
                         if self.cur_trashed {
                             if crate::icons::btn(ui, crate::icons::Icon::Restore, "복원").clicked() { acts.push(Act::Restore(self.cur.unwrap())); ui.close(); }
                         } else if crate::icons::btn(ui, crate::icons::Icon::Trash, "휴지통으로").clicked() { acts.push(Act::Trash(self.cur.unwrap())); ui.close(); }
@@ -1700,6 +1799,7 @@ impl App {
             self.goto_text = (md::line_of_char(&self.body, self.cursor_idx) + 1).to_string();
         }
         self.editor_keys(&ctx, id);
+        self.apply_edit_req(&ctx, id);
         self.find_keys(&ctx, id);
         self.find_bar(ui, id);
         self.goto_bar(ui, id);
@@ -1776,6 +1876,7 @@ impl App {
         if let Some(o) = self.page_scroll.take() {
             area = area.scroll_offset(o); // PageUp/PageDown으로 정한 스크롤 위치
         }
+        let pre_sel = Self::sel_range(&ctx, id); // 우클릭이 선택을 풀어 버리므로(egui는 버튼 종류를 가리지 않음) 그리기 전 선택을 기억해 둔다
         let blocks = crate::render::blocks_cached(&ctx, &self.body);
         let find_view: Option<(&[(usize, usize)], usize)> = if self.find.open { Some((&self.find.matches[..], self.find.cur)) } else { None };
         let bg = ui.visuals().extreme_bg_color;
@@ -1814,6 +1915,41 @@ impl App {
             });
         let (scroll_off, view_h) = (sa.state.clamped_offset(), sa.inner_rect.height());
         let out = sa.inner;
+        // 선택 안쪽을 우클릭하면 선택을 그대로 둔다(바깥을 우클릭하면 캐럿만 그 자리로 옮겨지는 기본 동작).
+        if pre_sel.0 != pre_sel.1 && ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Secondary)) {
+            if let Some(p) = ctx.input(|i| i.pointer.interact_pos()) {
+                let at: usize = out.galley.cursor_from_pos(p - out.galley_pos).index.into();
+                if out.response.rect.contains(p) && at >= pre_sel.0 && at <= pre_sel.1 {
+                    let mut st = egui::TextEdit::load_state(&ctx, id).unwrap_or_default();
+                    st.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(pre_sel.0), egui::text::CCursor::new(pre_sel.1))));
+                    st.store(&ctx, id);
+                    ctx.request_repaint();
+                }
+            }
+        }
+        {
+            let ed = !self.cur_trashed;
+            let has_sel = { let (a, b) = Self::sel_range(&ctx, id); a != b };
+            out.response.context_menu(|ui| {
+                use crate::icons::{btn_ex, Icon};
+                if btn_ex(ui, Icon::Export, "잘라내기", ed && has_sel, None).clicked() { acts.push(Act::Edit(EditReq::Cut)); ui.close(); }
+                if btn_ex(ui, Icon::Copy, "복사", has_sel, None).clicked() { acts.push(Act::Edit(EditReq::Copy)); ui.close(); }
+                if btn_ex(ui, Icon::Import, "붙여넣기", ed, None).clicked() { acts.push(Act::Edit(EditReq::Paste)); ui.close(); }
+                if btn_ex(ui, Icon::Check, "전체 선택", true, None).clicked() { acts.push(Act::Edit(EditReq::SelectAll)); ui.close(); }
+                ui.separator();
+                if btn_ex(ui, Icon::Edit, "굵게 (Ctrl+B)", ed, None).clicked() { acts.push(Act::Edit(EditReq::Wrap("**", "**"))); ui.close(); }
+                if btn_ex(ui, Icon::Edit, "기울임 (Ctrl+I)", ed, None).clicked() { acts.push(Act::Edit(EditReq::Wrap("*", "*"))); ui.close(); }
+                if btn_ex(ui, Icon::Edit, "취소선 (Ctrl+Shift+X)", ed, None).clicked() { acts.push(Act::Edit(EditReq::Wrap("~~", "~~"))); ui.close(); }
+                if btn_ex(ui, Icon::Edit, "인라인 코드 (Ctrl+`)", ed, None).clicked() { acts.push(Act::Edit(EditReq::Wrap("`", "`"))); ui.close(); }
+                if btn_ex(ui, Icon::Attach, "링크 (Ctrl+K)", ed, None).clicked() { acts.push(Act::Edit(EditReq::Link)); ui.close(); }
+                ui.separator();
+                if btn_ex(ui, Icon::Edit, "공백을 탭으로", ed, None).on_hover_text("선택한 줄(선택이 없으면 문서 전체)의 글자 사이 공백을 탭 하나로 바꿉니다").clicked() { acts.push(Act::Edit(EditReq::Respace(crate::editkeys::SpaceMode::ToTab))); ui.close(); }
+                if btn_ex(ui, Icon::Edit, "공백 제거", ed, None).on_hover_text("선택한 줄(선택이 없으면 문서 전체)의 글자 사이 공백을 모두 지웁니다").clicked() { acts.push(Act::Edit(EditReq::Respace(crate::editkeys::SpaceMode::Remove))); ui.close(); }
+                if btn_ex(ui, Icon::Edit, "열 자르기…", ed, None).on_hover_text("각 줄에서 A~B번째·처음 N개·끝 N개만 남기거나 지웁니다").clicked() { acts.push(Act::ColDialog); ui.close(); }
+                ui.separator();
+                if btn_ex(ui, Icon::Import, "이미지 삽입…", ed, None).clicked() { acts.push(Act::InsertImage); ui.close(); }
+            });
+        }
         if let Some((down, shift)) = self.page_req.take() {
             self.page_move_caret(&ctx, id, &out, scroll_off, view_h, down, shift);
         }
@@ -2583,6 +2719,9 @@ impl eframe::App for App {
         }
         if self.show_help {
             self.help_window(&ctx);
+        }
+        if self.col.open {
+            self.col_window(&ctx);
         }
         if self.graph_window {
             let mut a2 = Vec::new();
