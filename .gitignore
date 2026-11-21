@@ -6,3 +6,7 @@
 /LICENSE.md
 *.old
 *.new
+
+# 작업용 메모(로컬에만 둔다)
+/docs/superpowers/
+/개선목록.md

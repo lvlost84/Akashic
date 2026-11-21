@@ -4,18 +4,22 @@ KnowVault(WPF)를 Rust + eframe/egui 0.37 + rusqlite로 다시 만드는 프로�
 작업을 끝낼 때마다 아래 "기록" 맨 위에 항목을 추가합니다(날짜 · 무엇을 · 왜/어떻게 · 확인한 것 · 남은 것).
 
 - 빌드: `cargo build --release` → `out\Akashic.exe` (실행 중이라 잠기면 `Akashic-new.exe`)
-- 시험: `cargo test --release` (현재 132건 통과·1건 기존 실패(theme), 성능·실측 4건은 ignored)
+- 시험: `cargo test --release` (현재 298건 통과, 성능·실측 7건은 ignored. 2026-11-20 기준)
 - 격리 실행: `AKASHIC_DATA=<폴더>`, `--seed`. 개발용 환경변수: `AKASHIC_OPEN_HELP/GRAPH/TITLE/OPT`, `AKASHIC_RENDERER`, `AKASHIC_DIAG`
 - 스냅숏(커밋 대신): `snapshots\<날짜>-<번호>-<이름>\` (src, Cargo.toml, build.rs, .cargo, assets)
 - 오픈소스 고지: 빌드할 때 `LICENSE.md`가 자동 생성됨(build.rs)
 - 의존성 규칙: 직접 의존성 10개 이하, `default-features = false` 기본, 작업 후 미사용·중복·개수 점검
 
-## 현재 상태 (2026-11-16)
+## 현재 상태 (2026-11-21, 버전은 v2.12.1)
 - 직접 의존성 9개 + 빌드 의존성 1개(serde_json). Windows 대상 전체 크레이트 197개.
 - 이 PC에서 확인하지 못한 것: 사무실 PC(인텔 내장 그래픽)의 Vulkan 충돌 복구, 밝은 Windows 모드의 시작 시 글자 깨짐.
-- 남은 미개선 항목은 `개선목록.md` "처리 결과" 참고(C5·C11은 2026-11-17에 처리).
+- 남은 미개선 항목은 이 파일의 "미확인"·"남은 것" 표시와 로컬 `개선목록.md`(저장소에서는 제외) 참고(C5·C11은 2026-11-17에 처리).
 
 ## 기록
+
+### 2026-11-21 (문서, 코드 변경 없음)
+- **README 정리**: 최신 커밋 기준으로 다시 쓰고 간추림(저장 위치 `%AppData%\Akashic\vault.db`·`config.json`·`backup\`·`akashic.log`, 동기화 설명). 깨진 링크를 `docs/webdav-서버설정.md`로 고침(b24d3b8, 8751916).
+- **저장소 정리**: `docs/superpowers/*`·`개선목록.md`를 추적에서 뺌(`git rm --cached` + `.gitignore`, 파일은 로컬에 유지). **남은 것**: GitHub Actions의 v2.12.x 릴리스 결과 확인 필요(https://github.com/lvlost84/Akashic/actions).
 
 ### 2026-11-20 (v2.12.1)
 - **우클릭 메뉴 복사·잘라내기 수정**: 메뉴를 누르면 편집창이 포커스를 잃고 egui가 선택을 풀어(TextEdit이 포커스 없을 때 선택을 캐럿으로 줄임) 단추가 비활성이던 문제. 우클릭 순간의 선택(`menu_sel`)과 편집창이 포커스를 가졌던 마지막 선택(`last_sel`)을 저장해 `Act::EditAt`으로 넘기고, 적용 전에 편집창 상태에 되돌림. 복사·잘라내기는 Ctrl+C/X와 같은 `Event::Copy/Cut`로 처리. "…" 메뉴 공백 정리·열 자르기 창도 같은 선택을 써서 선택한 줄에만 적용. 앱에서 직접 확인함(복사·잘라내기 정상). **미확인**: 열 자르기 창·"…" 메뉴의 선택 범위 적용을 화면에서 확인했는지 여부는 사용자 확인 전.
