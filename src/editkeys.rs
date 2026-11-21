@@ -343,14 +343,92 @@ fn respace_line(line: &str, mode: SpaceMode) -> String {
     out // 줄 끝에 남은 공백 덩어리는 버린다(탭을 끝에 남기지 않는다)
 }
 
+/// 코드 울타리(``` 또는 ~~~) 줄인가
+fn is_fence_line(line: &str) -> bool {
+    let t = line.trim_start();
+    t.starts_with("```") || t.starts_with("~~~")
+}
+
+/// 표 줄인가(들여쓰기 뒤가 `|`로 시작)
+fn is_table_line(line: &str) -> bool {
+    line.trim_start().starts_with('|')
+}
+
+/// 줄 앞의 마크다운 기호(들여쓰기·인용 `>`·목록 기호·체크박스·제목 `#`)와 나머지 본문으로 나눈다.
+fn split_md_prefix(line: &str) -> (&str, &str) {
+    let b = line.as_bytes();
+    let mut i = 0;
+    let skip_sp = |i: &mut usize| {
+        while *i < b.len() && (b[*i] == b' ' || b[*i] == b'\t') {
+            *i += 1;
+        }
+    };
+    skip_sp(&mut i);
+    while i < b.len() && b[i] == b'>' {
+        i += 1;
+        skip_sp(&mut i);
+    }
+    let rest = &line[i..];
+    let rb = rest.as_bytes();
+    // 목록 기호: - * + 또는 숫자 + . )
+    let mut m = 0;
+    if !rb.is_empty() && matches!(rb[0], b'-' | b'*' | b'+') {
+        m = 1;
+    } else {
+        let d = rb.iter().take_while(|c| c.is_ascii_digit()).count();
+        if d > 0 && d <= 9 && d < rb.len() && matches!(rb[d], b'.' | b')') {
+            m = d + 1;
+        }
+    }
+    if m == 0 {
+        let h = rb.iter().take_while(|&&c| c == b'#').count();
+        if (1..=6).contains(&h) {
+            m = h;
+        }
+    }
+    if m > 0 && m < rb.len() && rb[m] == b' ' {
+        let mut j = i + m;
+        let mut k = j;
+        while k < b.len() && b[k] == b' ' {
+            k += 1;
+        }
+        j = k;
+        // 체크박스 [ ] [x]
+        let t = &line.as_bytes()[j..];
+        if t.len() >= 3 && t[0] == b'[' && matches!(t[1], b' ' | b'x' | b'X') && t[2] == b']' {
+            j += 3;
+            while j < b.len() && b[j] == b' ' {
+                j += 1;
+            }
+        }
+        return line.split_at(j);
+    }
+    // 기호 없는 인용만 있는 경우
+    line.split_at(i)
+}
+
 /// 선택이 걸친 줄들(선택이 없으면 문서 전체)의 글자 사이 공백을 탭으로 바꾸거나 지운다.
 /// 바뀐 줄 범위를 선택으로 돌려준다. 바뀔 것이 없으면 None.
-pub fn respace(text: &str, lo: usize, hi: usize, mode: SpaceMode) -> Option<Edit> {
+/// `protect`가 켜져 있으면 마크다운 구조(목록·인용·제목 기호, 체크박스, 표 줄, 코드 블록)는 건드리지 않는다.
+pub fn respace(text: &str, lo: usize, hi: usize, mode: SpaceMode, protect: bool) -> Option<Edit> {
     let mut ls = Lines::parse(text);
     let (l0, l1) = if lo == hi { (0, ls.len() - 1) } else { ls.block(lo, hi) };
     let mut changed = false;
-    for k in l0..=l1 {
-        let n = respace_line(&ls.content[k], mode);
+    let mut fenced = false; // 문서 처음부터 세어, 선택 앞의 코드 블록 안인지 안다
+    for k in 0..=l1 {
+        let is_fence = protect && is_fence_line(&ls.content[k]);
+        if is_fence {
+            fenced = !fenced;
+        }
+        if k < l0 || (protect && (fenced || is_fence || is_table_line(&ls.content[k]))) {
+            continue;
+        }
+        let n = if protect {
+            let (head, body) = split_md_prefix(&ls.content[k]);
+            format!("{head}{}", respace_line(body, mode))
+        } else {
+            respace_line(&ls.content[k], mode)
+        };
         if n != ls.content[k] {
             ls.content[k] = n;
             changed = true;
@@ -431,6 +509,110 @@ pub fn cut_columns(text: &str, lo: usize, hi: usize, unit: ColUnit, range: ColRa
     }
     let start = ls.start(l0);
     let end = ls.start(l1) + ls.content[l1].chars().count();
+    Some(Edit { text: ls.join(), lo: start, hi: end })
+}
+
+/// 캐럿 바로 앞의 단어가 스니펫 이름과 같으면 그 내용으로 바꾼다(이름 앞은 문서 처음이나 공백이어야 함).
+/// 이름이 여럿 맞으면 가장 긴 것. 바꾼 뒤 캐럿은 넣은 글 끝이다. 맞는 이름이 없으면 None.
+pub fn expand_abbrev(text: &str, caret: usize, snips: &[(String, String)]) -> Option<Edit> {
+    let ch: Vec<char> = text.chars().collect();
+    let caret = caret.min(ch.len());
+    let mut best: Option<(usize, &str)> = None; // (이름 글자 수, 내용)
+    for (name, body) in snips {
+        let n: Vec<char> = name.chars().collect();
+        if n.is_empty() || n.len() > caret || ch[caret - n.len()..caret] != n[..] {
+            continue;
+        }
+        let before_ok = caret == n.len() || ch[caret - n.len() - 1].is_whitespace();
+        if before_ok && best.map_or(true, |(l, _)| n.len() > l) {
+            best = Some((n.len(), body));
+        }
+    }
+    let (len, body) = best?;
+    let start = caret - len;
+    let mut s: String = ch[..start].iter().collect();
+    s.push_str(body);
+    s.extend(&ch[caret..]);
+    let pos = start + body.chars().count();
+    Some(Edit { text: s, lo: pos, hi: pos })
+}
+
+/// 선택 `lo..hi`를 `ins`로 바꾼다. 캐럿은 넣은 글 끝.
+pub fn replace_range(text: &str, lo: usize, hi: usize, ins: &str) -> Edit {
+    let ch: Vec<char> = text.chars().collect();
+    let (lo, hi) = (lo.min(ch.len()), hi.min(ch.len()));
+    let mut s: String = ch[..lo].iter().collect();
+    s.push_str(ins);
+    s.extend(&ch[hi..]);
+    let pos = lo + ins.chars().count();
+    Edit { text: s, lo: pos, hi: pos }
+}
+
+/// 줄 단위 정리 작업.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineOp {
+    /// 오름차순 정렬(글자 순서)
+    SortAsc,
+    /// 내림차순 정렬
+    SortDesc,
+    /// 같은 줄이 또 나오면 뒤의 것을 지움(처음 것만 남김)
+    Dedup,
+    /// 빈 줄이 아닌 줄 앞에 `1. `, `2. ` … 번호를 붙임
+    Number,
+}
+
+/// 선택이 걸친 줄들(선택이 없으면 문서 전체)에 `op`를 적용한다. 줄 끝 모양은 보존한다.
+/// 바뀔 것이 없으면 None.
+pub fn line_op(text: &str, lo: usize, hi: usize, op: LineOp) -> Option<Edit> {
+    let mut ls = Lines::parse(text);
+    let (l0, l1) = if lo == hi { (0, ls.len() - 1) } else { ls.block(lo, hi) };
+    let old: Vec<String> = ls.content[l0..=l1].to_vec();
+    let new: Vec<String> = match op {
+        LineOp::SortAsc | LineOp::SortDesc => {
+            let mut v = old.clone();
+            v.sort();
+            if op == LineOp::SortDesc {
+                v.reverse();
+            }
+            v
+        }
+        LineOp::Dedup => {
+            let mut seen = std::collections::HashSet::new();
+            old.iter().filter(|l| l.trim().is_empty() || seen.insert((*l).clone())).cloned().collect()
+        }
+        LineOp::Number => {
+            let mut n = 0;
+            old.iter()
+                .map(|l| {
+                    if l.trim().is_empty() {
+                        l.clone()
+                    } else {
+                        n += 1;
+                        format!("{n}. {l}")
+                    }
+                })
+                .collect()
+        }
+    };
+    if new == old {
+        return None;
+    }
+    let removed = old.len() - new.len();
+    let last_removed = removed > 0 && l1 + 1 == ls.len();
+    ls.content.splice(l0..=l1, new.iter().cloned());
+    if removed > 0 {
+        // 지운 줄의 줄 끝도 함께 뺀다(뒤쪽 줄 끝을 지움)
+        let cut = l0 + new.len();
+        ls.eol.drain(cut..cut + removed);
+        if last_removed {
+            if let Some(e) = ls.eol.last_mut() {
+                *e = "";
+            }
+        }
+    }
+    let last = l0 + new.len().max(1) - 1;
+    let start = ls.start(l0);
+    let end = ls.start(last) + ls.content[last].chars().count();
     Some(Edit { text: ls.join(), lo: start, hi: end })
 }
 
@@ -782,30 +964,80 @@ mod tests {
     // ---- 공백 정리 ----
     #[test]
     fn respace_to_tab_collapses_runs_and_keeps_indent() {
-        let e = respace("A   10  20\n  - 가 나\n", 0, 0, SpaceMode::ToTab).unwrap();
+        let e = respace("A   10  20\n  - 가 나\n", 0, 0, SpaceMode::ToTab, false).unwrap();
         assert_eq!(e.text, "A\t10\t20\n  -\t가\t나\n"); // 줄 앞 들여쓰기만 유지, 목록 기호 뒤 공백도 글자 사이로 본다
     }
 
     #[test]
     fn respace_remove_keeps_newlines_and_indent() {
-        let e = respace("A 1 2\r\n  b  c\n", 0, 0, SpaceMode::Remove).unwrap();
+        let e = respace("A 1 2\r\n  b  c\n", 0, 0, SpaceMode::Remove, false).unwrap();
         assert_eq!(e.text, "A12\r\n  bc\n");
     }
 
     #[test]
     fn respace_handles_fullwidth_nbsp_and_trailing() {
-        let e = respace("a\u{3000}b\u{00A0}c   \nx", 0, 0, SpaceMode::ToTab).unwrap();
+        let e = respace("a\u{3000}b\u{00A0}c   \nx", 0, 0, SpaceMode::ToTab, false).unwrap();
         assert_eq!(e.text, "a\tb\tc\nx");
-        let e = respace("a \t b\t", 0, 0, SpaceMode::ToTab).unwrap();
+        let e = respace("a \t b\t", 0, 0, SpaceMode::ToTab, false).unwrap();
         assert_eq!(e.text, "a\tb");
     }
 
     #[test]
+    fn respace_protect_keeps_markdown_structure() {
+        let src = "- 가 나\n  1. a  b\n> c  d\n- [ ] 할 일  하나\n| a | b |\n## 제목  글\n```\nx  y\n```\n본문  끝\n";
+        let e = respace(src, 0, 0, SpaceMode::ToTab, true).unwrap();
+        assert_eq!(e.text, "- 가\t나\n  1. a\tb\n> c\td\n- [ ] 할\t일\t하나\n| a | b |\n## 제목\t글\n```\nx  y\n```\n본문\t끝\n");
+        let e = respace(src, 0, 0, SpaceMode::Remove, true).unwrap();
+        assert!(e.text.starts_with("- 가나\n  1. ab\n> cd\n- [ ] 할일하나\n| a | b |\n"));
+        assert!(e.text.contains("x  y"));
+    }
+
+    #[test]
+    fn respace_protect_counts_fence_before_selection() {
+        let src = "```\na  b\nc  d\n```\ne  f";
+        // 선택이 코드 블록 안(둘째 줄)에서 시작해도 건드리지 않는다
+        assert!(respace(src, 6, 8, SpaceMode::ToTab, true).is_none());
+        let e = respace(src, 0, 0, SpaceMode::ToTab, true).unwrap();
+        assert_eq!(e.text, "```\na  b\nc  d\n```\ne\tf");
+    }
+
+    #[test]
+    fn line_ops_sort_dedup_number() {
+        let e = line_op("c\nb\na\n", 0, 0, LineOp::SortAsc).unwrap();
+        assert_eq!(e.text, "\na\nb\nc");
+        let e = line_op("b\r\na\r\nc", 0, 0, LineOp::SortDesc).unwrap();
+        assert_eq!(e.text, "c\r\nb\r\na");
+        let e = line_op("x\ny\nx\n\n\nz\ny", 0, 0, LineOp::Dedup).unwrap();
+        assert_eq!(e.text, "x\ny\n\n\nz");
+        let e = line_op("가\n\n나", 0, 0, LineOp::Number).unwrap();
+        assert_eq!(e.text, "1. 가\n\n2. 나");
+        // 선택한 줄만
+        let e = line_op("z\nb\na\nq", 2, 5, LineOp::SortAsc).unwrap();
+        assert_eq!(e.text, "z\na\nb\nq");
+        assert!(line_op("a\nb", 0, 0, LineOp::SortAsc).is_none());
+        assert!(line_op("a\nb", 0, 0, LineOp::Dedup).is_none());
+    }
+
+    #[test]
+    fn abbrev_expands_longest_after_space() {
+        let sn = vec![("~a".to_string(), "AA".to_string()), ("x~a".to_string(), "XX".to_string())];
+        let e = expand_abbrev("hi ~a bye", 5, &sn).unwrap();
+        assert_eq!(e.text, "hi AA bye");
+        assert_eq!((e.lo, e.hi), (5, 5));
+        assert!(expand_abbrev("hi~a", 4, &sn).is_none()); // 앞이 공백이 아님
+        assert_eq!(expand_abbrev("x~a", 3, &sn).unwrap().text, "XX"); // 긴 이름 우선
+        assert_eq!(expand_abbrev("~a", 2, &sn).unwrap().text, "AA");
+        assert!(expand_abbrev("zz", 2, &sn).is_none());
+        let e = replace_range("가나다", 1, 2, "XY");
+        assert_eq!((e.text.as_str(), e.lo), ("가XY다", 3));
+    }
+
+    #[test]
     fn respace_selection_limits_to_lines_and_none_when_unchanged() {
-        let e = respace("a b\nc d\ne f", 4, 7, SpaceMode::ToTab).unwrap(); // 둘째 줄만
+        let e = respace("a b\nc d\ne f", 4, 7, SpaceMode::ToTab, false).unwrap(); // 둘째 줄만
         assert_eq!(e.text, "a b\nc\td\ne f");
         assert_eq!((e.lo, e.hi), (4, 7));
-        assert!(respace("ab\ncd", 0, 0, SpaceMode::ToTab).is_none());
-        assert!(respace("a\tb", 0, 0, SpaceMode::Remove).is_none()); // 탭은 공백으로 지우지 않음
+        assert!(respace("ab\ncd", 0, 0, SpaceMode::ToTab, false).is_none());
+        assert!(respace("a\tb", 0, 0, SpaceMode::Remove, false).is_none()); // 탭은 공백으로 지우지 않음
     }
 }

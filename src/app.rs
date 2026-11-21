@@ -1,6 +1,7 @@
 use crate::db::*;
 mod about_ui;
 mod col_ui;
+mod extras_ui;
 mod export_ui;
 mod find_ui;
 mod graph_ui;
@@ -166,6 +167,12 @@ pub struct Config {
     /// 선택한 글꼴의 파일 위치(시작할 때 이 파일만 읽는다; ttc는 face 번호 포함)
     pub font_latin_loc: theme::FontPaths,
     pub font_korean_loc: theme::FontPaths,
+    /// 사용자 템플릿 (이름, 본문)
+    pub templates: Vec<(String, String)>,
+    /// 스니펫 (이름=약어, 내용)
+    pub snippets: Vec<(String, String)>,
+    /// 저장된 검색어
+    pub saved_searches: Vec<String>,
 }
 
 impl Default for Config {
@@ -230,6 +237,9 @@ impl Default for Config {
             font_korean: String::new(),
             font_latin_loc: Default::default(),
             font_korean_loc: Default::default(),
+            templates: vec![],
+            snippets: vec![],
+            saved_searches: vec![],
         }
     }
 }
@@ -328,12 +338,21 @@ enum EditReq {
     Wrap(&'static str, &'static str),
     Link,
     Respace(crate::editkeys::SpaceMode),
+    Lines(crate::editkeys::LineOp),
+    /// cfg.snippets[번호]를 선택 자리에 넣는다
+    Snippet(usize),
+    /// 캐럿 앞의 약어를 스니펫으로 펼친다(Ctrl+J)
+    Abbrev,
     /// 열 자르기(단위, 범위, 남기기 여부)
     Cols(crate::editkeys::ColUnit, crate::editkeys::ColRange, bool),
 }
 
 enum Act {
     NewDoc,
+    Today,
+    FromTemplate(usize),
+    SaveTemplate,
+    ExtrasWindow,
     Open(i64),
     SetView(View),
     ToggleTag(String),
@@ -440,7 +459,11 @@ pub struct App {
     menu_sel: (usize, usize),
     /// 편집창이 포커스를 가졌던 마지막 프레임의 선택(툴바 메뉴·대화상자를 누르면 포커스와 함께 선택이 풀리므로)
     last_sel: (usize, usize),
+    /// 공백 정리가 마크다운 구조(목록 기호·표·코드 블록)를 건드리지 않게 함
+    respace_md: bool,
     col: col_ui::ColCut,
+    extras_open: bool,
+    extras_tab: u8,
     page_scroll: Option<Vec2>,
 
     cursor_line: Option<usize>,
@@ -556,7 +579,10 @@ impl App {
             edit_sel: None,
             menu_sel: (0, 0),
             last_sel: (0, 0),
+            respace_md: true,
             col: Default::default(),
+            extras_open: false,
+            extras_tab: 0,
             page_scroll: None,
             cursor_line: None,
             cursor_idx: 0,
@@ -916,6 +942,10 @@ impl App {
                     self.list_dirty = true;
                 }
                 Act::NewDoc => self.new_doc(),
+                Act::Today => self.today_note(),
+                Act::FromTemplate(i) => self.new_from_template(i),
+                Act::SaveTemplate => self.save_as_template(),
+                Act::ExtrasWindow => self.extras_open = true,
                 Act::Open(id) => {
                     if self.cur != Some(id) {
                         self.open_doc(id, true)
@@ -1270,7 +1300,25 @@ impl App {
                 }
                 None => self.say("바뀌는 내용이 없습니다"),
             },
-            EditReq::Respace(mode) => match crate::editkeys::respace(&self.body, lo, hi, mode) {
+            EditReq::Snippet(i) => {
+                if let Some(t) = self.snippet_text(i) {
+                    let e = crate::editkeys::replace_range(&self.body, lo, hi, &t);
+                    self.apply_body_edit(ctx, id, e.text, (e.lo, e.hi));
+                }
+            }
+            EditReq::Abbrev => match crate::editkeys::expand_abbrev(&self.body, hi, &self.filled_snippets()) {
+                Some(e) => self.apply_body_edit(ctx, id, e.text, (e.lo, e.hi)),
+                None => self.say("펼칠 약어가 없습니다 (이름 바로 뒤에서 Ctrl+J)"),
+            },
+            EditReq::Lines(op) => match crate::editkeys::line_op(&self.body, lo, hi, op) {
+                Some(e) => {
+                    let scope = if lo == hi { "문서 전체" } else { "선택한 줄" };
+                    self.apply_body_edit(ctx, id, e.text, (e.lo, e.hi));
+                    self.say(&format!("{scope}: {}", match op { crate::editkeys::LineOp::SortAsc => "오름차순으로 정렬했습니다", crate::editkeys::LineOp::SortDesc => "내림차순으로 정렬했습니다", crate::editkeys::LineOp::Dedup => "겹치는 줄을 지웠습니다", crate::editkeys::LineOp::Number => "번호를 붙였습니다" }));
+                }
+                None => self.say("바뀌는 내용이 없습니다"),
+            },
+            EditReq::Respace(mode) => match crate::editkeys::respace(&self.body, lo, hi, mode, self.respace_md) {
                 Some(e) => {
                     let scope = if lo == hi { "문서 전체" } else { "선택한 줄" };
                     self.apply_body_edit(ctx, id, e.text, (e.lo, e.hi));
@@ -1329,6 +1377,9 @@ impl App {
                 changed = true;
                 break;
             }
+        }
+        if key_exact(ctx, Modifiers::COMMAND, Key::J) {
+            self.edit_req = Some(EditReq::Abbrev);
         }
         if !changed && key_exact(ctx, Modifiers::COMMAND, Key::K) {
             let (ba, bb) = (byte_of(&self.body, a), byte_of(&self.body, b));
@@ -1527,11 +1578,18 @@ impl App {
         let t = self.theme.clone();
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            if crate::icons::btn_ex(ui, crate::icons::Icon::NewDoc, "새 문서  (Ctrl+N)", true, Some(egui::vec2(ui.available_width(), 28.0))).clicked() {
+            if crate::icons::btn_ex(ui, crate::icons::Icon::NewDoc, "새 문서  (Ctrl+N)", true, Some(egui::vec2((ui.available_width() - 32.0).max(60.0), 28.0))).clicked() {
                 acts.push(Act::NewDoc);
             }
+            ui.menu_button("▾", |ui| self.new_doc_menu(ui, acts)).response.on_hover_text("오늘의 노트 · 템플릿 · 서식·스니펫 관리");
         });
-        let r = ui.add(egui::TextEdit::singleline(&mut self.search).hint_text("검색 (Ctrl+E)").desired_width(f32::INFINITY));
+        let r = ui
+            .horizontal(|ui| {
+                let r = ui.add(egui::TextEdit::singleline(&mut self.search).hint_text("검색 (Ctrl+E)").desired_width((ui.available_width() - 32.0).max(60.0)));
+                ui.menu_button("★", |ui| self.saved_search_menu(ui)).response.on_hover_text("저장된 검색");
+                r
+            })
+            .inner;
         if self.focus_search {
             r.request_focus();
             self.focus_search = false;
@@ -1747,6 +1805,12 @@ impl App {
                         ui.separator();
                         if crate::icons::btn_ex(ui, crate::icons::Icon::Import, "공백을 탭으로", !self.cur_trashed, None).on_hover_text("선택한 줄(선택이 없으면 문서 전체)의 글자 사이 공백을 탭 하나로 바꿉니다. 줄 앞 들여쓰기는 그대로 둡니다").clicked() { acts.push(Act::EditAt(self.last_sel, EditReq::Respace(crate::editkeys::SpaceMode::ToTab))); ui.close(); }
                         if crate::icons::btn_ex(ui, crate::icons::Icon::Import, "공백 제거", !self.cur_trashed, None).on_hover_text("선택한 줄(선택이 없으면 문서 전체)의 글자 사이 공백을 모두 지웁니다. 줄 앞 들여쓰기·줄바꿈은 그대로 둡니다").clicked() { acts.push(Act::EditAt(self.last_sel, EditReq::Respace(crate::editkeys::SpaceMode::Remove))); ui.close(); }
+                        if let Some(i) = self.snippet_menu(ui) { acts.push(Act::EditAt(self.last_sel, EditReq::Snippet(i))); ui.close(); }
+                        ui.checkbox(&mut self.respace_md, "마크다운 구조 보존").on_hover_text("목록 기호·체크박스·제목 #·인용 >, 표 줄, 코드 블록은 바꾸지 않습니다");
+                        if crate::icons::btn_ex(ui, crate::icons::Icon::Edit, "줄 오름차순 정렬", !self.cur_trashed, None).on_hover_text("선택한 줄(선택이 없으면 문서 전체)을 글자 순서로 정렬합니다").clicked() { acts.push(Act::EditAt(self.last_sel, EditReq::Lines(crate::editkeys::LineOp::SortAsc))); ui.close(); }
+                        if crate::icons::btn_ex(ui, crate::icons::Icon::Edit, "줄 내림차순 정렬", !self.cur_trashed, None).on_hover_text("선택한 줄(선택이 없으면 문서 전체)을 거꾸로 정렬합니다").clicked() { acts.push(Act::EditAt(self.last_sel, EditReq::Lines(crate::editkeys::LineOp::SortDesc))); ui.close(); }
+                        if crate::icons::btn_ex(ui, crate::icons::Icon::Edit, "겹치는 줄 지우기", !self.cur_trashed, None).on_hover_text("같은 줄이 또 나오면 뒤의 것을 지웁니다(빈 줄은 그대로)").clicked() { acts.push(Act::EditAt(self.last_sel, EditReq::Lines(crate::editkeys::LineOp::Dedup))); ui.close(); }
+                        if crate::icons::btn_ex(ui, crate::icons::Icon::Edit, "줄 번호 매기기", !self.cur_trashed, None).on_hover_text("빈 줄이 아닌 줄 앞에 1. 2. 3. 번호를 붙입니다").clicked() { acts.push(Act::EditAt(self.last_sel, EditReq::Lines(crate::editkeys::LineOp::Number))); ui.close(); }
                         if crate::icons::btn_ex(ui, crate::icons::Icon::Edit, "열 자르기…", !self.cur_trashed, None).on_hover_text("각 줄에서 A~B번째·처음 N개·끝 N개만 남기거나 지웁니다(글자 위치 또는 탭 열 기준)").clicked() { acts.push(Act::ColDialog); ui.close(); }
                         ui.separator();
                         if self.cur_trashed {
@@ -1977,6 +2041,12 @@ impl App {
                 ui.separator();
                 if btn_ex(ui, Icon::Edit, "공백을 탭으로", ed, None).on_hover_text("선택한 줄(선택이 없으면 문서 전체)의 글자 사이 공백을 탭 하나로 바꿉니다").clicked() { acts.push(Act::EditAt(snap, EditReq::Respace(crate::editkeys::SpaceMode::ToTab))); ui.close(); }
                 if btn_ex(ui, Icon::Edit, "공백 제거", ed, None).on_hover_text("선택한 줄(선택이 없으면 문서 전체)의 글자 사이 공백을 모두 지웁니다").clicked() { acts.push(Act::EditAt(snap, EditReq::Respace(crate::editkeys::SpaceMode::Remove))); ui.close(); }
+                if let Some(i) = self.snippet_menu(ui) { acts.push(Act::EditAt(snap, EditReq::Snippet(i))); ui.close(); }
+                ui.checkbox(&mut self.respace_md, "마크다운 구조 보존").on_hover_text("목록 기호·체크박스·제목 #·인용 >, 표 줄, 코드 블록은 바꾸지 않습니다");
+                if btn_ex(ui, Icon::Edit, "줄 오름차순 정렬", ed, None).on_hover_text("선택한 줄(선택이 없으면 문서 전체)을 글자 순서로 정렬합니다").clicked() { acts.push(Act::EditAt(snap, EditReq::Lines(crate::editkeys::LineOp::SortAsc))); ui.close(); }
+                if btn_ex(ui, Icon::Edit, "줄 내림차순 정렬", ed, None).on_hover_text("선택한 줄(선택이 없으면 문서 전체)을 거꾸로 정렬합니다").clicked() { acts.push(Act::EditAt(snap, EditReq::Lines(crate::editkeys::LineOp::SortDesc))); ui.close(); }
+                if btn_ex(ui, Icon::Edit, "겹치는 줄 지우기", ed, None).on_hover_text("같은 줄이 또 나오면 뒤의 것을 지웁니다(빈 줄은 그대로)").clicked() { acts.push(Act::EditAt(snap, EditReq::Lines(crate::editkeys::LineOp::Dedup))); ui.close(); }
+                if btn_ex(ui, Icon::Edit, "줄 번호 매기기", ed, None).on_hover_text("빈 줄이 아닌 줄 앞에 1. 2. 3. 번호를 붙입니다").clicked() { acts.push(Act::EditAt(snap, EditReq::Lines(crate::editkeys::LineOp::Number))); ui.close(); }
                 if btn_ex(ui, Icon::Edit, "열 자르기…", ed, None).on_hover_text("각 줄에서 A~B번째·처음 N개·끝 N개만 남기거나 지웁니다").clicked() { acts.push(Act::ColDialog); ui.close(); }
                 ui.separator();
                 if btn_ex(ui, Icon::Import, "이미지 삽입…", ed, None).clicked() { acts.push(Act::InsertImage); ui.close(); }
@@ -2634,6 +2704,7 @@ impl eframe::App for App {
             self.show_help = true; // 도움말 새 창
         }
         if new { acts.push(Act::NewDoc); }
+        if ctx.input(|i| i.modifiers.command && i.modifiers.alt && i.key_pressed(Key::T)) { acts.push(Act::Today); }
         if find { self.cfg.sidebar = true; self.focus_search = true; }
         if save && self.flush() { self.say("저장했습니다"); }
         if opts { self.show_options = true; }
@@ -2751,6 +2822,9 @@ impl eframe::App for App {
         }
         if self.show_help {
             self.help_window(&ctx);
+        }
+        if self.extras_open {
+            self.extras_window(&ctx);
         }
         if self.col.open {
             self.col_window(&ctx);
