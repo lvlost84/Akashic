@@ -64,6 +64,31 @@ pub struct Doc {
     pub trashed: bool,
 }
 
+/// 문서의 이전 내용 한 건(변경 이력). 본문은 DB에 저장된 그대로(암호화한 글은 암호문).
+#[derive(Clone, Debug)]
+pub struct Version {
+    pub id: i64,
+    pub title: String,
+    pub body: String,
+    pub saved_at: i64,
+}
+
+/// 문서마다 보관하는 변경 이력 개수.
+pub const HISTORY_KEEP: i64 = 10;
+
+/// 제목·본문이 바뀌려 할 때(저장·동기화·되돌리기 모두) 바뀌기 전 내용을 이력에 넣고 최근 10개만 남기는 트리거.
+/// 이전 본문이 비어 있으면(막 만든 문서) 남기지 않는다.
+const HISTORY_SQL: &str = "
+CREATE TABLE IF NOT EXISTS doc_versions(id INTEGER PRIMARY KEY AUTOINCREMENT, doc_id INTEGER NOT NULL REFERENCES docs(id) ON DELETE CASCADE,
+  title TEXT NOT NULL, body TEXT NOT NULL, saved_at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS doc_versions_doc ON doc_versions(doc_id, id);
+CREATE TRIGGER IF NOT EXISTS doc_history BEFORE UPDATE OF title, body ON docs
+WHEN (OLD.title <> NEW.title OR OLD.body <> NEW.body) AND OLD.body <> ''
+BEGIN
+  INSERT INTO doc_versions(doc_id, title, body, saved_at) VALUES(OLD.id, OLD.title, OLD.body, CAST(strftime('%s','now') AS INTEGER));
+  DELETE FROM doc_versions WHERE doc_id = OLD.id AND id NOT IN (SELECT id FROM doc_versions WHERE doc_id = OLD.id ORDER BY id DESC LIMIT 10);
+END;";
+
 /// 내보내기용 문서 한 건(태그 포함).
 #[derive(Clone, Debug)]
 pub struct ExportDoc {
@@ -296,6 +321,8 @@ COMMIT;",
         self.conn
             .execute_batch("CREATE TABLE IF NOT EXISTS files(hash TEXT PRIMARY KEY, data BLOB NOT NULL, size INTEGER NOT NULL, created INTEGER NOT NULL);")
             .map_err(e)?;
+        // 변경 이력: 이 PC의 DB에만 두는 표(스키마 번호 그대로, 옛 버전은 모른 채 열 수 있다).
+        self.conn.execute_batch(HISTORY_SQL).map_err(e)?;
         self.conn.execute_batch("UPDATE meta SET value='0' WHERE key='applying'").ok();
         self.conn.execute_batch(SYNC_SQL).map_err(e)?;
         self.conn.execute_batch("UPDATE meta SET value='0' WHERE key='applying'").map_err(e)?;
@@ -470,6 +497,40 @@ COMMIT;",
             )
             .map_err(e)?;
         Ok(n > 0)
+    }
+
+    /// 문서의 변경 이력(최근 것부터).
+    pub fn versions(&self, doc: i64) -> Res<Vec<Version>> {
+        let mut st = self.conn.prepare("SELECT id,title,body,saved_at FROM doc_versions WHERE doc_id=? ORDER BY id DESC").map_err(e)?;
+        let rows = st
+            .query_map([doc], |r| Ok(Version { id: r.get(0)?, title: r.get(1)?, body: r.get(2)?, saved_at: r.get(3)? }))
+            .map_err(e)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(e)?;
+        Ok(rows)
+    }
+
+    /// 이력 한 건을 문서에 되돌린다(되돌리기 전 내용은 트리거가 이력에 넣는다).
+    pub fn restore_version(&self, doc: i64, version: i64) -> Res<bool> {
+        let n = self
+            .conn
+            .execute(
+                "UPDATE docs SET title=(SELECT title FROM doc_versions WHERE id=?1 AND doc_id=?2), body=(SELECT body FROM doc_versions WHERE id=?1 AND doc_id=?2), updated=?3
+                 WHERE id=?2 AND EXISTS(SELECT 1 FROM doc_versions WHERE id=?1 AND doc_id=?2)",
+                params![version, doc, now()],
+            )
+            .map_err(e)?;
+        Ok(n > 0)
+    }
+
+    pub fn delete_version(&self, version: i64) -> Res<()> {
+        self.conn.execute("DELETE FROM doc_versions WHERE id=?", [version]).map_err(e)?;
+        Ok(())
+    }
+
+    pub fn clear_versions(&self, doc: i64) -> Res<()> {
+        self.conn.execute("DELETE FROM doc_versions WHERE doc_id=?", [doc]).map_err(e)?;
+        Ok(())
     }
 
     pub fn set_pinned(&self, id: i64, v: bool) -> Res<()> {
@@ -1181,6 +1242,42 @@ mod tests {
         let id = db.new_doc(None).unwrap();
         db.save_doc(id, t, "x").unwrap();
         id
+    }
+
+    #[test]
+    fn history_records_keeps_ten_and_restores() {
+        let path = tmp("hist");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let db = Db::open(&path).unwrap();
+        let id = db.new_doc(None).unwrap();
+        db.save_doc(id, "t", "v0").unwrap(); // 이전 본문이 비어 있으면 남기지 않는다
+        assert!(db.versions(id).unwrap().is_empty());
+        for i in 1..=12 {
+            db.save_doc(id, "t", &format!("v{i}")).unwrap();
+        }
+        db.save_doc(id, "t", "v12").unwrap(); // 같은 내용은 쓰지 않으므로 이력도 그대로
+        let v = db.versions(id).unwrap();
+        assert_eq!(v.len() as i64, HISTORY_KEEP);
+        assert_eq!(v[0].body, "v11");
+        assert_eq!(v[9].body, "v2");
+        // 되돌리면 되돌리기 전 내용이 이력에 남는다
+        assert!(db.restore_version(id, v[3].id).unwrap());
+        assert_eq!(db.get_doc(id).unwrap().unwrap().body, "v8");
+        assert_eq!(db.versions(id).unwrap()[0].body, "v12");
+        // 제목만 바꿔도 남고, 지우기·문서 삭제가 따라간다
+        db.save_doc(id, "새 제목", "v8").unwrap();
+        assert_eq!(db.versions(id).unwrap()[0].title, "t");
+        let first = db.versions(id).unwrap()[0].id;
+        db.delete_version(first).unwrap();
+        assert!(db.versions(id).unwrap().iter().all(|x| x.id != first));
+        db.clear_versions(id).unwrap();
+        assert!(db.versions(id).unwrap().is_empty());
+        db.save_doc(id, "a", "b").unwrap();
+        assert_eq!(db.versions(id).unwrap().len(), 1);
+        db.trash(id).unwrap();
+        db.purge(id).unwrap();
+        let n: i64 = db.conn.query_row("SELECT COUNT(*) FROM doc_versions", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 0);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use crate::db::*;
 mod about_ui;
 mod col_ui;
+mod history_ui;
 mod extras_ui;
 mod transfer_ui;
 mod attach_ui;
@@ -397,6 +398,8 @@ enum Act {
     /// 우클릭 순간의 선택(작은 쪽, 큰 쪽)과 함께
     EditAt((usize, usize), EditReq),
     ColDialog,
+    /// 현재 문서의 변경 이력 창
+    History,
     Back,
     Forward,
     /// 문서를 읽기 전용 참고 창으로 연다
@@ -485,6 +488,7 @@ pub struct App {
     /// 공백 정리가 마크다운 구조(목록 기호·표·코드 블록)를 건드리지 않게 함
     respace_md: bool,
     col: col_ui::ColCut,
+    hist: history_ui::Hist,
     extras_open: bool,
     extras_tab: u8,
     /// 백그라운드로 만드는 PDF의 결과 수신기
@@ -556,6 +560,13 @@ fn byte_of(s: &str, char_idx: usize) -> usize {
     s.char_indices().nth(char_idx).map(|(b, _)| b).unwrap_or(s.len())
 }
 
+/// 머리줄의 아이콘 메뉴 단추: 아이콘만 보이고 누르면 메뉴가 열린다(마우스를 올리면 이름).
+fn icon_menu<R>(ui: &mut egui::Ui, icon: crate::icons::Icon, tip: &str, add: impl FnOnce(&mut egui::Ui) -> R) {
+    let r = ui.menu_button("    ", add);
+    crate::icons::paint_in(ui, &r.response, icon, crate::icons::side(ui));
+    r.response.on_hover_text(tip);
+}
+
 fn fmt_size(b: u64) -> String {
     if b >= 1 << 20 { format!("{:.1} MB", b as f64 / 1048576.0) } else { format!("{:.0} KB", b as f64 / 1024.0) }
 }
@@ -615,6 +626,7 @@ impl App {
             last_sel: (0, 0),
             respace_md: true,
             col: Default::default(),
+            hist: Default::default(),
             extras_open: false,
             extras_tab: 0,
             pdf_rx: None,
@@ -1158,6 +1170,7 @@ impl App {
                 }
                 Act::InsertImage => self.insert_image_dialog(),
                 Act::ColDialog => self.col.open = true,
+                Act::History => self.hist_open(),
                 Act::Edit(r) => {
                     self.edit_sel = None;
                     self.edit_req = Some(r);
@@ -1895,38 +1908,47 @@ impl App {
                     self.graph_cfg_dirty = true; // 설정 저장
                 }
                 if self.cur.is_some() {
-                    ui.menu_button("…", |ui| {
-                        if crate::icons::btn(ui, crate::icons::Icon::Star, if self.cur_pinned { "즐겨찾기 해제" } else { "즐겨찾기 (Ctrl+Shift+D)" }).clicked() { acts.push(Act::Pin(self.cur.unwrap())); ui.close(); }
+                    // 오른쪽 끝에서 왼쪽으로 그리므로, 화면에는 편집도구 · 자물쇠 · … · ★ · 가져오기 · 내보내기 순으로 보인다.
+                    crate::app::icon_menu(ui, crate::icons::Icon::Export, "내보내기 (.md · HTML · PDF)", |ui| {
                         if crate::icons::btn(ui, crate::icons::Icon::Export, ".md로 내보내기").clicked() { acts.push(Act::Export); ui.close(); }
-                        if crate::icons::btn(ui, crate::icons::Icon::Import, ".md/.txt 가져오기").clicked() { acts.push(Act::Import); ui.close(); }
-                        if crate::icons::btn_ex(ui, crate::icons::Icon::Edit, "🔒 선택 암호화/해제 (Ctrl+Shift+L)", !self.cur_trashed, None).on_hover_text("선택한 글을 암호화합니다. 화면에는 그대로 보이고 DB·동기화·내보내기에는 암호문만 남습니다. 암호화한 글을 선택해 다시 누르면 풀립니다").clicked() { acts.push(Act::EditAt(self.last_sel, EditReq::Secret)); ui.close(); }
-                        if ui.button("암호화 키 복사").on_hover_text("다른 PC에서 같은 글을 보려면 이 키를 거기서 \"암호화 키 가져오기\"로 넣으세요. 안전한 곳에 보관하세요").clicked() { if self.cfg.text_key.is_empty() { acts.push(Act::Say("아직 암호화한 글이 없어 키가 없습니다".into())); } else { ui.ctx().copy_text(self.cfg.text_key.clone()); acts.push(Act::Say("암호화 키를 복사했습니다(클립보드). 안전한 곳에 붙여 넣어 보관하세요".into())); } ui.close(); }
-                        if ui.button("암호화 키 가져오기…").clicked() { acts.push(Act::KeyImport); ui.close(); }
-                        if crate::icons::btn_ex(ui, crate::icons::Icon::Attach, "파일 첨부…", self.cur.is_some() && !self.cur_trashed, None).on_hover_text("파일(15MB까지)을 DB에 넣고 본문에 링크를 둡니다. 링크를 Ctrl+클릭하면 엽니다").clicked() { acts.push(Act::Attach(None)); ui.close(); }
-                        if crate::icons::btn(ui, crate::icons::Icon::Import, "폴더 가져오기…").on_hover_text("Obsidian·Notion·일반 마크다운 폴더나 아카식 내보내기 폴더를 읽습니다. 하위 폴더는 분류가 되고, 머리말(YAML)의 제목·태그를 씁니다").clicked() { acts.push(Act::ImportDir); ui.close(); }
                         if crate::icons::btn_ex(ui, crate::icons::Icon::Export, "HTML로 저장…", self.cur.is_some(), None).on_hover_text("지금 문서를 그림이 들어간 HTML 파일 하나로 저장합니다").clicked() { acts.push(Act::ExportHtml); ui.close(); }
                         if crate::icons::btn_ex(ui, crate::icons::Icon::Export, "PDF로 저장…", self.cur.is_some() && self.pdf_rx.is_none(), None).on_hover_text("지금 문서를 PDF로 저장합니다(Microsoft Edge를 화면 없이 사용)").clicked() { acts.push(Act::ExportPdf); ui.close(); }
+                    });
+                    crate::app::icon_menu(ui, crate::icons::Icon::Import, "가져오기 (파일·폴더·이미지·첨부)", |ui| {
+                        if crate::icons::btn(ui, crate::icons::Icon::Import, ".md/.txt 가져오기").clicked() { acts.push(Act::Import); ui.close(); }
+                        if crate::icons::btn(ui, crate::icons::Icon::Import, "폴더 가져오기…").on_hover_text("Obsidian·Notion·일반 마크다운 폴더나 아카식 내보내기 폴더를 읽습니다. 하위 폴더는 분류가 되고, 머리말(YAML)의 제목·태그를 씁니다").clicked() { acts.push(Act::ImportDir); ui.close(); }
                         if crate::icons::btn_ex(ui, crate::icons::Icon::Import, "이미지 삽입…", !self.cur_trashed, None).on_hover_text("그림을 WebP로 줄여 문서에 넣습니다(붙여넣기·끌어놓기도 됩니다)").clicked() { acts.push(Act::InsertImage); ui.close(); }
-                        ui.separator();
-                        if crate::icons::btn_ex(ui, crate::icons::Icon::Import, "공백을 탭으로", !self.cur_trashed, None).on_hover_text("선택한 줄(선택이 없으면 문서 전체)의 글자 사이 공백을 탭 하나로 바꿉니다. 줄 앞 들여쓰기는 그대로 둡니다").clicked() { acts.push(Act::EditAt(self.last_sel, EditReq::Respace(crate::editkeys::SpaceMode::ToTab))); ui.close(); }
-                        if crate::icons::btn_ex(ui, crate::icons::Icon::Import, "공백 제거", !self.cur_trashed, None).on_hover_text("선택한 줄(선택이 없으면 문서 전체)의 글자 사이 공백을 모두 지웁니다. 줄 앞 들여쓰기·줄바꿈은 그대로 둡니다").clicked() { acts.push(Act::EditAt(self.last_sel, EditReq::Respace(crate::editkeys::SpaceMode::Remove))); ui.close(); }
-                        if let Some(i) = self.snippet_menu(ui) { acts.push(Act::EditAt(self.last_sel, EditReq::Snippet(i))); ui.close(); }
-                        ui.checkbox(&mut self.respace_md, "마크다운 구조 보존").on_hover_text("목록 기호·체크박스·제목 #·인용 >, 표 줄, 코드 블록은 바꾸지 않습니다");
-                        if crate::icons::btn_ex(ui, crate::icons::Icon::Edit, "줄 오름차순 정렬", !self.cur_trashed, None).on_hover_text("선택한 줄(선택이 없으면 문서 전체)을 글자 순서로 정렬합니다").clicked() { acts.push(Act::EditAt(self.last_sel, EditReq::Lines(crate::editkeys::LineOp::SortAsc))); ui.close(); }
-                        if crate::icons::btn_ex(ui, crate::icons::Icon::Edit, "줄 내림차순 정렬", !self.cur_trashed, None).on_hover_text("선택한 줄(선택이 없으면 문서 전체)을 거꾸로 정렬합니다").clicked() { acts.push(Act::EditAt(self.last_sel, EditReq::Lines(crate::editkeys::LineOp::SortDesc))); ui.close(); }
-                        if crate::icons::btn_ex(ui, crate::icons::Icon::Edit, "겹치는 줄 지우기", !self.cur_trashed, None).on_hover_text("같은 줄이 또 나오면 뒤의 것을 지웁니다(빈 줄은 그대로)").clicked() { acts.push(Act::EditAt(self.last_sel, EditReq::Lines(crate::editkeys::LineOp::Dedup))); ui.close(); }
-                        if crate::icons::btn_ex(ui, crate::icons::Icon::Edit, "줄 번호 매기기", !self.cur_trashed, None).on_hover_text("빈 줄이 아닌 줄 앞에 1. 2. 3. 번호를 붙입니다").clicked() { acts.push(Act::EditAt(self.last_sel, EditReq::Lines(crate::editkeys::LineOp::Number))); ui.close(); }
-                        if crate::icons::btn_ex(ui, crate::icons::Icon::Edit, "열 자르기…", !self.cur_trashed, None).on_hover_text("각 줄에서 A~B번째·처음 N개·끝 N개만 남기거나 지웁니다(글자 위치 또는 탭 열 기준)").clicked() { acts.push(Act::ColDialog); ui.close(); }
-                        ui.separator();
-                        if self.cur_trashed {
-                            if crate::icons::btn(ui, crate::icons::Icon::Restore, "복원").clicked() { acts.push(Act::Restore(self.cur.unwrap())); ui.close(); }
-                        } else if crate::icons::btn(ui, crate::icons::Icon::Trash, "휴지통으로").clicked() { acts.push(Act::Trash(self.cur.unwrap())); ui.close(); }
+                        if crate::icons::btn_ex(ui, crate::icons::Icon::Attach, "파일 첨부…", self.cur.is_some() && !self.cur_trashed, None).on_hover_text("파일(15MB까지)을 DB에 넣고 본문에 링크를 둡니다. 링크를 Ctrl+클릭하면 엽니다").clicked() { acts.push(Act::Attach(None)); ui.close(); }
                     });
                     let star = ui.selectable_label(self.cur_pinned, "    ").on_hover_text("즐겨찾기 (Ctrl+Shift+D)");
                     crate::icons::paint_in(ui, &star, crate::icons::Icon::Star, crate::icons::side(ui));
                     if star.clicked() {
                         acts.push(Act::Pin(self.cur.unwrap()));
                     }
+                    crate::app::icon_menu(ui, crate::icons::Icon::More, "더 보기 (변경 이력 · 휴지통)", |ui| {
+                        if crate::icons::btn_ex(ui, crate::icons::Icon::Restore, "변경 이력…", self.cur.is_some() && !self.cur_trashed, None).on_hover_text("이 문서의 이전 내용(최근 10개)을 보고 되돌립니다").clicked() { acts.push(Act::History); ui.close(); }
+                        ui.separator();
+                        if self.cur_trashed {
+                            if crate::icons::btn(ui, crate::icons::Icon::Restore, "복원").clicked() { acts.push(Act::Restore(self.cur.unwrap())); ui.close(); }
+                        } else if crate::icons::btn(ui, crate::icons::Icon::Trash, "휴지통으로").clicked() { acts.push(Act::Trash(self.cur.unwrap())); ui.close(); }
+                    });
+                    crate::app::icon_menu(ui, crate::icons::Icon::Lock, "암호화", |ui| {
+                        if crate::icons::btn_ex(ui, crate::icons::Icon::Lock, "선택 암호화/해제 (Ctrl+Shift+L)", !self.cur_trashed, None).on_hover_text("선택한 글을 암호화합니다. 화면에는 그대로 보이고 DB·동기화·내보내기에는 암호문만 남습니다. 암호화한 글을 선택해 다시 누르면 풀립니다").clicked() { acts.push(Act::EditAt(self.last_sel, EditReq::Secret)); ui.close(); }
+                        if ui.button("암호화 키 복사").on_hover_text("다른 PC에서 같은 글을 보려면 이 키를 거기서 \"암호화 키 가져오기\"로 넣으세요. 안전한 곳에 보관하세요").clicked() { if self.cfg.text_key.is_empty() { acts.push(Act::Say("아직 암호화한 글이 없어 키가 없습니다".into())); } else { ui.ctx().copy_text(self.cfg.text_key.clone()); acts.push(Act::Say("암호화 키를 복사했습니다(클립보드). 안전한 곳에 붙여 넣어 보관하세요".into())); } ui.close(); }
+                        if ui.button("암호화 키 가져오기…").clicked() { acts.push(Act::KeyImport); ui.close(); }
+                    });
+                    crate::app::icon_menu(ui, crate::icons::Icon::Edit, "편집 도구 (공백 · 줄 · 스니펫)", |ui| {
+                        if crate::icons::btn_ex(ui, crate::icons::Icon::Import, "공백을 탭으로", !self.cur_trashed, None).on_hover_text("선택한 줄(선택이 없으면 문서 전체)의 글자 사이 공백을 탭 하나로 바꿉니다. 줄 앞 들여쓰기는 그대로 둡니다").clicked() { acts.push(Act::EditAt(self.last_sel, EditReq::Respace(crate::editkeys::SpaceMode::ToTab))); ui.close(); }
+                        if crate::icons::btn_ex(ui, crate::icons::Icon::Import, "공백 제거", !self.cur_trashed, None).on_hover_text("선택한 줄(선택이 없으면 문서 전체)의 글자 사이 공백을 모두 지웁니다. 줄 앞 들여쓰기·줄바꿈은 그대로 둡니다").clicked() { acts.push(Act::EditAt(self.last_sel, EditReq::Respace(crate::editkeys::SpaceMode::Remove))); ui.close(); }
+                        if let Some(i) = self.snippet_menu(ui) { acts.push(Act::EditAt(self.last_sel, EditReq::Snippet(i))); ui.close(); }
+                        ui.checkbox(&mut self.respace_md, "마크다운 구조 보존").on_hover_text("목록 기호·체크박스·제목 #·인용 >, 표 줄, 코드 블록은 바꾸지 않습니다");
+                        ui.separator();
+                        if crate::icons::btn_ex(ui, crate::icons::Icon::Edit, "줄 오름차순 정렬", !self.cur_trashed, None).on_hover_text("선택한 줄(선택이 없으면 문서 전체)을 글자 순서로 정렬합니다").clicked() { acts.push(Act::EditAt(self.last_sel, EditReq::Lines(crate::editkeys::LineOp::SortAsc))); ui.close(); }
+                        if crate::icons::btn_ex(ui, crate::icons::Icon::Edit, "줄 내림차순 정렬", !self.cur_trashed, None).on_hover_text("선택한 줄(선택이 없으면 문서 전체)을 거꾸로 정렬합니다").clicked() { acts.push(Act::EditAt(self.last_sel, EditReq::Lines(crate::editkeys::LineOp::SortDesc))); ui.close(); }
+                        if crate::icons::btn_ex(ui, crate::icons::Icon::Edit, "겹치는 줄 지우기", !self.cur_trashed, None).on_hover_text("같은 줄이 또 나오면 뒤의 것을 지웁니다(빈 줄은 그대로)").clicked() { acts.push(Act::EditAt(self.last_sel, EditReq::Lines(crate::editkeys::LineOp::Dedup))); ui.close(); }
+                        if crate::icons::btn_ex(ui, crate::icons::Icon::Edit, "줄 번호 매기기", !self.cur_trashed, None).on_hover_text("빈 줄이 아닌 줄 앞에 1. 2. 3. 번호를 붙입니다").clicked() { acts.push(Act::EditAt(self.last_sel, EditReq::Lines(crate::editkeys::LineOp::Number))); ui.close(); }
+                        if crate::icons::btn_ex(ui, crate::icons::Icon::Edit, "열 자르기…", !self.cur_trashed, None).on_hover_text("각 줄에서 A~B번째·처음 N개·끝 N개만 남기거나 지웁니다(글자 위치 또는 탭 열 기준)").clicked() { acts.push(Act::ColDialog); ui.close(); }
+                    });
                 }
             });
         });
@@ -2140,27 +2162,34 @@ impl App {
                 if btn_ex(ui, Icon::Export, "잘라내기", ed && has_sel, None).clicked() { acts.push(Act::EditAt(snap, EditReq::Cut)); ui.close(); }
                 if btn_ex(ui, Icon::Copy, "복사", has_sel, None).clicked() { acts.push(Act::EditAt(snap, EditReq::Copy)); ui.close(); }
                 if btn_ex(ui, Icon::Import, "붙여넣기", ed, None).clicked() { acts.push(Act::EditAt(snap, EditReq::Paste)); ui.close(); }
-                if btn_ex(ui, Icon::Check, "전체 선택", true, None).clicked() { acts.push(Act::EditAt(snap, EditReq::SelectAll)); ui.close(); }
-                ui.separator();
-                if btn_ex(ui, Icon::Edit, "굵게 (Ctrl+B)", ed, None).clicked() { acts.push(Act::EditAt(snap, EditReq::Wrap("**", "**"))); ui.close(); }
-                if btn_ex(ui, Icon::Edit, "기울임 (Ctrl+I)", ed, None).clicked() { acts.push(Act::EditAt(snap, EditReq::Wrap("*", "*"))); ui.close(); }
-                if btn_ex(ui, Icon::Edit, "취소선 (Ctrl+Shift+X)", ed, None).clicked() { acts.push(Act::EditAt(snap, EditReq::Wrap("~~", "~~"))); ui.close(); }
-                if btn_ex(ui, Icon::Edit, "인라인 코드 (Ctrl+`)", ed, None).clicked() { acts.push(Act::EditAt(snap, EditReq::Wrap("`", "`"))); ui.close(); }
-                if btn_ex(ui, Icon::Attach, "링크 (Ctrl+K)", ed, None).clicked() { acts.push(Act::EditAt(snap, EditReq::Link)); ui.close(); }
-                if btn_ex(ui, Icon::Edit, "🔒 선택 암호화/해제 (Ctrl+Shift+L)", ed, None).clicked() { acts.push(Act::EditAt(snap, EditReq::Secret)); ui.close(); }
-                if btn_ex(ui, Icon::Attach, "파일 첨부… (15MB까지)", ed, None).clicked() { acts.push(Act::Attach(Some(snap))); ui.close(); }
-                ui.separator();
-                if btn_ex(ui, Icon::Edit, "공백을 탭으로", ed, None).on_hover_text("선택한 줄(선택이 없으면 문서 전체)의 글자 사이 공백을 탭 하나로 바꿉니다").clicked() { acts.push(Act::EditAt(snap, EditReq::Respace(crate::editkeys::SpaceMode::ToTab))); ui.close(); }
-                if btn_ex(ui, Icon::Edit, "공백 제거", ed, None).on_hover_text("선택한 줄(선택이 없으면 문서 전체)의 글자 사이 공백을 모두 지웁니다").clicked() { acts.push(Act::EditAt(snap, EditReq::Respace(crate::editkeys::SpaceMode::Remove))); ui.close(); }
-                if let Some(i) = self.snippet_menu(ui) { acts.push(Act::EditAt(snap, EditReq::Snippet(i))); ui.close(); }
-                ui.checkbox(&mut self.respace_md, "마크다운 구조 보존").on_hover_text("목록 기호·체크박스·제목 #·인용 >, 표 줄, 코드 블록은 바꾸지 않습니다");
-                if btn_ex(ui, Icon::Edit, "줄 오름차순 정렬", ed, None).on_hover_text("선택한 줄(선택이 없으면 문서 전체)을 글자 순서로 정렬합니다").clicked() { acts.push(Act::EditAt(snap, EditReq::Lines(crate::editkeys::LineOp::SortAsc))); ui.close(); }
-                if btn_ex(ui, Icon::Edit, "줄 내림차순 정렬", ed, None).on_hover_text("선택한 줄(선택이 없으면 문서 전체)을 거꾸로 정렬합니다").clicked() { acts.push(Act::EditAt(snap, EditReq::Lines(crate::editkeys::LineOp::SortDesc))); ui.close(); }
-                if btn_ex(ui, Icon::Edit, "겹치는 줄 지우기", ed, None).on_hover_text("같은 줄이 또 나오면 뒤의 것을 지웁니다(빈 줄은 그대로)").clicked() { acts.push(Act::EditAt(snap, EditReq::Lines(crate::editkeys::LineOp::Dedup))); ui.close(); }
-                if btn_ex(ui, Icon::Edit, "줄 번호 매기기", ed, None).on_hover_text("빈 줄이 아닌 줄 앞에 1. 2. 3. 번호를 붙입니다").clicked() { acts.push(Act::EditAt(snap, EditReq::Lines(crate::editkeys::LineOp::Number))); ui.close(); }
                 if btn_ex(ui, Icon::Edit, "열 자르기…", ed, None).on_hover_text("각 줄에서 A~B번째·처음 N개·끝 N개만 남기거나 지웁니다").clicked() { acts.push(Act::ColDialog); ui.close(); }
-                ui.separator();
                 if btn_ex(ui, Icon::Import, "이미지 삽입…", ed, None).clicked() { acts.push(Act::InsertImage); ui.close(); }
+                ui.separator();
+                ui.menu_button("서식 · 선택", |ui| {
+                    if btn_ex(ui, Icon::Check, "전체 선택", true, None).clicked() { acts.push(Act::EditAt(snap, EditReq::SelectAll)); ui.close(); }
+                    if btn_ex(ui, Icon::Edit, "굵게 (Ctrl+B)", ed, None).clicked() { acts.push(Act::EditAt(snap, EditReq::Wrap("**", "**"))); ui.close(); }
+                    if btn_ex(ui, Icon::Edit, "기울임 (Ctrl+I)", ed, None).clicked() { acts.push(Act::EditAt(snap, EditReq::Wrap("*", "*"))); ui.close(); }
+                    if btn_ex(ui, Icon::Edit, "취소선 (Ctrl+Shift+X)", ed, None).clicked() { acts.push(Act::EditAt(snap, EditReq::Wrap("~~", "~~"))); ui.close(); }
+                    if btn_ex(ui, Icon::Edit, "인라인 코드 (Ctrl+`)", ed, None).clicked() { acts.push(Act::EditAt(snap, EditReq::Wrap("`", "`"))); ui.close(); }
+                    if btn_ex(ui, Icon::Attach, "링크 (Ctrl+K)", ed, None).clicked() { acts.push(Act::EditAt(snap, EditReq::Link)); ui.close(); }
+                });
+                ui.menu_button("줄 · 공백 정리", |ui| {
+                    if btn_ex(ui, Icon::Edit, "공백을 탭으로", ed, None).on_hover_text("선택한 줄(선택이 없으면 문서 전체)의 글자 사이 공백을 탭 하나로 바꿉니다").clicked() { acts.push(Act::EditAt(snap, EditReq::Respace(crate::editkeys::SpaceMode::ToTab))); ui.close(); }
+                    if btn_ex(ui, Icon::Edit, "공백 제거", ed, None).on_hover_text("선택한 줄(선택이 없으면 문서 전체)의 글자 사이 공백을 모두 지웁니다").clicked() { acts.push(Act::EditAt(snap, EditReq::Respace(crate::editkeys::SpaceMode::Remove))); ui.close(); }
+                    ui.checkbox(&mut self.respace_md, "마크다운 구조 보존").on_hover_text("목록 기호·체크박스·제목 #·인용 >, 표 줄, 코드 블록은 바꾸지 않습니다");
+                    if btn_ex(ui, Icon::Edit, "줄 오름차순 정렬", ed, None).on_hover_text("선택한 줄(선택이 없으면 문서 전체)을 글자 순서로 정렬합니다").clicked() { acts.push(Act::EditAt(snap, EditReq::Lines(crate::editkeys::LineOp::SortAsc))); ui.close(); }
+                    if btn_ex(ui, Icon::Edit, "줄 내림차순 정렬", ed, None).on_hover_text("선택한 줄(선택이 없으면 문서 전체)을 거꾸로 정렬합니다").clicked() { acts.push(Act::EditAt(snap, EditReq::Lines(crate::editkeys::LineOp::SortDesc))); ui.close(); }
+                    if btn_ex(ui, Icon::Edit, "겹치는 줄 지우기", ed, None).on_hover_text("같은 줄이 또 나오면 뒤의 것을 지웁니다(빈 줄은 그대로)").clicked() { acts.push(Act::EditAt(snap, EditReq::Lines(crate::editkeys::LineOp::Dedup))); ui.close(); }
+                    if btn_ex(ui, Icon::Edit, "줄 번호 매기기", ed, None).on_hover_text("빈 줄이 아닌 줄 앞에 1. 2. 3. 번호를 붙입니다").clicked() { acts.push(Act::EditAt(snap, EditReq::Lines(crate::editkeys::LineOp::Number))); ui.close(); }
+                });
+                ui.menu_button("삽입", |ui| {
+                    if let Some(i) = self.snippet_menu(ui) { acts.push(Act::EditAt(snap, EditReq::Snippet(i))); ui.close(); }
+                    if btn_ex(ui, Icon::Attach, "파일 첨부… (15MB까지)", ed, None).clicked() { acts.push(Act::Attach(Some(snap))); ui.close(); }
+                });
+                ui.menu_button("암호화 · 이력", |ui| {
+                    if btn_ex(ui, Icon::Lock, "선택 암호화/해제 (Ctrl+Shift+L)", ed, None).clicked() { acts.push(Act::EditAt(snap, EditReq::Secret)); ui.close(); }
+                    if btn_ex(ui, Icon::Restore, "변경 이력…", self.cur.is_some() && ed, None).on_hover_text("이 문서의 이전 내용(최근 10개)을 보고 되돌립니다").clicked() { acts.push(Act::History); ui.close(); }
+                });
             });
         }
         if let Some((down, shift)) = self.page_req.take() {
@@ -2952,6 +2981,9 @@ impl eframe::App for App {
         }
         if self.col.open {
             self.col_window(&ctx);
+        }
+        if self.hist.open {
+            self.hist_window(&ctx);
         }
         if self.graph_window {
             let mut a2 = Vec::new();
