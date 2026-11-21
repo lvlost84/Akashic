@@ -257,6 +257,46 @@ pub fn rewrite_images(body: &str, depth: usize) -> (String, Vec<(String, String)
     (out, used)
 }
 
+/// 내보낸 첨부 파일의 이름(`해시-원래이름`).
+pub fn attach_file_name(hash: &str, name: &str) -> String {
+    format!("{hash}-{}", sanitize_name(name))
+}
+
+/// 본문의 첨부 링크 `[[file:해시|📎 이름]]`를 내보낸 파일 기준 상대경로 링크 `[📎 이름](../files/해시-이름)`로 바꾼다.
+/// 쓰인 (해시, 이름) 목록(중복 없음)을 함께 돌려준다. 해시 모양이 아닌 `[[file:…]]`은 그대로 둔다.
+pub fn rewrite_files(body: &str, depth: usize) -> (String, Vec<(String, String)>) {
+    let prefix = "../".repeat(depth);
+    let mut out = String::with_capacity(body.len());
+    let mut used: Vec<(String, String)> = Vec::new();
+    let mut rest = body;
+    while let Some(i) = rest.find("[[file:") {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + 2..];
+        match after.find("]]") {
+            Some(e) => {
+                let inner = &after[..e];
+                match crate::md::file_ref_parts(inner) {
+                    Some((h, name)) => {
+                        let name = if name.is_empty() { h.clone() } else { name };
+                        out.push_str(&format!("[📎 {name}](<{prefix}files/{}>)", attach_file_name(&h, &name)));
+                        if !used.iter().any(|(uh, un)| *uh == h && *un == name) {
+                            used.push((h, name));
+                        }
+                    }
+                    None => out.push_str(&rest[i..i + 2 + e + 2]),
+                }
+                rest = &after[e + 2..];
+            }
+            None => {
+                out.push_str(&rest[i..]);
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    (out, used)
+}
+
 /// 파일 전체 내용: front matter + 본문(원문 그대로).
 pub fn render(d: &ExportDoc, cats: &[Category]) -> String {
     render_body(d, cats, &d.body)
@@ -284,6 +324,18 @@ fn render_body(d: &ExportDoc, cats: &[Category], body: &str) -> String {
 /// `parent` 안에 `아카식-내보내기-<stamp>` 폴더를 만들고 모든 문서를 쓴다.
 /// `load_image(해시)`는 그 그림의 WebP 바이트를 돌려준다(없으면 None). 쓰인 그림은 `images/해시.webp`로 한 번씩 쓴다.
 pub fn run_export(parent: &Path, stamp: &str, docs: &[ExportDoc], cats: &[Category], load_image: &dyn Fn(&str) -> Option<Vec<u8>>) -> ExportResult {
+    run_export_with_files(parent, stamp, docs, cats, load_image, &|_| None)
+}
+
+/// `run_export`에 첨부 파일(`files/해시-이름`)까지 쓴다. `load_file(해시)`는 첨부 바이트를 돌려준다.
+pub fn run_export_with_files(
+    parent: &Path,
+    stamp: &str,
+    docs: &[ExportDoc],
+    cats: &[Category],
+    load_image: &dyn Fn(&str) -> Option<Vec<u8>>,
+    load_file: &dyn Fn(&str) -> Option<Vec<u8>>,
+) -> ExportResult {
     let mut dir = parent.join(format!("아카식-내보내기-{stamp}"));
     let mut n = 2;
     while dir.exists() {
@@ -299,10 +351,17 @@ pub fn run_export(parent: &Path, stamp: &str, docs: &[ExportDoc], cats: &[Catego
     let root_len = dir.to_string_lossy().chars().count();
     let rels = plan_paths(docs, cats, root_len);
     let mut hashes: Vec<String> = Vec::new(); // 쓰인 그림(처음 나온 순서, 중복 없음)
+    let mut attached: Vec<(String, String)> = Vec::new(); // 쓰인 첨부 파일 (해시, 이름)
     for (d, rel) in docs.iter().zip(rels) {
         let full = dir.join(&rel);
         let depth = rel.components().count().saturating_sub(1);
         let (body, used) = rewrite_images(&d.body, depth);
+        let (body, used_files) = rewrite_files(&body, depth);
+        for f in used_files {
+            if !attached.contains(&f) {
+                attached.push(f);
+            }
+        }
         for (h, _) in used {
             if !hashes.contains(&h) {
                 hashes.push(h);
@@ -342,6 +401,28 @@ pub fn run_export(parent: &Path, stamp: &str, docs: &[ExportDoc], cats: &[Catego
             }
         }
     }
+    if !attached.is_empty() {
+        let fdir = dir.join("files");
+        match std::fs::create_dir_all(&fdir) {
+            Err(x) => {
+                res.first_error.get_or_insert(format!("files 폴더를 만들 수 없습니다: {x}"));
+            }
+            Ok(()) => {
+                for (h, name) in &attached {
+                    match load_file(h) {
+                        Some(bytes) => {
+                            if let Err(x) = std::fs::write(fdir.join(attach_file_name(h, name)), bytes) {
+                                res.first_error.get_or_insert(format!("첨부 {name}: {x}"));
+                            }
+                        }
+                        None => {
+                            res.first_error.get_or_insert(format!("첨부 {name}을(를) DB에서 읽지 못했습니다"));
+                        }
+                    }
+                }
+            }
+        }
+    }
     res
 }
 
@@ -354,6 +435,15 @@ mod tests {
     }
     fn doc(id: i64, title: &str, body: &str, category: Option<i64>) -> ExportDoc {
         ExportDoc { id, title: title.into(), body: body.into(), category, tags: vec![], pinned: false, created: 1_700_000_000, updated: 1_700_000_100 }
+    }
+
+    #[test]
+    fn attachments_are_rewritten_for_export() {
+        let h = "0123456789abcdef";
+        let body = format!("본문 [[file:{h}|📎 보고서.pdf]] 와 [[문서]] 와 [[file:bad|x]]");
+        let (out, used) = rewrite_files(&body, 2);
+        assert_eq!(out, format!("본문 [📎 보고서.pdf](<../../files/{h}-보고서.pdf>) 와 [[문서]] 와 [[file:bad|x]]"));
+        assert_eq!(used, vec![(h.to_string(), "보고서.pdf".to_string())]);
     }
 
     #[test]

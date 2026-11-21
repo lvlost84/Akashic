@@ -961,6 +961,63 @@ pub fn wiki_links(text: &str) -> Vec<String> {
     out
 }
 
+/// 첨부 파일 링크 글자 `[[file:해시|📎 이름]]`(이름의 `|`·`[`·`]`·줄바꿈은 `_`로 바꾼다).
+pub fn file_tag(hash: &str, name: &str) -> String {
+    let n: String = name.chars().map(|c| if matches!(c, '|' | '[' | ']' | '\n' | '\r') { '_' } else { c }).collect();
+    format!("[[file:{hash}|📎 {n}]]")
+}
+
+/// `[[file:해시|…]]` 안의 (해시, 표시 이름). 해시 모양이 아니면 None.
+pub fn file_ref_parts(inner: &str) -> Option<(String, String)> {
+    parse_file_inner(inner)
+}
+
+fn parse_file_inner(inner: &str) -> Option<(String, String)> {
+    let rest = inner.strip_prefix("file:")?;
+    let (h, label) = rest.split_once('|').unwrap_or((rest, ""));
+    let h = h.trim();
+    if !is_img_hash(h) {
+        return None;
+    }
+    let name = label.trim().trim_start_matches('📎').trim().to_string();
+    Some((h.to_string(), name))
+}
+
+/// 본문의 첨부 파일 링크가 가리키는 해시들(처음 나온 순서, 중복 없음). 정리(prune)용이라 코드 블록 안도 센다.
+pub fn file_refs(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut rest = text;
+    while let Some(i) = rest.find("[[file:") {
+        rest = &rest[i + 7..];
+        if let Some(h) = rest.get(..IMG_HASH_LEN) {
+            if is_img_hash(h) && !out.iter().any(|x| x == h) {
+                out.push(h.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// 문자 위치가 첨부 파일 링크 `[[file:…]]` 안이면 (해시, 이름).
+pub fn file_at(text: &str, char_idx: usize) -> Option<(String, String)> {
+    let pos = text.char_indices().nth(char_idx).map(|(b, _)| b).unwrap_or(text.len());
+    let ls = text[..pos].rfind('\n').map_or(0, |p| p + 1);
+    let le = text[pos..].find('\n').map_or(text.len(), |p| pos + p);
+    let line = &text[ls..le];
+    let col = pos - ls;
+    let mut from = 0;
+    while let Some(a) = line[from..].find("[[") {
+        let a = from + a;
+        let Some(b) = line[a + 2..].find("]]") else { break };
+        let end = a + 2 + b + 2;
+        if col >= a && col <= end {
+            return parse_file_inner(&line[a + 2..a + 2 + b]);
+        }
+        from = end;
+    }
+    None
+}
+
 /// 문자 위치가 `[[...]]` 안이면 그 제목을 돌려준다.
 pub fn wiki_at(text: &str, char_idx: usize) -> Option<String> {
     let line_start_byte = text.char_indices().nth(char_idx).map(|(b, _)| b).unwrap_or(text.len());
@@ -1419,6 +1476,20 @@ mod tests {
         assert_eq!(kinds(&format!("| a | b |\n|---|---|\n| {img} | b |")), vec![("table".into(), 0, 2)]);
         // 줄 중간에 섞이면 블록이 아니다
         assert!(kinds(&format!("글 {img}")).is_empty());
+    }
+
+    #[test]
+    fn file_links_roundtrip() {
+        let t = file_tag("0123456789abcdef", "보고서 [최종]|v2.pdf");
+        assert_eq!(t, "[[file:0123456789abcdef|📎 보고서 _최종__v2.pdf]]");
+        let body = format!("앞 {t} 뒤\n둘째 줄 [[file:0123456789abcdef|x]] [[file:zzzz|bad]] [[문서]]");
+        assert_eq!(file_refs(&body), vec!["0123456789abcdef"]);
+        let col = body.chars().position(|c| c == '📎').unwrap();
+        assert_eq!(file_at(&body, col), Some(("0123456789abcdef".to_string(), "보고서 _최종__v2.pdf".to_string())));
+        assert_eq!(file_at(&body, 0), None);
+        // 파일 링크는 문서 링크(그래프)로 세지 않는다
+        assert!(wiki_links(&body).iter().all(|t| t == "문서"));
+        assert!(wiki_at(&body, col).is_none());
     }
 
     #[test]

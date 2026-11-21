@@ -39,7 +39,7 @@ impl App {
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let r = crate::db::Db::export_data_from_file(&src)
-                .map(|(docs, cats)| export::run_export(&parent, &stamp, &docs, &cats, &|h| crate::db::Db::image_from_file(&src, h)));
+                .map(|(docs, cats)| export::run_export_with_files(&parent, &stamp, &docs, &cats, &|h| crate::db::Db::image_from_file(&src, h), &|h| crate::db::Db::file_from_file(&src, h)));
             let _ = tx.send(r);
             ctx.request_repaint();
         });

@@ -2,6 +2,8 @@ use crate::db::*;
 mod about_ui;
 mod col_ui;
 mod extras_ui;
+mod transfer_ui;
+mod attach_ui;
 mod export_ui;
 mod find_ui;
 mod graph_ui;
@@ -343,6 +345,8 @@ enum EditReq {
     Snippet(usize),
     /// 캐럿 앞의 약어를 스니펫으로 펼친다(Ctrl+J)
     Abbrev,
+    /// 첨부 링크(`attach_text`)를 선택 자리에 넣는다
+    AttachText,
     /// 열 자르기(단위, 범위, 남기기 여부)
     Cols(crate::editkeys::ColUnit, crate::editkeys::ColRange, bool),
 }
@@ -368,6 +372,13 @@ enum Act {
     MoveCat(i64, Option<i64>),
     ToggleCollapse(i64),
     Import,
+    ImportDir,
+    /// 파일 첨부(선택 범위: 우클릭 때 저장해 둔 것, 없으면 마지막 선택)
+    Attach(Option<(usize, usize)>),
+    /// 첨부 파일 열기(해시, 이름)
+    OpenFile(String, String),
+    ExportHtml,
+    ExportPdf,
     Export,
     InsertImage,
     Edit(EditReq),
@@ -464,6 +475,10 @@ pub struct App {
     col: col_ui::ColCut,
     extras_open: bool,
     extras_tab: u8,
+    /// 백그라운드로 만드는 PDF의 결과 수신기
+    pdf_rx: Option<std::sync::mpsc::Receiver<String>>,
+    /// 파일 첨부 직후 넣을 링크 글자
+    attach_text: Option<String>,
     page_scroll: Option<Vec2>,
 
     cursor_line: Option<usize>,
@@ -583,6 +598,8 @@ impl App {
             col: Default::default(),
             extras_open: false,
             extras_tab: 0,
+            pdf_rx: None,
+            attach_text: None,
             page_scroll: None,
             cursor_line: None,
             cursor_idx: 0,
@@ -943,6 +960,11 @@ impl App {
                 }
                 Act::NewDoc => self.new_doc(),
                 Act::Today => self.today_note(),
+                Act::ImportDir => self.import_dir(),
+                Act::Attach(sel) => self.attach_file(sel),
+                Act::OpenFile(h, n) => self.open_attachment(&h, &n),
+                Act::ExportHtml => self.export_html(),
+                Act::ExportPdf => self.export_pdf(),
                 Act::FromTemplate(i) => self.new_from_template(i),
                 Act::SaveTemplate => self.save_as_template(),
                 Act::ExtrasWindow => self.extras_open = true,
@@ -1302,6 +1324,12 @@ impl App {
             },
             EditReq::Snippet(i) => {
                 if let Some(t) = self.snippet_text(i) {
+                    let e = crate::editkeys::replace_range(&self.body, lo, hi, &t);
+                    self.apply_body_edit(ctx, id, e.text, (e.lo, e.hi));
+                }
+            }
+            EditReq::AttachText => {
+                if let Some(t) = self.attach_text.take() {
                     let e = crate::editkeys::replace_range(&self.body, lo, hi, &t);
                     self.apply_body_edit(ctx, id, e.text, (e.lo, e.hi));
                 }
@@ -1801,6 +1829,10 @@ impl App {
                         if crate::icons::btn(ui, crate::icons::Icon::Star, if self.cur_pinned { "즐겨찾기 해제" } else { "즐겨찾기 (Ctrl+Shift+D)" }).clicked() { acts.push(Act::Pin(self.cur.unwrap())); ui.close(); }
                         if crate::icons::btn(ui, crate::icons::Icon::Export, ".md로 내보내기").clicked() { acts.push(Act::Export); ui.close(); }
                         if crate::icons::btn(ui, crate::icons::Icon::Import, ".md/.txt 가져오기").clicked() { acts.push(Act::Import); ui.close(); }
+                        if crate::icons::btn_ex(ui, crate::icons::Icon::Attach, "파일 첨부…", self.cur.is_some() && !self.cur_trashed, None).on_hover_text("파일(15MB까지)을 DB에 넣고 본문에 링크를 둡니다. 링크를 Ctrl+클릭하면 엽니다").clicked() { acts.push(Act::Attach(None)); ui.close(); }
+                        if crate::icons::btn(ui, crate::icons::Icon::Import, "폴더 가져오기…").on_hover_text("Obsidian·Notion·일반 마크다운 폴더나 아카식 내보내기 폴더를 읽습니다. 하위 폴더는 분류가 되고, 머리말(YAML)의 제목·태그를 씁니다").clicked() { acts.push(Act::ImportDir); ui.close(); }
+                        if crate::icons::btn_ex(ui, crate::icons::Icon::Export, "HTML로 저장…", self.cur.is_some(), None).on_hover_text("지금 문서를 그림이 들어간 HTML 파일 하나로 저장합니다").clicked() { acts.push(Act::ExportHtml); ui.close(); }
+                        if crate::icons::btn_ex(ui, crate::icons::Icon::Export, "PDF로 저장…", self.cur.is_some() && self.pdf_rx.is_none(), None).on_hover_text("지금 문서를 PDF로 저장합니다(Microsoft Edge를 화면 없이 사용)").clicked() { acts.push(Act::ExportPdf); ui.close(); }
                         if crate::icons::btn_ex(ui, crate::icons::Icon::Import, "이미지 삽입…", !self.cur_trashed, None).on_hover_text("그림을 WebP로 줄여 문서에 넣습니다(붙여넣기·끌어놓기도 됩니다)").clicked() { acts.push(Act::InsertImage); ui.close(); }
                         ui.separator();
                         if crate::icons::btn_ex(ui, crate::icons::Icon::Import, "공백을 탭으로", !self.cur_trashed, None).on_hover_text("선택한 줄(선택이 없으면 문서 전체)의 글자 사이 공백을 탭 하나로 바꿉니다. 줄 앞 들여쓰기는 그대로 둡니다").clicked() { acts.push(Act::EditAt(self.last_sel, EditReq::Respace(crate::editkeys::SpaceMode::ToTab))); ui.close(); }
@@ -2038,6 +2070,7 @@ impl App {
                 if btn_ex(ui, Icon::Edit, "취소선 (Ctrl+Shift+X)", ed, None).clicked() { acts.push(Act::EditAt(snap, EditReq::Wrap("~~", "~~"))); ui.close(); }
                 if btn_ex(ui, Icon::Edit, "인라인 코드 (Ctrl+`)", ed, None).clicked() { acts.push(Act::EditAt(snap, EditReq::Wrap("`", "`"))); ui.close(); }
                 if btn_ex(ui, Icon::Attach, "링크 (Ctrl+K)", ed, None).clicked() { acts.push(Act::EditAt(snap, EditReq::Link)); ui.close(); }
+                if btn_ex(ui, Icon::Attach, "파일 첨부… (15MB까지)", ed, None).clicked() { acts.push(Act::Attach(Some(snap))); ui.close(); }
                 ui.separator();
                 if btn_ex(ui, Icon::Edit, "공백을 탭으로", ed, None).on_hover_text("선택한 줄(선택이 없으면 문서 전체)의 글자 사이 공백을 탭 하나로 바꿉니다").clicked() { acts.push(Act::EditAt(snap, EditReq::Respace(crate::editkeys::SpaceMode::ToTab))); ui.close(); }
                 if btn_ex(ui, Icon::Edit, "공백 제거", ed, None).on_hover_text("선택한 줄(선택이 없으면 문서 전체)의 글자 사이 공백을 모두 지웁니다").clicked() { acts.push(Act::EditAt(snap, EditReq::Respace(crate::editkeys::SpaceMode::Remove))); ui.close(); }
@@ -2087,7 +2120,7 @@ impl App {
                 let hidx: usize = out.galley.cursor_from_pos(p - out.galley_pos).index.into();
                 if md::is_checkbox_at(&self.body, hidx) {
                     ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
-                } else if md::wiki_at(&self.body, hidx).is_some() || md::footnote_jump(&self.body, hidx).is_some() {
+                } else if md::wiki_at(&self.body, hidx).is_some() || md::footnote_jump(&self.body, hidx).is_some() || md::file_at(&self.body, hidx).is_some() {
                     if ctx.input(|i| i.modifiers.command) {
                         ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
                     } else {
@@ -2101,6 +2134,8 @@ impl App {
             if ctrl {
                 if let Some(title) = md::wiki_at(&self.body, self.cursor_idx) {
                     acts.push(Act::Follow(title));
+                } else if let Some((h, n)) = md::file_at(&self.body, self.cursor_idx) {
+                    acts.push(Act::OpenFile(h, n));
                 } else if let Some(line) = md::footnote_jump(&self.body, self.cursor_idx) {
                     self.goto_line = Some(line);
                     ctx.request_repaint();
@@ -2715,6 +2750,7 @@ impl eframe::App for App {
 
         // 파일 끌어 놓기 가져오기
         self.poll_image(&ctx);
+        self.poll_pdf(&ctx);
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
         if !dropped.is_empty() {
             // 그림 파일은 이미지로 넣고, 나머지(.md/.txt)는 문서로 가져온다.

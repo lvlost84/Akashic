@@ -273,6 +273,9 @@ fn dev_name(dev: &str) -> String {
 fn img_name(hash: &str) -> String {
     format!("img-{hash}.enc")
 }
+fn file_name(hash: &str) -> String {
+    format!("file-{hash}.enc")
+}
 
 enum FileKind {
     Log(String, u64),
@@ -863,6 +866,57 @@ fn push_images(db: &Db, remote: &dyn Remote, key: &VaultKey, hashes: &BTreeSet<S
     Ok(())
 }
 
+fn file_hashes(recs: &[Rec]) -> BTreeSet<String> {
+    let mut s = BTreeSet::new();
+    for r in recs.iter().filter(|r| r.k == K_DOC) {
+        s.extend(crate::md::file_refs(sv(&r.data, "body")));
+    }
+    s
+}
+
+/// 올리는 문서가 가리키는 첨부 파일을 서버에 올린다(이미 있으면 건너뜀).
+fn push_files(db: &Db, remote: &dyn Remote, key: &VaultKey, hashes: &BTreeSet<String>, have: &HashSet<String>) -> Res<()> {
+    for h in hashes {
+        let name = file_name(h);
+        if have.contains(&name) {
+            continue;
+        }
+        let Some(data) = db.get_file(h)? else { continue };
+        let sealed = seal_named(key, &name, &data).map_err(e)?;
+        match remote.put(&name, &sealed, PutCond::IfNoneMatch) {
+            Ok(_) | Err(RemoteError::Conflict) => {}
+            Err(x) => return Err(rerr(x)),
+        }
+    }
+    Ok(())
+}
+
+/// 본문이 가리키는데 로컬에 없는 첨부 파일을 받는다. 못 받은 것이 있으면 true.
+fn pull_files(db: &Db, remote: &dyn Remote, key: &VaultKey) -> Res<bool> {
+    let mut want: BTreeSet<String> = BTreeSet::new();
+    {
+        let mut st = db.conn.prepare("SELECT body FROM docs WHERE body LIKE '%[[file:%'").map_err(e)?;
+        for b in st.query_map([], |r| r.get::<_, String>(0)).map_err(e)?.flatten() {
+            want.extend(crate::md::file_refs(&b));
+        }
+    }
+    let mut missing = false;
+    for h in want {
+        if db.has_file(&h)? {
+            continue;
+        }
+        let name = file_name(&h);
+        match remote.get(&name).map_err(rerr)? {
+            Some((data, _)) => match open_named(key, &name, &data) {
+                Some(p) if p.len() <= crate::db::ATTACH_MAX => db.put_file(&h, &p)?,
+                _ => missing = true,
+            },
+            None => missing = true,
+        }
+    }
+    Ok(missing)
+}
+
 /// 본문이 가리키는데 로컬에 없는 이미지를 받는다. 못 받은 것이 있으면 다음 동기화 때 다시 시도하도록 표시한다.
 fn pull_images(db: &Db, remote: &dyn Remote, key: &VaultKey, rep: &mut Report) -> Res<()> {
     let mut want: BTreeSet<String> = BTreeSet::new();
@@ -891,7 +945,8 @@ fn pull_images(db: &Db, remote: &dyn Remote, key: &VaultKey, rep: &mut Report) -
             None => missing = true,
         }
     }
-    mset(db, "ds_img_pending", if missing { "1" } else { "0" })
+    let files_missing = pull_files(db, remote, key)?;
+    mset(db, "ds_img_pending", if missing || files_missing { "1" } else { "0" })
 }
 
 // ───────────────────────── 동기화 한 번 ─────────────────────────
@@ -1027,6 +1082,7 @@ pub fn sync(db: &Db, remote: &dyn Remote, key: &VaultKey, o: &Opts) -> Res<Repor
     if !out.is_empty() {
         let have: HashSet<String> = names.iter().cloned().collect();
         push_images(db, remote, key, &image_hashes(&out), &have, &mut rep)?;
+        push_files(db, remote, key, &file_hashes(&out), &have)?;
         let mut tries = 0;
         loop {
             let n = seq + 1;

@@ -11,6 +11,8 @@ fn e<E: std::fmt::Display>(x: E) -> String {
 
 pub const MAX_DEPTH: usize = 6;
 pub const SCHEMA_VERSION: i64 = 4;
+/// 첨부 파일 하나의 크기 상한(15MB)
+pub const ATTACH_MAX: usize = 15 * 1024 * 1024;
 /// 직접 정렬 위치 값 사이의 기본 간격.
 pub const POS_GAP: i64 = 1024;
 
@@ -124,7 +126,9 @@ CREATE TRIGGER IF NOT EXISTS rev_tag_d AFTER DELETE ON tags BEGIN UPDATE meta SE
 CREATE TRIGGER IF NOT EXISTS rev_dt_i AFTER INSERT ON doc_tags BEGIN UPDATE meta SET value=CAST(value AS INTEGER)+1 WHERE key='rev'; END;
 CREATE TRIGGER IF NOT EXISTS rev_dt_d AFTER DELETE ON doc_tags BEGIN UPDATE meta SET value=CAST(value AS INTEGER)+1 WHERE key='rev'; END;
 CREATE TRIGGER IF NOT EXISTS rev_img_i AFTER INSERT ON images BEGIN UPDATE meta SET value=CAST(value AS INTEGER)+1 WHERE key='rev'; END;
-CREATE TRIGGER IF NOT EXISTS rev_img_d AFTER DELETE ON images BEGIN UPDATE meta SET value=CAST(value AS INTEGER)+1 WHERE key='rev'; END;";
+CREATE TRIGGER IF NOT EXISTS rev_img_d AFTER DELETE ON images BEGIN UPDATE meta SET value=CAST(value AS INTEGER)+1 WHERE key='rev'; END;
+CREATE TRIGGER IF NOT EXISTS rev_file_i AFTER INSERT ON files BEGIN UPDATE meta SET value=CAST(value AS INTEGER)+1 WHERE key='rev'; END;
+CREATE TRIGGER IF NOT EXISTS rev_file_d AFTER DELETE ON files BEGIN UPDATE meta SET value=CAST(value AS INTEGER)+1 WHERE key='rev'; END;";
 
 
 /// 문서 단위 동기화용 변경 표시(스키마 v4). 모든 쓰기 경로(앱 코드·FK 연쇄·불러오기)를 트리거로 잡아 `dirty`를 세운다.
@@ -288,6 +292,10 @@ COMMIT;",
             );
             self.conn.execute_batch(&sql).map_err(e)?;
         }
+        // 첨부 파일: 스키마 번호를 올리지 않고 표만 더한다(옛 버전은 이 표를 모른 채 그대로 열 수 있다).
+        self.conn
+            .execute_batch("CREATE TABLE IF NOT EXISTS files(hash TEXT PRIMARY KEY, data BLOB NOT NULL, size INTEGER NOT NULL, created INTEGER NOT NULL);")
+            .map_err(e)?;
         self.conn.execute_batch("UPDATE meta SET value='0' WHERE key='applying'").ok();
         self.conn.execute_batch(SYNC_SQL).map_err(e)?;
         self.conn.execute_batch("UPDATE meta SET value='0' WHERE key='applying'").map_err(e)?;
@@ -848,6 +856,61 @@ COMMIT;",
             .map_err(e)
     }
 
+    // ---------- 첨부 파일 ----------
+    /// 첨부 파일을 저장한다(같은 해시가 있으면 그대로 둔다). 15MB를 넘으면 거절한다.
+    pub fn put_file(&self, hash: &str, data: &[u8]) -> Res<()> {
+        if data.len() > ATTACH_MAX {
+            return Err(format!("첨부 파일은 {}MB까지만 넣을 수 있습니다", ATTACH_MAX / 1024 / 1024));
+        }
+        self.conn
+            .execute("INSERT OR IGNORE INTO files(hash,data,size,created) VALUES(?,?,?,?)", params![hash, data, data.len() as i64, now()])
+            .map_err(e)?;
+        Ok(())
+    }
+
+    pub fn get_file(&self, hash: &str) -> Res<Option<Vec<u8>>> {
+        self.conn.query_row("SELECT data FROM files WHERE hash=?", [hash], |r| r.get(0)).optional().map_err(e)
+    }
+
+    pub fn has_file(&self, hash: &str) -> Res<bool> {
+        Ok(self.conn.query_row("SELECT 1 FROM files WHERE hash=?", [hash], |_| Ok(())).optional().map_err(e)?.is_some())
+    }
+
+    /// (첨부 개수, 총 바이트)
+    pub fn file_stats(&self) -> Res<(usize, u64)> {
+        self.conn
+            .query_row("SELECT COUNT(*), COALESCE(SUM(size),0) FROM files", [], |r| Ok((r.get::<_, i64>(0)? as usize, r.get::<_, i64>(1)? as u64)))
+            .map_err(e)
+    }
+
+    /// 어떤 문서(휴지통 포함)의 본문에서도 가리키지 않는 첨부 파일을 지우고 지운 개수를 돌려준다.
+    pub fn prune_files(&self) -> Res<usize> {
+        let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+        {
+            let mut st = self.conn.prepare("SELECT body FROM docs WHERE body LIKE '%[[file:%'").map_err(e)?;
+            for b in st.query_map([], |r| r.get::<_, String>(0)).map_err(e)?.flatten() {
+                used.extend(crate::md::file_refs(&b));
+            }
+        }
+        let all: Vec<String> = {
+            let mut st = self.conn.prepare("SELECT hash FROM files").map_err(e)?;
+            let v = st.query_map([], |r| r.get::<_, String>(0)).map_err(e)?.flatten().collect();
+            v
+        };
+        let mut n = 0;
+        for h in all.iter().filter(|h| !used.contains(*h)) {
+            n += self.conn.execute("DELETE FROM files WHERE hash=?", [h]).map_err(e)?;
+        }
+        Ok(n)
+    }
+
+    /// 저장된 DB 파일을 읽기 전용으로 열어 첨부 파일 바이트를 읽는다(화면 스레드 밖 내보내기용).
+    pub fn file_from_file(src: &Path, hash: &str) -> Option<Vec<u8>> {
+        let conn = Connection::open_with_flags(src, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+        conn.execute_batch("PRAGMA busy_timeout=3000;").ok()?;
+        conn.query_row("SELECT data FROM files WHERE hash=?", [hash], |r| r.get(0)).optional().ok()?
+    }
+
     /// (이미지 개수, WebP 총 바이트).
     pub fn image_stats(&self) -> Res<(usize, u64)> {
         self.conn
@@ -874,6 +937,7 @@ COMMIT;",
         for h in all.iter().filter(|h| !used.contains(*h)) {
             n += self.conn.execute("DELETE FROM images WHERE hash=?", [h]).map_err(e)?;
         }
+        let _ = self.prune_files(); // 쓰지 않는 첨부 파일도 같은 때에 정리한다
         Ok(n)
     }
 
@@ -1168,6 +1232,26 @@ mod tests {
         assert_eq!(db.image_stats().unwrap(), (1, 3));
         assert_eq!(db.get_image(HA).unwrap(), Some((vec![1, 2, 3], 8, 6)));
         assert_eq!(db.get_image(HB).unwrap(), None);
+    }
+
+    #[test]
+    fn attachments_limit_prune_and_rev() {
+        let db = Db::open(&tmp("file-att")).unwrap();
+        let r0 = db.rev();
+        db.put_file(HA, b"hello").unwrap();
+        assert!(db.rev() > r0);
+        assert_eq!(db.get_file(HA).unwrap().as_deref(), Some(&b"hello"[..]));
+        assert!(db.has_file(HA).unwrap());
+        assert_eq!(db.file_stats().unwrap(), (1, 5));
+        // 15MB 상한: 넘으면 거절하고 저장하지 않는다
+        let big = vec![0u8; ATTACH_MAX + 1];
+        assert!(db.put_file("ffffffffffffffff", &big).is_err());
+        assert!(!db.has_file("ffffffffffffffff").unwrap());
+        db.put_file("eeeeeeeeeeeeeeee", &vec![0u8; ATTACH_MAX]).unwrap(); // 딱 15MB는 허용
+        // 본문이 가리키는 첨부는 남기고 나머지는 지운다
+        doc_with(&db, &format!("글 {}", crate::md::file_tag(HA, "a.txt")));
+        assert_eq!(db.prune_files().unwrap(), 1);
+        assert!(db.has_file(HA).unwrap() && !db.has_file("eeeeeeeeeeeeeeee").unwrap());
     }
 
     #[test]
