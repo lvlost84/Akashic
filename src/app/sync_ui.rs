@@ -70,6 +70,15 @@ const STUCK: Duration = Duration::from_secs(15 * 60);
 /// 자동 동기화 실패 뒤 재시도 간격
 const RETRY: Duration = Duration::from_secs(10 * 60);
 
+/// 상태바 동기화 막대의 상태.
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum SyncBar {
+    Hidden,
+    Busy,
+    Wait(f32),
+    Warn,
+}
+
 thread_local! {
     static ST: RefCell<St> = RefCell::new(St::default());
 }
@@ -855,6 +864,36 @@ impl App {
         }
     }
 
+    /// 진행 중인 동기화가 시작된 뒤 지난 초(진행 중이 아니면 None).
+    pub(super) fn sync_elapsed_secs() -> Option<u64> {
+        let st = ST.with(|s| {
+            let s = s.borrow();
+            if s.rx.is_some() || s.rrx.is_some() { s.started } else { None }
+        });
+        st.or_else(Self::ds_started).map(|t| t.elapsed().as_secs())
+    }
+
+    /// 상태바 동기화 막대: 진행 중=움직임, 대기=다음 자동 동기화까지 차오름, 실패·보류·접속불가=가득(경고), 수동·미설정=없음.
+    pub(super) fn sync_bar(&self) -> SyncBar {
+        if self.sync_busy() {
+            return SyncBar::Busy;
+        }
+        if !self.sync_configured() {
+            return SyncBar::Hidden;
+        }
+        if self.storage.sync_ok == Some(false) || !self.cfg.sync_skip.is_empty() || self.cfg.sync_failed {
+            return SyncBar::Warn;
+        }
+        if !self.cfg.sync_auto {
+            return SyncBar::Hidden;
+        }
+        let period = if self.is_doc() { self.cfg.sync_mins.max(1) as f32 * 60.0 } else { self.cfg.sync_hours.max(1) as f32 * 3600.0 };
+        if self.cfg.last_sync <= 0 {
+            return SyncBar::Wait(1.0);
+        }
+        SyncBar::Wait(((db::now() - self.cfg.last_sync) as f32 / period).clamp(0.0, 1.0))
+    }
+
     /// 상태바용 동기화 요약: (짧은 글, 자세한 설명, 주의 여부).
     pub(super) fn sync_status(&self) -> (String, String, bool) {
         let hhmm = |ts: i64| {
@@ -865,7 +904,8 @@ impl App {
         let wd = self.is_wd();
         if self.sync_busy() {
             let tip = if self.is_doc() { "바뀐 문서를 서버와 주고받는 중입니다" } else if wd { "서버와 주고받는 중입니다" } else { "동기화 폴더에 바뀐 조각을 쓰는 중입니다" };
-            return ("동기화 중…".into(), tip.into(), false);
+            let secs = Self::sync_elapsed_secs().map_or(String::new(), |s| format!(" {s}초"));
+            return (format!("동기화 중{secs}"), tip.into(), false);
         }
         if !self.sync_configured() {
             let tip = if wd {

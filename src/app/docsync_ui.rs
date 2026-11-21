@@ -68,6 +68,13 @@ impl App {
         DS.with(|d| d.borrow().rx.is_some())
     }
 
+    pub(super) fn ds_started() -> Option<Instant> {
+        DS.with(|d| {
+            let d = d.borrow();
+            if d.rx.is_some() { d.started } else { None }
+        })
+    }
+
     pub(super) fn ds_set_ctx(ctx: &egui::Context) {
         DS.with(|d| d.borrow_mut().ctx = Some(ctx.clone()));
     }

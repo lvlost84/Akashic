@@ -52,11 +52,11 @@ pub const STATUS_DEFS: &[(&str, &str, bool, bool)] = &[
     ("num", "NumLock", true, false),
     ("caps", "CapsLock", true, false),
     ("scroll", "ScrollLock", true, false),
-    ("save", "저장 상태 + 저장 막대", true, true),
-    ("merge", "로그 병합 진행 + 막대", true, true),
+    ("save", "저장 상태 (저장까지 남은 시간 · 저장됨 시각)", true, true),
+    ("merge", "쓰기 로그 크기 (1MB 이상일 때만)", true, true),
     ("db", "DB 크기 · 문서 수", true, true),
     ("backup", "백업", true, true),
-    ("sync", "동기화", true, true),
+    ("sync", "동기화 상태 + 진행 막대", true, true),
     ("mem", "메모리 사용량", true, true),
 ];
 

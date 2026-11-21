@@ -1,5 +1,6 @@
 //! 하단 상태바: 저장까지 남은 시간, 데이터·캐시, 백업, 동기화, 문서 통계, 커서 위치.
 use super::*;
+use super::sync_ui::SyncBar;
 use std::time::SystemTime;
 
 /// 본문 통계(길이가 바뀔 때만 다시 센다).
@@ -199,6 +200,21 @@ fn bar(ui: &mut egui::Ui, frac: f32, fill: Color32, line: Color32, tip: String) 
     r.on_hover_text(tip);
 }
 
+/// 끝을 모르는 진행 막대: 조각이 좌우로 오간다(움직이는 동안 화면을 계속 다시 그린다).
+fn sweep(ui: &mut egui::Ui, fill: Color32, line: Color32, tip: String) {
+    let (rect, r) = ui.allocate_exact_size(egui::vec2(70.0, 8.0), Sense::hover());
+    let p = ui.painter();
+    p.rect_stroke(rect, 0.0, egui::Stroke::new(1.0, line), egui::StrokeKind::Inside);
+    let inner = rect.shrink(2.0);
+    let w = inner.width() * 0.3;
+    let t = (ui.input(|i| i.time) / 1.2) % 2.0;
+    let pos = if t < 1.0 { t } else { 2.0 - t } as f32;
+    let x = inner.left() + (inner.width() - w) * pos;
+    p.rect_filled(egui::Rect::from_min_size(egui::pos2(x, inner.top()), egui::vec2(w, inner.height())), 0.0, fill);
+    ui.ctx().request_repaint_after(Duration::from_millis(50));
+    r.on_hover_text(tip);
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Click {
     None,
@@ -210,6 +226,8 @@ enum Click {
 enum Piece {
     Seg { txt: String, tip: String, col: Color32, act: Click },
     Bar { frac: f32, fill: Color32, line: Color32, tip: String },
+    /// 끝을 모르는 진행: 막대 안에서 좌우로 움직이는 조각
+    Sweep { fill: Color32, line: Color32, tip: String },
     Lock { name: &'static str, on: bool, tip: &'static str },
 }
 
@@ -218,7 +236,7 @@ fn piece_width(ui: &egui::Ui, p: &Piece) -> f32 {
     let text_w = |s: &str| ui.ctx().fonts_mut(|f| f.layout_no_wrap(s.to_string(), egui::FontId::proportional(crate::theme::ui(0.0)), Color32::WHITE)).size().x;
     match p {
         Piece::Seg { txt, .. } => text_w(txt),
-        Piece::Bar { .. } => 70.0,
+        Piece::Bar { .. } | Piece::Sweep { .. } => 70.0,
         Piece::Lock { name, .. } => text_w(name),
     }
 }
@@ -230,6 +248,7 @@ fn draw_piece(ui: &mut egui::Ui, p: &Piece, accent: Color32, dim: Color32, click
             }
         }
         Piece::Bar { frac, fill, line, tip } => bar(ui, *frac, *fill, *line, tip.clone()),
+        Piece::Sweep { fill, line, tip } => sweep(ui, *fill, *line, tip.clone()),
         Piece::Lock { name, on, tip } => lock_chip(ui, name, *on, accent, dim, tip),
     }
 }
@@ -392,11 +411,8 @@ impl App {
         // 동기화
         let (sync_txt, sync_tip, sync_warn) = self.sync_status();
 
-        // 막대: 저장까지(채워질수록 저장이 가까움) · 병합까지
-        let save_total = self.cfg.autosave_min.clamp(1, 20) as f32 * 60.0;
-        let save_frac = self.last_edit.map_or(0.0, |t| (t.elapsed().as_secs_f32() / save_total).min(1.0));
+        // 쓰기 로그 안내(로그가 1MB 이상일 때만 표시)
         let merge_total = self.cfg.merge_min.clamp(5, 720) as f32 * 60.0;
-        let merge_frac = (self.last_merge.elapsed().as_secs_f32() / merge_total).min(1.0);
         let merge_left = (merge_total - self.last_merge.elapsed().as_secs_f32()).max(0.0) as u64 / 60;
         let merge_tip = format!(
             "쓰기 로그(WAL) {} — {}분 뒤 본 파일에 병합합니다(병합 간격 {}분).\n{}\n로그가 64MB를 넘거나 프로그램을 시작·종료할 때도 병합합니다.",
@@ -405,7 +421,6 @@ impl App {
             self.cfg.merge_min,
             if self.last_merge_ts > 0 { format!("마지막 병합 {}", clock(self.last_merge_ts)) } else { "이번 실행에서는 아직 병합 전".into() }
         );
-        let save_bar_tip = if self.last_edit.is_some() { "저장 대기 시간 막대".to_string() } else { "저장할 변경 없음".to_string() };
         let mem_txt = format!("메모리 {}", fmt_size(self.storage.mem.1.max(self.storage.mem.0)));
         let mem_tip = format!(
             "이 프로그램이 쓰는 메모리 (5분마다 갱신)\n비공개 사용량 {} · 작업 집합 {}\n그래픽 렌더러: {} — 대부분 이 값이 좌우합니다(옵션에서 OpenGL로 바꾸면 크게 줄어듭니다)\nDB 캐시 상한 {}MB",
@@ -424,7 +439,12 @@ impl App {
 
         // 항목별 조각 만들기(보이는 항목만 그린다)
         let (num, caps, scroll) = lock_keys();
-        let save_bar = Piece::Bar { frac: save_frac, fill: accent, line: dim, tip: save_bar_tip };
+        let sync_bar = match self.sync_bar() {
+            SyncBar::Hidden => None,
+            SyncBar::Busy => Some(Piece::Sweep { fill: accent, line: dim, tip: sync_tip.clone() }),
+            SyncBar::Wait(f) => Some(Piece::Bar { frac: f, fill: dim, line: dim, tip: sync_tip.clone() }),
+            SyncBar::Warn => Some(Piece::Bar { frac: 1.0, fill: warn, line: warn, tip: sync_tip.clone() }),
+        };
         let pieces = |id: &str| -> Vec<Piece> {
             match id {
                 "msg" if status != "준비됨" => vec![Piece::Seg { txt: status.clone(), tip: "알림".into(), col: dim, act: Click::None }],
@@ -434,11 +454,15 @@ impl App {
                 "num" => vec![Piece::Lock { name: "Num", on: num, tip: "NumLock" }],
                 "caps" => vec![Piece::Lock { name: "Caps", on: caps, tip: "CapsLock" }],
                 "scroll" => vec![Piece::Lock { name: "Scroll", on: scroll, tip: "ScrollLock" }],
-                "save" => vec![Piece::Seg { txt: save_txt.clone(), tip: save_tip.clone(), col: save_col, act: Click::None }, save_bar.clone()],
-                "merge" => vec![Piece::Seg { txt: format!("병합 {}%", (merge_frac * 100.0) as u32), tip: merge_tip.clone(), col: dim, act: Click::None }, Piece::Bar { frac: merge_frac, fill: dim, line: dim, tip: merge_tip.clone() }],
+                "save" => vec![Piece::Seg { txt: save_txt.clone(), tip: save_tip.clone(), col: save_col, act: Click::None }],
+                "merge" if self.storage.wal >= 1 << 20 => vec![Piece::Seg { txt: format!("로그 {}", fmt_size(self.storage.wal)), tip: merge_tip.clone(), col: dim, act: Click::None }],
                 "db" => vec![Piece::Seg { txt: data_txt.clone(), tip: data_tip.clone(), col: dim, act: Click::Goto(1) }],
                 "backup" => vec![Piece::Seg { txt: bak_txt.clone(), tip: bak_tip.clone(), col: bak_col, act: Click::Goto(2) }],
-                "sync" => vec![Piece::Seg { txt: sync_txt.clone(), tip: sync_tip.clone(), col: if sync_warn { warn } else { dim }, act: Click::Goto(2) }],
+                "sync" => {
+                    let mut v = vec![Piece::Seg { txt: sync_txt.clone(), tip: sync_tip.clone(), col: if sync_warn { warn } else { dim }, act: Click::Goto(2) }];
+                    v.extend(sync_bar.clone());
+                    v
+                }
                 "mem" => vec![Piece::Seg { txt: mem_txt.clone(), tip: mem_tip.clone(), col: dim, act: Click::None }],
                 _ => vec![],
             }
