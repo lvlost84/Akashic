@@ -4,6 +4,7 @@ mod col_ui;
 mod extras_ui;
 mod transfer_ui;
 mod attach_ui;
+mod secret_ui;
 mod export_ui;
 mod find_ui;
 mod graph_ui;
@@ -175,6 +176,9 @@ pub struct Config {
     pub snippets: Vec<(String, String)>,
     /// 저장된 검색어
     pub saved_searches: Vec<String>,
+    /// 본문 일부 암호화 키(이 PC용, 파일에는 Windows 계정으로 보호되어 저장)와 가져온 키들
+    pub text_key: String,
+    pub text_keys_extra: Vec<String>,
 }
 
 impl Default for Config {
@@ -242,6 +246,8 @@ impl Default for Config {
             templates: vec![],
             snippets: vec![],
             saved_searches: vec![],
+            text_key: String::new(),
+            text_keys_extra: vec![],
         }
     }
 }
@@ -275,7 +281,7 @@ impl Config {
                     c.right_default_v2 = true;
                 }
                 // 비밀값은 파일에서 Windows 계정에 묶여 암호화돼 있다(표식 없는 옛 평문은 그대로 읽고 다음 저장 때 보호된다).
-                for v in [&mut c.wd_pass, &mut c.wd_key] {
+                for v in [&mut c.wd_pass, &mut c.wd_key, &mut c.text_key].into_iter().chain(c.text_keys_extra.iter_mut()) {
                     match crate::secret::unprotect(v) {
                         Some(p) => *v = p,
                         None => {
@@ -299,10 +305,13 @@ impl Config {
         let _ = std::fs::create_dir_all(app_dir());
         // 비밀번호·복구 문자열은 암호화해서 쓴다. 암호화에 실패하면 평문으로 쓰지 않고 이번 저장을 건너뛴다.
         let mut c = self.clone();
-        match (crate::secret::protect(&self.wd_pass), crate::secret::protect(&self.wd_key)) {
-            (Some(p), Some(k)) => {
+        let extras: Option<Vec<String>> = self.text_keys_extra.iter().map(|k| crate::secret::protect(k)).collect();
+        match (crate::secret::protect(&self.wd_pass), crate::secret::protect(&self.wd_key), crate::secret::protect(&self.text_key), extras) {
+            (Some(p), Some(k), Some(t), Some(x)) => {
                 c.wd_pass = p;
                 c.wd_key = k;
+                c.text_key = t;
+                c.text_keys_extra = x;
             }
             _ => {
                 crate::diag::log("설정 저장 건너뜀: 비밀값을 암호화하지 못했습니다");
@@ -347,6 +356,8 @@ enum EditReq {
     Abbrev,
     /// 첨부 링크(`attach_text`)를 선택 자리에 넣는다
     AttachText,
+    /// 선택한 글을 암호화 표식으로 감싸거나(이미 감싸져 있으면) 풀어낸다
+    Secret,
     /// 열 자르기(단위, 범위, 남기기 여부)
     Cols(crate::editkeys::ColUnit, crate::editkeys::ColRange, bool),
 }
@@ -373,6 +384,7 @@ enum Act {
     ToggleCollapse(i64),
     Import,
     ImportDir,
+    KeyImport,
     /// 파일 첨부(선택 범위: 우클릭 때 저장해 둔 것, 없으면 마지막 선택)
     Attach(Option<(usize, usize)>),
     /// 첨부 파일 열기(해시, 이름)
@@ -479,6 +491,11 @@ pub struct App {
     pdf_rx: Option<std::sync::mpsc::Receiver<String>>,
     /// 파일 첨부 직후 넣을 링크 글자
     attach_text: Option<String>,
+    /// 본문 암호화: (글 → 암호문) 기억(저장할 때마다 암호문이 바뀌지 않게)
+    secret_cache: std::collections::HashMap<String, String>,
+    /// 암호화 키 가져오기 창의 입력(열려 있으면 Some)
+    key_import: Option<String>,
+    ctx_for_windows: Option<egui::Context>,
     page_scroll: Option<Vec2>,
 
     cursor_line: Option<usize>,
@@ -600,6 +617,9 @@ impl App {
             extras_tab: 0,
             pdf_rx: None,
             attach_text: None,
+            secret_cache: std::collections::HashMap::new(),
+            key_import: None,
+            ctx_for_windows: None,
             page_scroll: None,
             cursor_line: None,
             cursor_idx: 0,
@@ -730,7 +750,14 @@ impl App {
                 self.last_edit = None;
                 return true;
             }
-            match self.db.save_doc(id, &self.title, &self.body) {
+            let stored = match self.conceal_body() {
+                Ok(s) => s,
+                Err(x) => {
+                    self.say(&format!("저장 실패: {x} (편집 내용은 그대로 두었습니다)"));
+                    return false;
+                }
+            };
+            match self.db.save_doc(id, &self.title, &stored) {
                 Ok(true) => {
                     self.list_dirty = true;
                     self.ref_rev += 1;
@@ -791,7 +818,7 @@ impl App {
                 self.cur = Some(d.id);
                 self.cfg.last_doc = d.id; // 다음에 시작할 때 이 문서를 다시 연다(설정은 닫을 때 저장)
                 self.title = d.title;
-                self.body = d.body;
+                self.body = self.reveal_body(&d.body);
                 self.cur_trashed = d.trashed;
                 self.cur_pinned = d.pinned;
                 self.cur_cat = d.category;
@@ -961,6 +988,7 @@ impl App {
                 Act::NewDoc => self.new_doc(),
                 Act::Today => self.today_note(),
                 Act::ImportDir => self.import_dir(),
+                Act::KeyImport => self.key_import = Some(String::new()),
                 Act::Attach(sel) => self.attach_file(sel),
                 Act::OpenFile(h, n) => self.open_attachment(&h, &n),
                 Act::ExportHtml => self.export_html(),
@@ -1328,6 +1356,21 @@ impl App {
                     self.apply_body_edit(ctx, id, e.text, (e.lo, e.hi));
                 }
             }
+            EditReq::Secret => {
+                let sel: String = self.body.chars().skip(lo).take(hi - lo).collect();
+                let e = crate::editkeys::toggle_wrap(&self.body, lo, hi, crate::textcrypt::OPEN, crate::textcrypt::CLOSE);
+                if lo == hi {
+                    self.say("암호화할 글을 먼저 선택하세요(이미 암호화한 글은 선택한 뒤 다시 누르면 풀립니다)");
+                    return;
+                }
+                if e.text.chars().count() > self.body.chars().count() {
+                    if let Err(m) = crate::textcrypt::can_wrap(&sel) {
+                        self.say(m);
+                        return;
+                    }
+                }
+                self.apply_body_edit(ctx, id, e.text, (e.lo, e.hi));
+            }
             EditReq::AttachText => {
                 if let Some(t) = self.attach_text.take() {
                     let e = crate::editkeys::replace_range(&self.body, lo, hi, &t);
@@ -1405,6 +1448,9 @@ impl App {
                 changed = true;
                 break;
             }
+        }
+        if key_exact(ctx, Modifiers::COMMAND | Modifiers::SHIFT, Key::L) {
+            self.edit_req = Some(EditReq::Secret);
         }
         if key_exact(ctx, Modifiers::COMMAND, Key::J) {
             self.edit_req = Some(EditReq::Abbrev);
@@ -1606,14 +1652,14 @@ impl App {
         let t = self.theme.clone();
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            if crate::icons::btn_ex(ui, crate::icons::Icon::NewDoc, "새 문서  (Ctrl+N)", true, Some(egui::vec2((ui.available_width() - 32.0).max(60.0), 28.0))).clicked() {
+            if crate::icons::btn_ex(ui, crate::icons::Icon::NewDoc, "새 문서  (Ctrl+N)", true, Some(egui::vec2((ui.available_width() - 48.0).max(60.0), 28.0))).clicked() {
                 acts.push(Act::NewDoc);
             }
             ui.menu_button("▾", |ui| self.new_doc_menu(ui, acts)).response.on_hover_text("오늘의 노트 · 템플릿 · 서식·스니펫 관리");
         });
         let r = ui
             .horizontal(|ui| {
-                let r = ui.add(egui::TextEdit::singleline(&mut self.search).hint_text("검색 (Ctrl+E)").desired_width((ui.available_width() - 32.0).max(60.0)));
+                let r = ui.add(egui::TextEdit::singleline(&mut self.search).hint_text("검색 (Ctrl+E)").desired_width((ui.available_width() - 48.0).max(60.0)));
                 ui.menu_button("★", |ui| self.saved_search_menu(ui)).response.on_hover_text("저장된 검색");
                 r
             })
@@ -1829,6 +1875,9 @@ impl App {
                         if crate::icons::btn(ui, crate::icons::Icon::Star, if self.cur_pinned { "즐겨찾기 해제" } else { "즐겨찾기 (Ctrl+Shift+D)" }).clicked() { acts.push(Act::Pin(self.cur.unwrap())); ui.close(); }
                         if crate::icons::btn(ui, crate::icons::Icon::Export, ".md로 내보내기").clicked() { acts.push(Act::Export); ui.close(); }
                         if crate::icons::btn(ui, crate::icons::Icon::Import, ".md/.txt 가져오기").clicked() { acts.push(Act::Import); ui.close(); }
+                        if crate::icons::btn_ex(ui, crate::icons::Icon::Edit, "🔒 선택 암호화/해제 (Ctrl+Shift+L)", !self.cur_trashed, None).on_hover_text("선택한 글을 암호화합니다. 화면에는 그대로 보이고 DB·동기화·내보내기에는 암호문만 남습니다. 암호화한 글을 선택해 다시 누르면 풀립니다").clicked() { acts.push(Act::EditAt(self.last_sel, EditReq::Secret)); ui.close(); }
+                        if ui.button("암호화 키 복사").on_hover_text("다른 PC에서 같은 글을 보려면 이 키를 거기서 \"암호화 키 가져오기\"로 넣으세요. 안전한 곳에 보관하세요").clicked() { if self.cfg.text_key.is_empty() { acts.push(Act::Say("아직 암호화한 글이 없어 키가 없습니다".into())); } else { ui.ctx().copy_text(self.cfg.text_key.clone()); acts.push(Act::Say("암호화 키를 복사했습니다(클립보드). 안전한 곳에 붙여 넣어 보관하세요".into())); } ui.close(); }
+                        if ui.button("암호화 키 가져오기…").clicked() { acts.push(Act::KeyImport); ui.close(); }
                         if crate::icons::btn_ex(ui, crate::icons::Icon::Attach, "파일 첨부…", self.cur.is_some() && !self.cur_trashed, None).on_hover_text("파일(15MB까지)을 DB에 넣고 본문에 링크를 둡니다. 링크를 Ctrl+클릭하면 엽니다").clicked() { acts.push(Act::Attach(None)); ui.close(); }
                         if crate::icons::btn(ui, crate::icons::Icon::Import, "폴더 가져오기…").on_hover_text("Obsidian·Notion·일반 마크다운 폴더나 아카식 내보내기 폴더를 읽습니다. 하위 폴더는 분류가 되고, 머리말(YAML)의 제목·태그를 씁니다").clicked() { acts.push(Act::ImportDir); ui.close(); }
                         if crate::icons::btn_ex(ui, crate::icons::Icon::Export, "HTML로 저장…", self.cur.is_some(), None).on_hover_text("지금 문서를 그림이 들어간 HTML 파일 하나로 저장합니다").clicked() { acts.push(Act::ExportHtml); ui.close(); }
@@ -2070,6 +2119,7 @@ impl App {
                 if btn_ex(ui, Icon::Edit, "취소선 (Ctrl+Shift+X)", ed, None).clicked() { acts.push(Act::EditAt(snap, EditReq::Wrap("~~", "~~"))); ui.close(); }
                 if btn_ex(ui, Icon::Edit, "인라인 코드 (Ctrl+`)", ed, None).clicked() { acts.push(Act::EditAt(snap, EditReq::Wrap("`", "`"))); ui.close(); }
                 if btn_ex(ui, Icon::Attach, "링크 (Ctrl+K)", ed, None).clicked() { acts.push(Act::EditAt(snap, EditReq::Link)); ui.close(); }
+                if btn_ex(ui, Icon::Edit, "🔒 선택 암호화/해제 (Ctrl+Shift+L)", ed, None).clicked() { acts.push(Act::EditAt(snap, EditReq::Secret)); ui.close(); }
                 if btn_ex(ui, Icon::Attach, "파일 첨부… (15MB까지)", ed, None).clicked() { acts.push(Act::Attach(Some(snap))); ui.close(); }
                 ui.separator();
                 if btn_ex(ui, Icon::Edit, "공백을 탭으로", ed, None).on_hover_text("선택한 줄(선택이 없으면 문서 전체)의 글자 사이 공백을 탭 하나로 바꿉니다").clicked() { acts.push(Act::EditAt(snap, EditReq::Respace(crate::editkeys::SpaceMode::ToTab))); ui.close(); }
@@ -2858,6 +2908,10 @@ impl eframe::App for App {
         }
         if self.show_help {
             self.help_window(&ctx);
+        }
+        self.ctx_for_windows = Some(ctx.clone());
+        if self.key_import.is_some() {
+            self.key_import_window();
         }
         if self.extras_open {
             self.extras_window(&ctx);

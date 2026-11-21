@@ -103,7 +103,7 @@ impl App {
         let stale = view.loaded.as_ref().is_none_or(|l| l.0 != self.ref_rev || l.1 != doc);
         if stale {
             view.loaded = Some(match self.db.get_doc(doc) {
-                Ok(Some(d)) => (self.ref_rev, doc, d.title, d.body, d.trashed, true),
+                Ok(Some(d)) => (self.ref_rev, doc, d.title, crate::textcrypt::reveal(&d.body, &self.text_ring(), &mut std::collections::HashMap::new()), d.trashed, true),
                 _ => (self.ref_rev, doc, String::new(), String::new(), false, false),
             });
         }

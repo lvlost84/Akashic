@@ -20,6 +20,7 @@ mod secret;
 mod docsync;
 mod sync;
 mod webdav;
+mod textcrypt;
 mod theme;
 mod update;
 mod vault;

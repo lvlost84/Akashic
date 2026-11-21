@@ -1086,8 +1086,144 @@ pub fn height_em(n: &Node) -> f32 {
     l.asc + l.desc
 }
 
+/// 화면과 같은 배치(`layout`)를 SVG로 옮긴다. `size`는 본문 글자 크기(px), `measure`는 `layout`에 주는 것과 같은 글자 폭 측정.
+/// 글자·선의 위치가 화면에서 그리는 것과 같고, 색은 `currentColor`·글꼴은 문서 글꼴을 따른다.
+pub fn to_svg(n: &Node, size: f32, measure: &mut dyn FnMut(&str, f32) -> f32) -> String {
+    let lay = layout(n, measure);
+    let pad = 3.0;
+    let (w, h) = (lay.w * size + 2.0 * pad, (lay.asc + lay.desc) * size + 2.0 * pad);
+    let base = pad + lay.asc * size;
+    let mut o = format!("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w:.1}\" height=\"{h:.1}\" viewBox=\"0 0 {w:.1} {h:.1}\" role=\"img\">");
+    for it in &lay.items {
+        match it {
+            Item::Glyph { x, y, text, scale } => {
+                o.push_str(&format!(
+                    "<text x=\"{:.2}\" y=\"{:.2}\" font-size=\"{:.2}\" fill=\"currentColor\" style=\"white-space:pre\">{}</text>",
+                    pad + x * size,
+                    base + y * size,
+                    size * scale,
+                    ml_esc(text)
+                ));
+            }
+            Item::Line { a, b } => {
+                o.push_str(&format!(
+                    "<line x1=\"{:.2}\" y1=\"{:.2}\" x2=\"{:.2}\" y2=\"{:.2}\" stroke=\"currentColor\" stroke-width=\"{:.2}\"/>",
+                    pad + a.0 * size,
+                    base + a.1 * size,
+                    pad + b.0 * size,
+                    base + b.1 * size,
+                    (RULE * size).max(1.0)
+                ));
+            }
+        }
+    }
+    o.push_str("</svg>");
+    o
+}
+
+// ───────────────────────── MathML (HTML·PDF 내보내기용) ─────────────────────────
+
+fn ml_esc(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+fn ml_sym(s: &str) -> String {
+    let e = ml_esc(s);
+    if !s.is_empty() && s.chars().all(|c| c.is_ascii_digit() || c == '.' || c == ',') {
+        format!("<mn>{e}</mn>")
+    } else if !s.is_empty() && s.chars().all(|c| c.is_alphabetic()) {
+        format!("<mi>{e}</mi>")
+    } else {
+        format!("<mo>{e}</mo>")
+    }
+}
+
+fn ml_delim(s: &str) -> String {
+    if s.is_empty() || s == "." { String::new() } else { format!("<mo stretchy=\"true\">{}</mo>", ml_esc(s)) }
+}
+
+/// 파싱한 수식을 MathML 조각(`<mrow>…`)으로 바꾼다. Edge·Chrome·Firefox·Safari가 그대로 그린다.
+pub fn to_mathml(n: &Node) -> String {
+    match n {
+        Node::Sym(s) => ml_sym(s),
+        Node::Text(s) => format!("<mtext>{}</mtext>", ml_esc(s).replace(' ', "&#160;")),
+        Node::Row(v) => format!("<mrow>{}</mrow>", v.iter().map(to_mathml).collect::<String>()),
+        Node::Frac(a, b) => format!("<mfrac>{}{}</mfrac>", to_mathml(a), to_mathml(b)),
+        Node::Sqrt(a) => format!("<msqrt>{}</msqrt>", to_mathml(a)),
+        Node::Root(k, a) => format!("<mroot>{}{}</mroot>", to_mathml(a), to_mathml(k)),
+        Node::Script { base, sub, sup } => match (sub, sup) {
+            (Some(s), Some(p)) => format!("<msubsup>{}{}{}</msubsup>", to_mathml(base), to_mathml(s), to_mathml(p)),
+            (Some(s), None) => format!("<msub>{}{}</msub>", to_mathml(base), to_mathml(s)),
+            (None, Some(p)) => format!("<msup>{}{}</msup>", to_mathml(base), to_mathml(p)),
+            (None, None) => to_mathml(base),
+        },
+        Node::Stack(rows) => {
+            let r: String = rows.iter().map(|x| format!("<mtr><mtd>{}</mtd></mtr>", to_mathml(x))).collect();
+            format!("<mtable>{r}</mtable>")
+        }
+        Node::Style(s, a) => format!("<mstyle displaystyle=\"{}\">{}</mstyle>", *s == Sty::Display, to_mathml(a)),
+        Node::Binom(a, b) => format!("<mrow><mo>(</mo><mfrac linethickness=\"0\">{}{}</mfrac><mo>)</mo></mrow>", to_mathml(a), to_mathml(b)),
+        Node::Over { base, over, under } => match (under, over) {
+            (Some(u), Some(o)) => format!("<munderover>{}{}{}</munderover>", to_mathml(base), to_mathml(u), to_mathml(o)),
+            (Some(u), None) => format!("<munder>{}{}</munder>", to_mathml(base), to_mathml(u)),
+            (None, Some(o)) => format!("<mover>{}{}</mover>", to_mathml(base), to_mathml(o)),
+            (None, None) => to_mathml(base),
+        },
+        Node::Deco(d, a) => {
+            let inner = to_mathml(a);
+            let over = |c: &str| format!("<mover accent=\"true\">{inner}<mo>{c}</mo></mover>");
+            match d {
+                Deco::Hat | Deco::WideHat => over("^"),
+                Deco::Bar | Deco::Overline => over("\u{203E}"),
+                Deco::Vec => over("\u{2192}"),
+                Deco::Dot => over("\u{02D9}"),
+                Deco::DDot => over("\u{00A8}"),
+                Deco::Tilde | Deco::WideTilde => over("~"),
+                Deco::Underline => format!("<munder>{inner}<mo>_</mo></munder>"),
+                Deco::Boxed => format!("<mrow style=\"border:1px solid currentColor;padding:2px 4px\">{inner}</mrow>"),
+                Deco::Cancel | Deco::BCancel | Deco::XCancel => format!("<mrow style=\"text-decoration:line-through\">{inner}</mrow>"),
+            }
+        }
+        Node::Delim { open, close, body } => format!("<mrow>{}{}{}</mrow>", ml_delim(open), to_mathml(body), ml_delim(close)),
+        Node::Align(rows) => {
+            let r: String = rows
+                .iter()
+                .map(|(l, r)| {
+                    let right = r.as_ref().map(to_mathml).unwrap_or_default();
+                    format!("<mtr><mtd style=\"text-align:right\">{}</mtd><mtd style=\"text-align:left\">{right}</mtd></mtr>", to_mathml(l))
+                })
+                .collect();
+            format!("<mtable>{r}</mtable>")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn svg_places_items_like_the_screen_layout() {
+        let n = parse_block("$$x=\\frac{a}{b}$$").unwrap();
+        let mut m = |s: &str, sc: f32| s.chars().count() as f32 * 0.5 * sc;
+        let lay = layout(&n, &mut m);
+        let mut m2 = |s: &str, sc: f32| s.chars().count() as f32 * 0.5 * sc;
+        let svg = to_svg(&n, 20.0, &mut m2);
+        let glyphs = lay.items.iter().filter(|i| matches!(i, Item::Glyph { .. })).count();
+        let lines = lay.items.len() - glyphs;
+        assert_eq!(svg.matches("<text ").count(), glyphs);
+        assert_eq!(svg.matches("<line ").count(), lines);
+        assert!(lines >= 1 && svg.starts_with("<svg") && svg.ends_with("</svg>"));
+        assert!(!svg.contains("\\frac"));
+    }
+
+    #[test]
+    fn mathml_basic_shapes() {
+        let n = parse_block("$$x=\\frac{a}{b}+\\sqrt{y^2}$$").unwrap();
+        let m = to_mathml(&n);
+        assert!(m.contains("<mfrac><mrow><mi>a</mi></mrow><mrow><mi>b</mi></mrow></mfrac>") || m.contains("<mfrac>"), "{m}");
+        assert!(m.contains("<msqrt>") && m.contains("<msup>") && m.contains("<mo>=</mo>") && m.contains("<mn>2</mn>"), "{m}");
+        assert!(!m.contains("\\frac"));
+    }
+
     use super::*;
 
     fn meas() -> impl FnMut(&str, f32) -> f32 {

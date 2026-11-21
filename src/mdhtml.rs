@@ -184,12 +184,12 @@ fn is_table_sep(l: &str) -> bool {
 }
 
 /// 본문 전체를 HTML 조각으로. `img(해시)`는 그 그림의 src(보통 data URI)를 돌려준다.
-pub fn to_html(body: &str, img: &dyn Fn(&str) -> Option<String>) -> String {
+pub fn to_html(body: &str, img: &dyn Fn(&str) -> Option<String>, math: &dyn Fn(&crate::math::Node) -> Option<String>) -> String {
     let lines: Vec<&str> = body.lines().collect();
-    block(&lines, img)
+    block(&lines, img, math)
 }
 
-fn block(lines: &[&str], img: &dyn Fn(&str) -> Option<String>) -> String {
+fn block(lines: &[&str], img: &dyn Fn(&str) -> Option<String>, math: &dyn Fn(&crate::math::Node) -> Option<String>) -> String {
     let mut o = String::new();
     let mut i = 0;
     while i < lines.len() {
@@ -214,29 +214,26 @@ fn block(lines: &[&str], img: &dyn Fn(&str) -> Option<String>) -> String {
             o.push_str(&format!("<pre><code{cls}>{}</code></pre>\n", esc(&code.join("\n"))));
             continue;
         }
-        // 수식 블록 $$ … $$
-        if t.starts_with("$$") {
-            let mut m = Vec::new();
-            let first = t.trim_start_matches('$');
-            if first.ends_with("$$") && !first.is_empty() {
-                m.push(first.trim_end_matches('$'));
-                i += 1;
-            } else {
-                if !first.is_empty() {
-                    m.push(first);
-                }
-                i += 1;
-                while i < lines.len() && !lines[i].trim_end().ends_with("$$") {
-                    m.push(lines[i]);
-                    i += 1;
-                }
-                if i < lines.len() {
-                    m.push(lines[i].trim_end().trim_end_matches('$'));
-                    i += 1;
-                }
-            }
-            o.push_str(&format!("<pre class=\"math\">{}</pre>\n", esc(&m.join("\n"))));
+        // 수식: 한 줄 `$$수식$$` 또는 `$$` 줄로 감싼 여러 줄(앱이 그리는 것과 같은 규칙). 파싱한 수식은 MathML로 내보낸다.
+        if let Some(node) = crate::math::parse_block(t) {
+            o.push_str(&math_div(&node, math));
+            i += 1;
             continue;
+        }
+        if t == "$$" {
+            let mut j = i + 1;
+            while j < lines.len() && lines[j].trim() != "$$" && !lines[j].trim().is_empty() && !is_fence(lines[j]) {
+                j += 1;
+            }
+            if j < lines.len() && lines[j].trim() == "$$" {
+                let src = lines[i + 1..j].join(" ");
+                match crate::math::parse_multi(&src) {
+                    Some(node) => o.push_str(&math_div(&node, math)),
+                    None => o.push_str(&format!("<pre class=\"math\">{}</pre>\n", esc(&lines[i + 1..j].join("\n")))), // 문법이 틀린 수식은 원문
+                }
+                i = j + 1;
+                continue;
+            }
         }
         if let Some((n, text)) = heading(t) {
             o.push_str(&format!("<h{n}>{}</h{n}>\n", inline(text)));
@@ -304,7 +301,7 @@ fn block(lines: &[&str], img: &dyn Fn(&str) -> Option<String>) -> String {
                 i += 1;
             }
             let refs: Vec<&str> = inner.iter().map(|s| s.as_str()).collect();
-            o.push_str(&format!("<blockquote>\n{}</blockquote>\n", block(&refs, img)));
+            o.push_str(&format!("<blockquote>\n{}</blockquote>\n", block(&refs, img, math)));
             continue;
         }
         // 목록
@@ -335,6 +332,14 @@ fn block(lines: &[&str], img: &dyn Fn(&str) -> Option<String>) -> String {
         o.push_str(&format!("<p>{}</p>\n", p.join("<br>\n")));
     }
     o
+}
+
+/// 수식 한 블록. `math`가 SVG(화면과 같은 배치)를 주면 그것을, 아니면 MathML을 쓴다.
+fn math_div(n: &crate::math::Node, math: &dyn Fn(&crate::math::Node) -> Option<String>) -> String {
+    match math(n) {
+        Some(svg) => format!("<div class=\"math\">{svg}</div>\n"),
+        None => format!("<div class=\"math\"><math display=\"block\">{}</math></div>\n", crate::math::to_mathml(n)),
+    }
 }
 
 fn list(lines: &[&str]) -> String {
@@ -394,40 +399,113 @@ pub fn base64(data: &[u8]) -> String {
     o
 }
 
-/// 완성된 HTML 문서(스타일 포함, 인쇄에 알맞음).
+/// 화면(앱)과 같은 모양으로 만들기 위한 값. 색은 `#rrggbb`.
+#[derive(Clone, Debug)]
+pub struct Style {
+    pub bg: String,
+    pub text: String,
+    pub dim: String,
+    pub link: String,
+    pub quote: String,
+    pub code_bg: String,
+    pub code_fg: String,
+    pub border: String,
+    /// CSS font-family 값(따옴표 포함)
+    pub font: String,
+    /// 본문 글자 크기(px)
+    pub size: f32,
+    /// 줄 간격 배율(설정의 줄 간격)
+    pub line: f32,
+    /// 문단 사이(빈 줄) 간격 배율
+    pub para: f32,
+    /// 목록 항목 간격 배율
+    pub list: f32,
+}
+
+impl Default for Style {
+    /// 밝은 테마 기본값
+    fn default() -> Style {
+        Style {
+            bg: "#ffffff".into(),
+            text: "#1f2328".into(),
+            dim: "#9aa1ab".into(),
+            link: "#1a6fd6".into(),
+            quote: "#5b6573".into(),
+            code_bg: "#eceff3".into(),
+            code_fg: "#b3261e".into(),
+            border: "#c9ced6".into(),
+            font: "'Malgun Gothic','Segoe UI',sans-serif".into(),
+            size: 15.0,
+            line: 1.0,
+            para: 1.0,
+            list: 1.3,
+        }
+    }
+}
+
+/// 완성된 HTML 문서(기본 스타일).
 pub fn page(title: &str, inner: &str) -> String {
+    page_styled(title, inner, &Style::default())
+}
+
+/// 완성된 HTML 문서: 앱 화면의 색·글꼴·크기·간격을 따른다. 인쇄(PDF)에서도 배경색을 그대로 낸다.
+pub fn page_styled(title: &str, inner: &str, s: &Style) -> String {
+    let lh = (1.45 * s.line).max(1.0);
+    let css = format!(
+        "html{{background:{bg};-webkit-print-color-adjust:exact;print-color-adjust:exact}}
+body{{font-family:{font};font-size:{size}px;line-height:{lh:.3};color:{text};background:{bg};margin:0}}
+main{{max-width:860px;margin:0 auto;padding:28px 30px}}
+h1,h2,h3,h4,h5,h6{{font-weight:700;line-height:1.35;margin:{hm:.2}em 0 .3em}}
+h1{{font-size:1.7em}}h2{{font-size:1.4em}}h3{{font-size:1.2em}}h4{{font-size:1.1em}}h5,h6{{font-size:1em}}
+h1.doc-title{{font-size:1.7em;margin-top:0;border-bottom:1px solid {border};padding-bottom:.3em}}
+p{{margin:{pm:.2}em 0}}
+code{{background:{code_bg};color:{code_fg};padding:.08em .35em;border-radius:4px;font-family:Consolas,'Malgun Gothic',monospace;font-size:.94em}}
+pre{{background:{code_bg};border:1px solid {border};padding:10px 14px;border-radius:5px;overflow:auto;white-space:pre-wrap;margin:.7em 0}}
+pre code{{background:none;color:{text};padding:0;border-radius:0}}
+pre.math{{font-family:Consolas,monospace}}
+div.math{{text-align:center;margin:.7em 0;overflow-x:auto}}
+div.math svg{{max-width:100%;height:auto;display:inline-block}}
+math{{font-family:'Cambria Math','STIX Two Math',serif;font-size:1.25em}}
+blockquote{{margin:.7em 0;padding:.05em 1em;border-left:4px solid {border};color:{quote}}}
+ul,ol{{margin:.4em 0;padding-left:1.6em}}
+li{{margin:{lm:.2}em 0}}
+table{{border-collapse:collapse;margin:.7em 0}}
+th,td{{border:1px solid {border};padding:4px 10px}}
+th{{background:{code_bg}}}
+li.task{{list-style:none;margin-left:-1.4em}}
+img{{max-width:100%;height:auto}}
+.wiki{{color:{link};border-bottom:1px dotted {link}}}
+a{{color:{link}}}
+hr{{border:0;border-top:1px solid {border};margin:1.2em 0}}
+.noimg{{color:{dim}}}
+@page{{margin:12mm}}
+@media print{{main{{max-width:none;padding:0}}pre,table,div.math{{page-break-inside:avoid}}h1,h2,h3{{page-break-after:avoid}}}}
+",
+        bg = s.bg,
+        font = s.font,
+        size = s.size.clamp(8.0, 40.0),
+        text = s.text,
+        border = s.border,
+        link = s.link,
+        quote = s.quote,
+        code_bg = s.code_bg,
+        code_fg = s.code_fg,
+        dim = s.dim,
+        hm = 0.6 * s.para.max(0.5),
+        pm = 0.5 * s.para.max(0.3),
+        lm = 0.15 * s.list.max(0.5),
+    );
     format!(
-        "<!doctype html>\n<html lang=\"ko\"><head><meta charset=\"utf-8\"><title>{t}</title>\n<style>\n{CSS}</style></head>\n<body><main>\n<h1 class=\"doc-title\">{t}</h1>\n{inner}</main></body></html>\n",
+        "<!doctype html>\n<html lang=\"ko\"><head><meta charset=\"utf-8\"><title>{t}</title>\n<style>\n{css}</style></head>\n<body><main>\n<h1 class=\"doc-title\">{t}</h1>\n{inner}</main></body></html>\n",
         t = esc(title)
     )
 }
-
-const CSS: &str = "body{font-family:'Malgun Gothic','Segoe UI',sans-serif;line-height:1.7;color:#222;background:#fff;margin:0}
-main{max-width:820px;margin:0 auto;padding:32px 28px}
-h1,h2,h3,h4,h5,h6{line-height:1.3;margin:1.4em 0 .5em}
-h1.doc-title{margin-top:0;border-bottom:2px solid #ddd;padding-bottom:.3em}
-p{margin:.6em 0}
-code{background:#f3f3f3;padding:.1em .35em;border-radius:3px;font-family:Consolas,monospace;font-size:.92em}
-pre{background:#f6f6f6;padding:12px 14px;border-radius:6px;overflow:auto;white-space:pre-wrap}
-pre code{background:none;padding:0}
-pre.math{font-family:'Cambria Math',Consolas,monospace;text-align:center;background:#fafafa}
-blockquote{margin:.8em 0;padding:.1em 1em;border-left:4px solid #bbb;color:#555}
-table{border-collapse:collapse;margin:.8em 0}
-th,td{border:1px solid #ccc;padding:5px 10px}
-th{background:#f0f0f0}
-li.task{list-style:none;margin-left:-1.2em}
-img{max-width:100%;height:auto}
-.wiki{color:#2a6;border-bottom:1px dotted #2a6}
-a{color:#1a5fb4}
-hr{border:0;border-top:1px solid #ccc;margin:1.4em 0}
-@media print{main{max-width:none;padding:0}pre{page-break-inside:avoid}h1,h2,h3{page-break-after:avoid}}
-";
 
 #[cfg(test)]
 mod tests {
     use super::*;
     fn h(b: &str) -> String {
-        to_html(b, &|_| None)
+        to_html(b, &|_| None, &|_| None)
     }
 
     #[test]
@@ -457,12 +535,43 @@ mod tests {
     #[test]
     fn image_rows_use_callback_and_base64_works() {
         let b = "![사진](img:0123456789abcdef 8x6)";
-        let s = to_html(b, &|h| Some(format!("data:x/{h}")));
+        let s = to_html(b, &|h| Some(format!("data:x/{h}")), &|_| None);
         assert!(s.contains("<img src=\"data:x/0123456789abcdef\" alt=\"사진\">"));
         assert!(h(b).contains("[그림: 사진]"));
         assert_eq!(base64(b"Man"), "TWFu");
         assert_eq!(base64(b"Ma"), "TWE=");
         assert_eq!(base64(b"M"), "TQ==");
+    }
+
+    #[test]
+    fn math_blocks_become_mathml() {
+        let s = h("앞\n$$x=\\frac{a}{b}$$\n뒤\n\n$$\n\\sqrt{y}\n$$\n\n$$\\frac{1}$$");
+        assert!(s.contains("<math display=\"block\">") && s.contains("<mfrac>") && s.contains("<msqrt>"), "{s}");
+        assert!(!s.contains("\\frac{a}")); // 원문 코드가 그대로 나오지 않는다
+        assert!(s.contains("$$\\frac{1}$$")); // 문법이 틀린 한 줄은 앱처럼 글자 그대로
+    }
+
+    /// 개발용: 샘플 HTML을 `AKASHIC_SAMPLE_OUT` 경로에 쓴다(다크 스타일 + 수식 SVG). Edge로 PDF를 만들어 눈으로 확인할 때 쓴다.
+    #[test]
+    #[ignore]
+    fn write_sample_html() {
+        let Ok(out) = std::env::var("AKASHIC_SAMPLE_OUT") else { return };
+        let body = "# 큰 제목\n\n본문 **굵게** *기울임* `코드` [[위키]]\n\n## 수식\n\n$$x=\\frac{-b\\pm\\sqrt{b^2-4ac}}{2a}$$\n\n$$\n\\sum_{i=1}^{n} i = \\frac{n(n+1)}{2}\n$$\n\n- 목록 1\n  - 안쪽\n- [x] 완료\n\n| 이름 | 값 |\n|---|--:|\n| a | 1 |\n\n> 인용문\n\n```\nlet a = 1;\n```\n";
+        let dark = Style {
+            bg: "#1b1d21".into(),
+            text: "#e3e6ea".into(),
+            dim: "#6b7380".into(),
+            link: "#6fb1ff".into(),
+            quote: "#9aa3b0".into(),
+            code_bg: "#2d3137".into(),
+            code_fg: "#f08d80".into(),
+            border: "#3a3f47".into(),
+            ..Style::default()
+        };
+        let mut measure = |s: &str, sc: f32| s.chars().map(|c| if c.is_ascii() { 0.52 } else { 1.0 }).sum::<f32>() * sc;
+        let size = 15.0;
+        let inner = to_html(body, &|_| None, &|n| Some(crate::math::to_svg(n, size, &mut |s, sc| measure(s, sc))));
+        std::fs::write(out, page_styled("샘플 문서", &inner, &dark)).unwrap();
     }
 
     #[test]

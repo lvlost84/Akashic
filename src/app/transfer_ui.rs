@@ -98,15 +98,54 @@ impl App {
         ));
     }
 
-    /// 지금 문서의 완성된 HTML(그림은 data URI로 넣는다)
+    /// 화면과 같은 모양의 스타일(테마 색·설정한 글꼴·크기·간격)
+    fn html_style(&self) -> crate::mdhtml::Style {
+        let hex = |c: egui::Color32| format!("#{:02x}{:02x}{:02x}", c.r(), c.g(), c.b());
+        let t = &self.theme;
+        let mut fonts: Vec<String> = [&self.cfg.font_latin, &self.cfg.font_korean]
+            .iter()
+            .filter(|n| !n.trim().is_empty())
+            .map(|n| format!("'{}'", n.replace(['\'', '"', '\\'], "")))
+            .collect();
+        fonts.extend(["'Malgun Gothic'".to_string(), "'Segoe UI'".to_string(), "sans-serif".to_string()]);
+        crate::mdhtml::Style {
+            bg: hex(t.bg),
+            text: hex(t.text),
+            dim: hex(t.dim),
+            link: hex(t.link),
+            quote: hex(t.quote),
+            code_bg: hex(t.code_bg),
+            code_fg: hex(t.code_fg),
+            border: hex(t.border),
+            font: fonts.join(","),
+            size: self.cfg.font_size,
+            line: self.cfg.line_spacing,
+            para: self.cfg.para_spacing,
+            list: self.cfg.list_spacing,
+        }
+    }
+
+    /// 지금 문서의 완성된 HTML(그림은 data URI로 넣고, 수식은 화면과 같은 배치의 SVG로 그린다)
     fn current_html(&self) -> String {
         let db = &self.db;
-        let inner = crate::mdhtml::to_html(&self.body, &|hash| {
-            let (webp, _, _) = db.get_image(hash).ok().flatten()?;
-            Some(format!("data:image/webp;base64,{}", crate::mdhtml::base64(&webp)))
-        });
+        let size = self.cfg.font_size;
+        let ctx = self.ctx_for_windows.clone();
+        let math = |node: &crate::math::Node| -> Option<String> {
+            let ctx = ctx.as_ref()?;
+            let font = |sc: f32| egui::FontId::new(size * sc, egui::FontFamily::Proportional);
+            let mut measure = |s: &str, sc: f32| ctx.fonts_mut(|f| f.layout_no_wrap(s.to_string(), font(sc), egui::Color32::WHITE)).size().x / size;
+            Some(crate::math::to_svg(node, size, &mut measure))
+        };
+        let inner = crate::mdhtml::to_html(
+            &self.body,
+            &|hash| {
+                let (webp, _, _) = db.get_image(hash).ok().flatten()?;
+                Some(format!("data:image/webp;base64,{}", crate::mdhtml::base64(&webp)))
+            },
+            &math,
+        );
         let title = if self.title.trim().is_empty() { "제목없음" } else { self.title.trim() };
-        crate::mdhtml::page(title, &inner)
+        crate::mdhtml::page_styled(title, &inner, &self.html_style())
     }
 
     fn doc_file_stem(&self) -> String {

@@ -306,6 +306,13 @@ impl VaultKey {
         format!("akashic-{}", self.vault_id())
     }
 
+    /// 본문 일부 암호화(textcrypt)용 키. 같은 저장소를 쓰는 PC들이 같은 키를 얻는다.
+    pub fn text_key(&self) -> [u8; 32] {
+        let mut k = [0u8; 32];
+        self.expand(b"text", &mut k);
+        k
+    }
+
     fn cipher(&self) -> XChaCha20Poly1305 {
         let mut k = [0u8; 32];
         self.expand(b"enc", &mut k);
