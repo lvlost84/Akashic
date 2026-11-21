@@ -493,6 +493,8 @@ pub struct App {
     attach_text: Option<String>,
     /// 본문 암호화: (글 → 암호문) 기억(저장할 때마다 암호문이 바뀌지 않게)
     secret_cache: std::collections::HashMap<String, String>,
+    /// 커서가 암호화 표식 안에 있는지(바뀌면 화면을 다시 그려 가림/보임을 바꾼다)
+    caret_in_secret: bool,
     /// 암호화 키 가져오기 창의 입력(열려 있으면 Some)
     key_import: Option<String>,
     ctx_for_windows: Option<egui::Context>,
@@ -618,6 +620,7 @@ impl App {
             pdf_rx: None,
             attach_text: None,
             secret_cache: std::collections::HashMap::new(),
+            caret_in_secret: false,
             key_import: None,
             ctx_for_windows: None,
             page_scroll: None,
@@ -1357,19 +1360,40 @@ impl App {
                 }
             }
             EditReq::Secret => {
-                let sel: String = self.body.chars().skip(lo).take(hi - lo).collect();
-                let e = crate::editkeys::toggle_wrap(&self.body, lo, hi, crate::textcrypt::OPEN, crate::textcrypt::CLOSE);
-                if lo == hi {
-                    self.say("암호화할 글을 먼저 선택하세요(이미 암호화한 글은 선택한 뒤 다시 누르면 풀립니다)");
+                use crate::textcrypt::{CLOSE, OPEN};
+                // 커서가 암호화한 글 안에 있으면 그 암호화를 푼다(가려져 있어 선택하기 어려우므로 커서만 있으면 된다).
+                if let Some((s, e, inner)) = crate::textcrypt::marker_range(&self.body, lo) {
+                    let n = inner.chars().count();
+                    let t = crate::editkeys::replace_range(&self.body, s, e, &inner).text;
+                    self.apply_body_edit(ctx, id, t, (s, s + n));
+                    self.say("암호화를 풀었습니다");
                     return;
                 }
-                if e.text.chars().count() > self.body.chars().count() {
-                    if let Err(m) = crate::textcrypt::can_wrap(&sel) {
-                        self.say(m);
-                        return;
-                    }
+                if lo == hi {
+                    self.say("암호화할 글을 먼저 선택하세요(암호화한 글은 그 안에 커서를 두고 다시 누르면 풀립니다)");
+                    return;
                 }
-                self.apply_body_edit(ctx, id, e.text, (e.lo, e.hi));
+                let sel: String = self.body.chars().skip(lo).take(hi - lo).collect();
+                if let Err(m) = crate::textcrypt::can_wrap(&sel) {
+                    self.say(m);
+                    return;
+                }
+                // 표·수식 줄은 화면에서 따로 그려서 가릴 수 없으므로 거절한다
+                let line_start = self.body.chars().take(lo).collect::<String>().rfind('\n').map_or(0, |p| p + 1);
+                let line: String = self.body.chars().take(lo).collect::<String>()[line_start..].to_string() + &sel;
+                if line.trim_start().starts_with('|') || sel.contains("$$") || sel.lines().any(|l| l.trim_start().starts_with('|')) {
+                    self.say("표나 수식 안의 글은 암호화할 수 없습니다");
+                    return;
+                }
+                let mut t = String::new();
+                t.extend(self.body.chars().take(lo));
+                t.push_str(OPEN);
+                t.push_str(&sel);
+                t.push_str(CLOSE);
+                t.extend(self.body.chars().skip(hi));
+                let caret = lo + OPEN.chars().count() + sel.chars().count() + CLOSE.chars().count();
+                self.apply_body_edit(ctx, id, t, (caret, caret)); // 커서를 표식 뒤로 보내 바로 가려지게 한다
+                self.say("암호화했습니다(저장하면 암호문으로 기록됩니다). 풀려면 그 글 안에 커서를 두고 다시 누르세요");
             }
             EditReq::AttachText => {
                 if let Some(t) = self.attach_text.take() {
@@ -2007,9 +2031,13 @@ impl App {
             self.font_swap_pass = None;
             self.galley_cache = None;
         }
+        let caret_now = self.cursor_idx;
         let cache = &mut self.galley_cache;
         let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, width: f32| -> Arc<egui::Galley> {
             let text = buf.as_str();
+            // 암호화한 글(`🔒【…】🔒` 안)은 화면에서 `•`로 가린다(커서가 그 안에 있을 때만 보임). 글자 수는 같다.
+            let masked = crate::textcrypt::mask_for_display(text, Some(caret_now));
+            let text = masked.as_deref().unwrap_or(text);
             let w = if wrap_on { width } else { f32::INFINITY };
             let mut h = DefaultHasher::new();
             crate::render::cache_key(text).hash(&mut h);
@@ -2157,6 +2185,12 @@ impl App {
         if let Some(r) = out.cursor_range {
             let idx: usize = r.primary.index.into();
             self.cursor_idx = idx;
+            let in_secret = crate::textcrypt::caret_in_marker(&self.body, idx);
+            if in_secret != self.caret_in_secret {
+                self.caret_in_secret = in_secret;
+                self.galley_cache = None;
+                ctx.request_repaint();
+            }
             let line = md::line_of_char(&self.body, idx);
             if self.cursor_line != Some(line) {
                 self.cursor_line = Some(line);

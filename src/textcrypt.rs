@@ -1,4 +1,4 @@
-//! 본문 일부 자동 암호화. 편집창에서는 `🔒⟪글⟫`로 읽히고, DB에는 `🔒⟪enc:키번호:암호문⟫`로만 저장된다.
+//! 본문 일부 자동 암호화. 편집창에서는 `🔒【글】🔒`로 읽히고, DB에는 `🔒【enc:키번호:암호문】🔒`로만 저장된다.
 //! 열 때 풀고(`reveal`) 저장할 때 잠근다(`conceal`). 같은 글은 같은 암호문을 다시 써서(캐시) 저장할 때마다 본문이 바뀌지 않게 한다.
 //! 키를 모르면(다른 PC 등) 암호문 표식이 그대로 보이고 저장해도 그대로 유지된다.
 use chacha20poly1305::aead::{Aead, Payload};
@@ -6,8 +6,8 @@ use chacha20poly1305::{KeyInit, XChaCha20Poly1305};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
-pub const OPEN: &str = "🔒⟪";
-pub const CLOSE: &str = "⟫";
+pub const OPEN: &str = "🔒【";
+pub const CLOSE: &str = "】🔒";
 const AAD: &[u8] = b"akashic-text-v1";
 pub type Key = [u8; 32];
 
@@ -70,7 +70,7 @@ pub fn open(ring: &[Key], token: &str) -> Option<String> {
     String::from_utf8(pt).ok()
 }
 
-/// `🔒⟪…⟫` 구간들을 (시작, 안쪽 시작, 안쪽 끝, 끝)으로 찾는다(바이트 위치).
+/// `🔒【…】🔒` 구간들을 (시작, 안쪽 시작, 안쪽 끝, 끝)으로 찾는다(바이트 위치).
 fn spans(s: &str) -> Vec<(usize, usize, usize, usize)> {
     let mut v = Vec::new();
     let mut from = 0;
@@ -140,10 +140,65 @@ pub fn conceal(body: &str, key: &Key, cache: &mut HashMap<String, String>) -> Re
     Ok(out)
 }
 
-/// 이 글을 암호화 표식 안에 넣어도 되는가(`⟫`가 있으면 닫는 표식과 헷갈리고, 그림·첨부 링크는 정리 때 놓칠 수 있다).
+/// 캐럿(글자 위치)을 바이트 위치로
+fn byte_at(s: &str, ch: usize) -> usize {
+    s.char_indices().nth(ch).map(|(b, _)| b).unwrap_or(s.len())
+}
+
+/// 화면용: 표식 안의 글을 `•`로 가린다. 글자 수·줄바꿈은 그대로라 커서 위치와 편집이 어긋나지 않는다.
+/// `caret`(글자 위치)이 그 표식 안(표식 포함)에 있으면 그 표식은 가리지 않는다. 가릴 것이 없으면 None.
+pub fn mask_for_display(text: &str, caret: Option<usize>) -> Option<String> {
+    if !has_markers(text) {
+        return None;
+    }
+    let sp = spans(text);
+    if sp.is_empty() {
+        return None;
+    }
+    let cb = caret.map(|c| byte_at(text, c));
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    let mut any = false;
+    for (a, i, j, b) in sp {
+        if cb.is_some_and(|c| c >= a && c <= b) || i == j {
+            continue; // 커서가 안에 있는 표식(또는 빈 표식)은 그대로 보인다
+        }
+        any = true;
+        out.push_str(&text[last..i]);
+        out.extend(text[i..j].chars().map(|c| if c == '\n' || c == '\r' { c } else { '•' }));
+        last = j;
+    }
+    if !any {
+        return None;
+    }
+    out.push_str(&text[last..]);
+    Some(out)
+}
+
+/// 캐럿이 표식 안(표식 포함)인가
+pub fn caret_in_marker(text: &str, caret: usize) -> bool {
+    if !has_markers(text) {
+        return false;
+    }
+    let cb = byte_at(text, caret);
+    spans(text).into_iter().any(|(a, _, _, b)| cb >= a && cb <= b)
+}
+
+/// 캐럿이 든 표식의 (시작, 끝) 글자 위치와 안쪽 글. 못 푼 암호문(`enc:`)이면 None.
+pub fn marker_range(text: &str, caret: usize) -> Option<(usize, usize, String)> {
+    let cb = byte_at(text, caret);
+    let (a, i, j, b) = spans(text).into_iter().find(|(a, _, _, b)| cb >= *a && cb <= *b)?;
+    let inner = &text[i..j];
+    if inner.starts_with("enc:") {
+        return None;
+    }
+    Some((text[..a].chars().count(), text[..b].chars().count(), inner.to_string()))
+}
+
+/// 이 글을 암호화 표식 안에 넣어도 되는가(`】🔒`가 있으면 닫는 표식과 헷갈리고, 그림·첨부 링크는 정리 때 놓칠 수 있다).
 pub fn can_wrap(sel: &str) -> Result<(), &'static str> {
     if sel.contains(CLOSE) || sel.contains(OPEN) {
-        return Err("선택에 `⟫`나 `🔒⟪`가 있어 암호화할 수 없습니다");
+        return Err("선택에 `】🔒`나 `🔒【`가 있어 암호화할 수 없습니다");
     }
     if sel.contains("img:") || sel.contains("[[file:") {
         return Err("그림·첨부 파일 링크가 든 부분은 암호화할 수 없습니다");
@@ -178,7 +233,7 @@ mod tests {
         let body = format!("앞 {OPEN}카드 1234{CLOSE} 뒤\n둘째 {OPEN}한 줄\n두 줄{CLOSE}\n끝");
         let stored = conceal(&body, &key, &mut cache).unwrap();
         assert!(!stored.contains("1234") && !stored.contains("두 줄"));
-        assert!(stored.starts_with("앞 🔒⟪enc:") && stored.ends_with("\n끝"));
+        assert!(stored.starts_with("앞 🔒【enc:") && stored.ends_with("\n끝"));
         // 같은 글을 다시 저장해도 암호문이 바뀌지 않는다
         assert_eq!(conceal(&body, &key, &mut cache).unwrap(), stored);
         // 열면 원래 글, 새 캐시로도 다시 잠가도 같은 결과(열 때 캐시가 채워진다)
@@ -202,9 +257,38 @@ mod tests {
     fn plain_text_and_empty_markers_pass_through() {
         let mut c = HashMap::new();
         assert_eq!(conceal("일반 글", &k(1), &mut c).unwrap(), "일반 글");
-        assert_eq!(conceal("a 🔒⟪⟫ b", &k(1), &mut c).unwrap(), "a 🔒⟪⟫ b");
-        assert_eq!(reveal("안 닫힘 🔒⟪abc", &[k(1)], &mut c), "안 닫힘 🔒⟪abc");
-        assert!(can_wrap("보통 글").is_ok() && can_wrap("a⟫b").is_err() && can_wrap("![](img:0123456789abcdef 1x1)").is_err());
+        assert_eq!(conceal("a 🔒【】🔒 b", &k(1), &mut c).unwrap(), "a 🔒【】🔒 b");
+        assert_eq!(reveal("안 닫힘 🔒【abc", &[k(1)], &mut c), "안 닫힘 🔒【abc");
+        assert!(can_wrap("보통 글").is_ok() && can_wrap("a】🔒b").is_err() && can_wrap("![](img:0123456789abcdef 1x1)").is_err());
+    }
+
+    #[test]
+    fn display_mask_keeps_length_and_reveals_at_caret() {
+        let body = format!("앞 {OPEN}비밀\n둘째{CLOSE} 뒤 {OPEN}x{CLOSE}");
+        let n = body.chars().count();
+        let m = mask_for_display(&body, Some(0)).unwrap();
+        assert_eq!(m.chars().count(), n);
+        assert!(!m.contains("비밀") && !m.contains("둘째") && m.contains("••\n••"));
+        assert!(m.starts_with("앞 ") && m.contains(" 뒤 "));
+        // 커서가 첫 표식 안이면 그것만 보이고 둘째는 가려진다
+        let caret = body.chars().position(|c| c == '밀').unwrap();
+        let m2 = mask_for_display(&body, Some(caret)).unwrap();
+        assert!(m2.contains("비밀") && !m2.contains("•x") && m2.matches('•').count() == 1);
+        // 가릴 것이 없으면 None
+        assert!(mask_for_display("일반 글", Some(0)).is_none());
+        assert!(mask_for_display(&format!("{OPEN}{CLOSE}"), None).is_none());
+        assert!(caret_in_marker(&body, caret) && !caret_in_marker(&body, 0));
+    }
+
+    #[test]
+    fn marker_range_finds_inner_text() {
+        let body = format!("앞 {OPEN}카드{CLOSE} 뒤");
+        let caret = body.chars().position(|c| c == '카').unwrap();
+        let (s, e, inner) = marker_range(&body, caret).unwrap();
+        assert_eq!(inner, "카드");
+        assert_eq!(body.chars().skip(s).take(e - s).collect::<String>(), format!("{OPEN}카드{CLOSE}"));
+        assert!(marker_range(&body, 0).is_none());
+        assert!(marker_range(&format!("{OPEN}enc:aa:00{CLOSE}"), 3).is_none()); // 못 푼 암호문
     }
 
     #[test]
