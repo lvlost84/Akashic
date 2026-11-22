@@ -14,6 +14,7 @@ mod layout;
 mod math;
 mod mdhtml;
 mod md;
+mod mcp;
 mod probe;
 mod render;
 mod secret;
@@ -46,6 +47,10 @@ fn main() -> eframe::Result {
     // 렌더러 시험 전용 자식 프로세스: 저장소·설정을 열지 않고 결과만 종료 코드로 알린다.
     if let Some(i) = args.iter().position(|a| a == "--probe-renderer") {
         std::process::exit(probe::run(args.get(i + 1).map_or("", |s| s.as_str())));
+    }
+    // MCP 서버(표준 입출력): 창을 만들지 않고 JSON-RPC만 주고받는다. 클라이언트(Claude Code 등)가 이 프로그램을 띄운다.
+    if args.iter().any(|a| a == "--mcp") {
+        std::process::exit(mcp::run_stdio());
     }
     let safe_mode = args.iter().any(|a| a == "--safe-mode") || probe::shift_down();
     let mut cfg = app::Config::load();

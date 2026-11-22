@@ -18,6 +18,7 @@ mod sync_ui;
 mod toc_ui;
 mod update_ui;
 mod theme_ui;
+mod mcp_ui;
 
 use crate::graph::{Graph, GraphAct};
 use crate::md;
@@ -180,6 +181,12 @@ pub struct Config {
     /// 본문 일부 암호화 키(이 PC용, 파일에는 Windows 계정으로 보호되어 저장)와 가져온 키들
     pub text_key: String,
     pub text_keys_extra: Vec<String>,
+    /// MCP: 앱이 켜져 있는 동안 HTTP 서버(127.0.0.1)를 가동할지 / 포트 / 접속 토큰
+    pub mcp_http: bool,
+    pub mcp_port: u16,
+    pub mcp_token: String,
+    /// MCP: 쓰기 도구(문서 만들기·고치기·덧붙이기)를 허용할지(stdio·HTTP 공통)
+    pub mcp_write: bool,
 }
 
 impl Default for Config {
@@ -249,6 +256,10 @@ impl Default for Config {
             saved_searches: vec![],
             text_key: String::new(),
             text_keys_extra: vec![],
+            mcp_http: false,
+            mcp_port: crate::mcp::DEFAULT_PORT,
+            mcp_token: String::new(),
+            mcp_write: false,
         }
     }
 }
@@ -546,6 +557,14 @@ pub struct App {
     ref_focus: Option<u64>,
     /// 저장·목록 갱신 때마다 올라가는 번호(참고 창이 DB 저장본을 다시 읽을 때를 안다)
     ref_rev: u64,
+    /// MCP HTTP 서버(옵션을 켠 동안만 Some)와 쓰기 허용 표시(서버 스레드가 읽는다)
+    mcp_http: Option<crate::mcp::Http>,
+    mcp_write_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// 다른 곳(MCP 등)이 DB를 바꿨는지 보려고 마지막으로 본 변경 번호·확인 시각·시작 시각
+    mcp_seen_rev: i64,
+    mcp_polled: Instant,
+    mcp_since: i64,
+    mcp_warned: i64,
 }
 
 /// 수정키가 정확히 `m`일 때만 `k`를 소비한다(egui의 `consume_key`는 Shift·Alt가 더 눌려도 맞다고 본다).
@@ -667,6 +686,12 @@ impl App {
             ref_views: Default::default(),
             ref_focus: None,
             ref_rev: 0,
+            mcp_http: None,
+            mcp_write_flag: Default::default(),
+            mcp_seen_rev: 0,
+            mcp_polled: Instant::now(),
+            mcp_since: now(),
+            mcp_warned: 0,
             cfg,
         };
         let days = a.cfg.trash_days;
@@ -2625,6 +2650,8 @@ impl App {
                     });
                     // 동기화 저장소 → sync_ui.rs
                     self.sync_options(ui, &mut notes);
+                    // MCP 서버 → mcp_ui.rs
+                    self.mcp_options(ui, &mut notes);
                 }
                 4 => self.status_tab(ui),
             _ => self.about_tab(ui),
@@ -2912,6 +2939,7 @@ impl eframe::App for App {
         }
         self.sync_tick();
         self.update_tick();
+        self.mcp_tick(&ctx);
         crate::diag::tick();
         // 그래프 설정은 마우스를 놓은 뒤(슬라이더 조작이 끝난 뒤) 한 번만 저장한다.
         if self.graph_cfg_dirty && !ctx.input(|i| i.pointer.any_down()) {
