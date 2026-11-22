@@ -486,6 +486,8 @@ pub struct App {
     goto_open: bool,
     goto_text: String,
     goto_focus: bool,
+    /// 새 문서를 만든 직후: 다음 프레임에 커서를 본문으로 보낸다(제목은 비워 둬도 되므로)
+    focus_body_next: bool,
     /// PageUp/PageDown 요청(아래로?, Shift?)과, 다음 그리기에 맞출 스크롤 위치
     page_req: Option<(bool, bool)>,
     /// 우클릭·… 메뉴에서 고른 편집(다음에 편집창을 그리기 전에 적용)
@@ -638,6 +640,7 @@ impl App {
             goto_open: false,
             goto_text: String::new(),
             goto_focus: false,
+            focus_body_next: false,
             page_req: None,
             edit_req: None,
             edit_sel: None,
@@ -925,6 +928,7 @@ impl App {
                 self.list_dirty = true;
                 self.open_doc(id, true);
                 self.refresh();
+                self.focus_body_next = true;
             }
             Err(x) => self.say(&format!("새 문서 실패: {x}")),
         }
@@ -2038,6 +2042,10 @@ impl App {
             self.goto_open = true;
             self.goto_focus = true;
             self.goto_text = (md::line_of_char(&self.body, self.cursor_idx) + 1).to_string();
+        }
+        // 새 문서: 제목이 아니라 본문에서 바로 쓰기 시작한다(제목을 비우면 본문 첫 줄이 제목).
+        if std::mem::take(&mut self.focus_body_next) && !self.cur_trashed {
+            ctx.memory_mut(|m| m.request_focus(id));
         }
         self.editor_keys(&ctx, id);
         self.apply_edit_req(&ctx, id);

@@ -17,6 +17,9 @@ KnowVault(WPF)를 Rust + eframe/egui 0.37 + rusqlite로 다시 만드는 프로�
 
 ## 기록
 
+### 2026-11-22 (새 문서 만들면 커서를 본문으로)
+- `new_doc()`이 `focus_body_next`를 켜고 `body_editor`가 다음 프레임에 본문에 포커스를 요청한다(제목은 비워 둬도 되므로). 새 문서(Ctrl+N·버튼)에만 적용, 일일 노트·템플릿은 그대로. **미확인**: 화면에서 제목에 커서가 있을 때 Ctrl+N을 눌러도 본문으로 가는지.
+
 ### 2026-11-22 (MCP 서버 내장, 커밋됨)
 - **MCP 서버**(`mcp.rs`, `app/mcp_ui.rs`, 새 크레이트 없음): ① `Akashic.exe --mcp`(main에서 설정을 읽은 직후 분기, 창 없이 stdio JSON-RPC) ② 옵션을 켜면 앱이 127.0.0.1:포트(기본 39218)에서 Streamable HTTP(응답은 JSON 한 번)를 가동 — Bearer 토큰·Host·Origin 검사. 같은 `Server` 코드를 공유. Anthropic API 호출 없음(비용 없음).
 - 도구: 읽기 6개(목록·검색·읽기·분류·태그·이력 목록) 항상, 쓰기 3개(만들기·바꾸기·덧붙이기)는 `Config.mcp_write`가 켜졌을 때만 목록·동작(stdio는 호출마다 설정 파일을 다시 읽음). 삭제 도구 없음.
