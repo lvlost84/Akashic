@@ -4,13 +4,13 @@ KnowVault(WPF)를 Rust + eframe/egui 0.37 + rusqlite로 다시 만드는 프로�
 작업을 끝낼 때마다 아래 "기록" 맨 위에 항목을 추가합니다(날짜 · 무엇을 · 왜/어떻게 · 확인한 것 · 남은 것).
 
 - 빌드: `cargo build --release` → `out\Akashic.exe` (실행 중이라 잠기면 `Akashic-new.exe`)
-- 시험: `cargo test --release` (현재 298건 통과, 성능·실측 7건은 ignored. 2026-11-20 기준)
+- 시험: `cargo test --release` (현재 332건 통과, 성능·실측 8건은 ignored. 2026-11-22 기준)
 - 격리 실행: `AKASHIC_DATA=<폴더>`, `--seed`. 개발용 환경변수: `AKASHIC_OPEN_HELP/GRAPH/TITLE/OPT`, `AKASHIC_RENDERER`, `AKASHIC_DIAG`
 - 스냅숏(커밋 대신): `snapshots\<날짜>-<번호>-<이름>\` (src, Cargo.toml, build.rs, .cargo, assets)
 - 오픈소스 고지: 빌드할 때 `LICENSE.md`가 자동 생성됨(build.rs)
 - 의존성 규칙: 직접 의존성 10개 이하, `default-features = false` 기본, 작업 후 미사용·중복·개수 점검
 
-## 현재 상태 (2026-11-21, 버전은 v2.17.0)
+## 현재 상태 (2026-11-22, 버전은 v2.18.0)
 - 직접 의존성 9개 + 빌드 의존성 1개(serde_json). Windows 대상 전체 크레이트 197개.
 - 이 PC에서 확인하지 못한 것: 사무실 PC(인텔 내장 그래픽)의 Vulkan 충돌 복구, 밝은 Windows 모드의 시작 시 글자 깨짐.
 - 남은 미개선 항목은 이 파일의 "미확인"·"남은 것" 표시와 로컬 `개선목록.md`(저장소에서는 제외) 참고(C5·C11은 2026-11-17에 처리).
@@ -20,7 +20,10 @@ KnowVault(WPF)를 Rust + eframe/egui 0.37 + rusqlite로 다시 만드는 프로�
 ### 2026-11-22 (새 문서 만들면 커서를 본문으로)
 - `new_doc()`이 `focus_body_next`를 켜고 `body_editor`가 다음 프레임에 본문에 포커스를 요청한다(제목은 비워 둬도 되므로). 새 문서(Ctrl+N·버튼)에만 적용, 일일 노트·템플릿은 그대로. **미확인**: 화면에서 제목에 커서가 있을 때 Ctrl+N을 눌러도 본문으로 가는지.
 
-### 2026-11-22 (MCP 서버 내장, 커밋됨)
+### 2026-11-22 (v2.18.0: MCP 서버 내장 · 새 문서 본문 포커스)
+- 버전을 2.18.0으로 올림. `cargo test --release` 332건 통과, 릴리스 빌드 확인. 아래 두 항목(MCP 서버, 새 문서 커서)이 이 버전에 들어감. **릴리스 전 미확인**: 새 문서 커서 동작과 옵션 화면 모양(사용자가 화면에서 확인).
+
+### MCP 서버 내장
 - **MCP 서버**(`mcp.rs`, `app/mcp_ui.rs`, 새 크레이트 없음): ① `Akashic.exe --mcp`(main에서 설정을 읽은 직후 분기, 창 없이 stdio JSON-RPC) ② 옵션을 켜면 앱이 127.0.0.1:포트(기본 39218)에서 Streamable HTTP(응답은 JSON 한 번)를 가동 — Bearer 토큰·Host·Origin 검사. 같은 `Server` 코드를 공유. Anthropic API 호출 없음(비용 없음).
 - 도구: 읽기 6개(목록·검색·읽기·분류·태그·이력 목록) 항상, 쓰기 3개(만들기·바꾸기·덧붙이기)는 `Config.mcp_write`가 켜졌을 때만 목록·동작(stdio는 호출마다 설정 파일을 다시 읽음). 삭제 도구 없음.
 - 암호화한 글: 읽을 때 `🔒【암호화됨】🔒`로 가림(닫는 표식이 없으면 끝까지), 쓸 때 표식이 든 글 거부, 암호화한 글이 있는 문서의 본문 교체 거부(덧붙이기·제목 변경은 허용).
