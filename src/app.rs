@@ -743,6 +743,13 @@ impl App {
         if let Some(first) = pick.or(last).or_else(|| a.rows.first().map(|r| r.id)) {
             a.open_doc(first, false);
         }
+        // 개발용: 제목이 '00.'으로 시작하는 문서를 인덱스로 지정하고 인덱스 정리 창을 연다.
+        if std::env::var_os("AKASHIC_OPEN_INDEX").is_some() {
+            if let Some(id) = a.rows.iter().find(|r| r.title.starts_with("00.")).map(|r| r.id) {
+                a.index_set(id, true);
+                a.index_open();
+            }
+        }
         a
     }
 
