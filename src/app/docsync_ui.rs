@@ -274,7 +274,7 @@ impl App {
                 Err(_) => {
                     if let Ok(nid) = self.db.new_doc(d.category) {
                         let t = format!("{} (충돌 · 원격 · {})", d.title, chrono::Local::now().format("%Y-%m-%d %H:%M"));
-                        let _ = self.db.save_doc(nid, &t, &d.body);
+                        let _ = self.db.save_doc_plain(nid, &t, &d.body);
                         let _ = self.db.add_tag(nid, docsync::CONFLICT_TAG);
                     }
                     note = "편집 중이던 내용과 다른 PC의 변경이 같은 줄에서 겹쳐 내 편집을 유지하고, 다른 PC 쪽은 '충돌' 사본 문서로 남겼습니다";

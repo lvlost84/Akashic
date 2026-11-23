@@ -3,6 +3,7 @@
 
 mod app;
 mod db;
+mod docindex;
 mod diag;
 mod editkeys;
 mod export;

@@ -488,7 +488,23 @@ COMMIT;",
     }
 
     /// 내용이 실제로 바뀐 경우에만 쓰고 true를 돌려준다.
+    /// 저장한다. 제목이 처음 생긴 문서(빈 제목 → 제목 있음)는 인덱스 문서로 지정돼 있으면 거기에 링크를 덧붙인다.
     pub fn save_doc(&self, id: i64, title: &str, body: &str) -> Res<bool> {
+        let was_empty = self
+            .conn
+            .query_row("SELECT title FROM docs WHERE id=?", [id], |r| r.get::<_, String>(0))
+            .optional()
+            .map_err(e)?
+            .map_or(false, |t| t.trim().is_empty());
+        let changed = self.save_doc_plain(id, title, body)?;
+        if changed && was_empty && !title.trim().is_empty() {
+            self.auto_index(id);
+        }
+        Ok(changed)
+    }
+
+    /// 인덱스 훅 없이 저장한다(동기화로 들어오는 문서, 인덱스 문서 자신 등).
+    pub fn save_doc_plain(&self, id: i64, title: &str, body: &str) -> Res<bool> {
         let n = self
             .conn
             .execute(

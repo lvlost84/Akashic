@@ -2,6 +2,7 @@ use crate::db::*;
 mod about_ui;
 mod col_ui;
 mod history_ui;
+mod index_ui;
 mod extras_ui;
 mod transfer_ui;
 mod attach_ui;
@@ -411,6 +412,10 @@ enum Act {
     ColDialog,
     /// 현재 문서의 변경 이력 창
     History,
+    /// 문서를 인덱스로 지정(true)/해제(false)
+    SetIndexDoc(i64, bool),
+    /// 인덱스 정리 창
+    IndexClean,
     Back,
     Forward,
     /// 문서를 읽기 전용 참고 창으로 연다
@@ -502,6 +507,7 @@ pub struct App {
     respace_md: bool,
     col: col_ui::ColCut,
     hist: history_ui::Hist,
+    index_win: index_ui::IndexWin,
     extras_open: bool,
     extras_tab: u8,
     /// 백그라운드로 만드는 PDF의 결과 수신기
@@ -649,6 +655,7 @@ impl App {
             respace_md: true,
             col: Default::default(),
             hist: Default::default(),
+            index_win: Default::default(),
             extras_open: false,
             extras_tab: 0,
             pdf_rx: None,
@@ -745,6 +752,7 @@ impl App {
     }
 
     fn refresh(&mut self) {
+        self.index_reload_if_stale();
         self.filter.query = self.search.clone();
         match self.db.list_docs(&self.filter) {
             Ok(r) => self.rows = r,
@@ -1200,6 +1208,8 @@ impl App {
                 Act::InsertImage => self.insert_image_dialog(),
                 Act::ColDialog => self.col.open = true,
                 Act::History => self.hist_open(),
+                Act::SetIndexDoc(id, on) => self.index_set(id, on),
+                Act::IndexClean => self.index_open(),
                 Act::Edit(r) => {
                     self.edit_sel = None;
                     self.edit_req = Some(r);
@@ -1889,6 +1899,13 @@ impl App {
                                     ui.close();
                                 }
                                 if crate::icons::btn(ui, crate::icons::Icon::Detach, "새 창으로 열기").on_hover_text("읽기 전용 참고 창으로 엽니다").clicked() { acts.push(Act::OpenRef(r.id)); ui.close(); }
+                                if self.db.index_doc() == Some(r.id) {
+                                    if crate::icons::btn(ui, crate::icons::Icon::Check, "인덱스 정리…").on_hover_text("인덱스에 빠진 문서를 찾아 넣고, 끊긴 링크를 골라 지웁니다").clicked() { acts.push(Act::IndexClean); ui.close(); }
+                                    if crate::icons::btn(ui, crate::icons::Icon::Cross, "인덱스 지정 해제").on_hover_text("새 문서를 이 문서에 자동으로 덧붙이는 기능을 끕니다").clicked() { acts.push(Act::SetIndexDoc(r.id, false)); ui.close(); }
+                                } else if crate::icons::btn(ui, crate::icons::Icon::Database, "인덱스 문서로 지정").on_hover_text("새 문서에 제목이 생기면 이 문서의 알맞은 섹션에 [[링크]]를 자동으로 덧붙입니다(이 PC에서만)").clicked() {
+                                    acts.push(Act::SetIndexDoc(r.id, true));
+                                    ui.close();
+                                }
                                 ui.menu_button("분류로 이동", |ui| {
                                     if ui.button("미분류").clicked() { acts.push(Act::MoveDoc(r.id, None)); ui.close(); }
                                     ui.separator();
@@ -3020,6 +3037,9 @@ impl eframe::App for App {
         }
         if self.hist.open {
             self.hist_window(&ctx);
+        }
+        if self.index_win.open {
+            self.index_window(&ctx);
         }
         if self.graph_window {
             let mut a2 = Vec::new();
