@@ -1,0 +1,65 @@
+{
+  "manifest_version": "0.2",
+  "name": "akashic",
+  "display_name": "아카식",
+  "version": "__VERSION__",
+  "description": "아카식 마크다운 노트를 검색하고 읽습니다(쓰기는 앱 설정에서 켠 경우만). 암호화한 글은 가려 보입니다.",
+  "long_description": "아카식 앱이 이 PC에 저장한 문서를 MCP로 연결합니다. 저장소 위치와 쓰기 허용 여부는 아카식 앱 설정을 따릅니다.",
+  "author": {
+    "name": "lvlost84"
+  },
+  "license": "MIT",
+  "server": {
+    "type": "binary",
+    "entry_point": "server/akashic.exe",
+    "mcp_config": {
+      "command": "${__dirname}/server/akashic.exe",
+      "args": [
+        "--mcp"
+      ]
+    }
+  },
+  "tools": [
+    {
+      "name": "list_documents",
+      "description": "문서 목록(최근 수정순)"
+    },
+    {
+      "name": "search_documents",
+      "description": "제목·본문·태그 검색"
+    },
+    {
+      "name": "get_document",
+      "description": "문서 본문 읽기"
+    },
+    {
+      "name": "list_categories",
+      "description": "분류 트리"
+    },
+    {
+      "name": "list_tags",
+      "description": "태그 목록"
+    },
+    {
+      "name": "list_versions",
+      "description": "변경 이력 목록"
+    },
+    {
+      "name": "create_document",
+      "description": "새 문서 만들기(쓰기 허용 시)"
+    },
+    {
+      "name": "update_document",
+      "description": "제목·본문 바꾸기(쓰기 허용 시)"
+    },
+    {
+      "name": "append_to_document",
+      "description": "본문 끝에 덧붙이기(쓰기 허용 시)"
+    }
+  ],
+  "compatibility": {
+    "platforms": [
+      "win32"
+    ]
+  }
+}

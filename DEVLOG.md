@@ -17,6 +17,9 @@ KnowVault(WPF)를 Rust + eframe/egui 0.37 + rusqlite로 다시 만드는 프로�
 
 ## 기록
 
+### 2026-11-23 (.mcpb 번들: Claude Desktop 더블클릭 설치)
+- `mcpb/manifest.template.json` + `mcpb/pack.ps1`: 릴리스 빌드한 `akashic.exe`(--mcp)를 `@anthropic-ai/mcpb pack`으로 `out/akashic-<버전>.mcpb`로 묶는다(버전은 Cargo.toml에서 자동). 도움말(F1) "AI 연동"에 3번 항목, README에 한 줄 추가. 확인: mcpb 스키마 검증 통과, 번들 안 exe에 initialize·tools/list 응답 확인. **미확인**: Claude Desktop에서 실제 더블클릭 설치. 쓰기 허용·저장소 위치는 앱 설정을 따른다(번들 설정 화면 없음).
+
 ### 2026-11-22 (새 문서 만들면 커서를 본문으로)
 - `new_doc()`이 `focus_body_next`를 켜고 `body_editor`가 다음 프레임에 본문에 포커스를 요청한다(제목은 비워 둬도 되므로). 새 문서(Ctrl+N·버튼)에만 적용, 일일 노트·템플릿은 그대로. **미확인**: 화면에서 제목에 커서가 있을 때 Ctrl+N을 눌러도 본문으로 가는지.
 
