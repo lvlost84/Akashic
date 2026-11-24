@@ -12,6 +12,7 @@ mod icons;
 mod import;
 mod img;
 mod layout;
+mod linksuggest;
 mod math;
 mod mdhtml;
 mod md;

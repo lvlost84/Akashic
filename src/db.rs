@@ -730,6 +730,13 @@ COMMIT;",
         Ok(self.all_docs()?.into_iter().filter(|d| Some(d.0) != index).collect())
     }
 
+    /// 휴지통이 아닌 문서의 (id, 제목)을 최근 수정순으로 — `[[` 제목 후보용(본문은 읽지 않는다).
+    pub fn link_titles(&self) -> Res<Vec<(i64, String)>> {
+        let mut st = self.conn.prepare("SELECT id,title FROM docs WHERE trashed_at IS NULL AND title<>'' ORDER BY updated DESC").map_err(e)?;
+        let v = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).map_err(e)?;
+        v.collect::<Result<Vec<_>, _>>().map_err(e)
+    }
+
     /// 모든 (id, 제목, 본문)을 훑는다 — 링크 그래프·내보내기용(휴지통 제외).
     pub fn all_docs(&self) -> Res<Vec<(i64, String, String)>> {
         let mut st = self.conn.prepare("SELECT id,title,body FROM docs WHERE trashed_at IS NULL").map_err(e)?;
