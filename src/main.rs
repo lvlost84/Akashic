@@ -14,6 +14,7 @@ mod img;
 mod layout;
 mod linksuggest;
 mod tagsuggest;
+mod typefx;
 mod math;
 mod mdhtml;
 mod md;

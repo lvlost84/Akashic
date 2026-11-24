@@ -4,18 +4,24 @@ KnowVault(WPF)를 Rust + eframe/egui 0.37 + rusqlite로 다시 만드는 프로�
 작업을 끝낼 때마다 아래 "기록" 맨 위에 항목을 추가합니다(날짜 · 무엇을 · 왜/어떻게 · 확인한 것 · 남은 것).
 
 - 빌드: `cargo build --release` → `out\Akashic.exe` (실행 중이라 잠기면 `Akashic-new.exe`)
-- 시험: `cargo test --release` (현재 375건 통과, 성능·실측 9건은 ignored. 2026-11-24 기준)
+- 시험: `cargo test --release` (현재 379건 통과, 성능·실측 9건은 ignored. 2026-11-24 기준)
 - 격리 실행: `AKASHIC_DATA=<폴더>`, `--seed`. 개발용 환경변수: `AKASHIC_OPEN_HELP/GRAPH/TITLE/OPT/INDEX`(INDEX: 제목이 `00.`으로 시작하는 문서를 인덱스로 지정하고 정리 창을 연다), `AKASHIC_RENDERER`, `AKASHIC_DIAG`
 - 스냅숏(커밋 대신): `snapshots\<날짜>-<번호>-<이름>\` (src, Cargo.toml, build.rs, .cargo, assets)
 - 오픈소스 고지: 빌드할 때 `LICENSE.md`가 자동 생성됨(build.rs)
 - 의존성 규칙: 직접 의존성 10개 이하, `default-features = false` 기본, 작업 후 미사용·중복·개수 점검
 
-## 현재 상태 (2026-11-24, 버전은 v2.25.0)
+## 현재 상태 (2026-11-24, 버전은 v2.26.0)
 - 직접 의존성 9개 + 빌드 의존성 1개(serde_json). Windows 대상 전체 크레이트 197개.
 - 이 PC에서 확인하지 못한 것: 사무실 PC(인텔 내장 그래픽)의 Vulkan 충돌 복구, 밝은 Windows 모드의 시작 시 글자 깨짐.
 - 남은 미개선 항목은 이 파일의 "미확인"·"남은 것" 표시와 로컬 `개선목록.md`(저장소에서는 제외) 참고(C5·C11은 2026-11-17에 처리).
 
 ## 기록
+
+### 2026-11-24 (v2.26.0: 타이핑 효과, 부드러운 커서·글자 스며들기)
+- 옵션 "타이핑 효과"(끔/커서만/커서+글자, 기본 끔, `cfg.typing_fx`)와 "본문 커서 깜박임"(`cfg.caret_blink`, 기본 켬). 구현안 `docs/타이핑효과-구현안.md`를 egui 내장 기능 기준으로 고쳐서 진행(새 크레이트 없음).
+- 순수 함수 `src/typefx.rs`: `blink_alpha`(입력 직후 0.5초 선명, 그 뒤 코사인으로 서서히), `reveal_cover`(120ms, `emath::easing::exponential_out`), `typed_range`(1~20자 늘고 커서가 그만큼 움직였을 때만 방금 친 글자). 시험 3건.
+- 화면(`body_editor`): egui 기본 커서를 숨기고(편집창 영역에서만 `text_cursor.stroke = NONE`) 직접 그림. 위치는 글자 배치 안의 x를 `ctx.animate_value_with_time(…, 0.08)`로 보간하고 `galley_pos`를 더해 그려 스크롤·타자기 모드와 어긋나지 않음. 줄이 바뀌면 보간 없이 바로 이동. 한글 조합 중에는 선택 끝을 커서로 봄(조합 중 같은 음절을 바꿔 써도 길이가 그대로라 효과가 새로 생기지 않음). 글자 효과는 새 글자 위에 편집창 배경색(`extreme_bg_color`) 덮개를 얹고 투명도를 줄임(표·코드 블록 안 제외, 줄이 바뀐 범위 제외). 문서를 바꾸거나 `apply_body_edit`가 본문을 바꾸면 상태 초기화(`fx_reset`).
+- 확인: `cargo test --release` 379건 통과. **미확인(화면)**: 끔일 때 기존과 같음 / 커서만에서 막대가 부드럽게 따라옴 / 한글 조합 중 번쩍임·흔들림 / 줄바꿈·클릭 이동 / 커서+글자에서 새 글자 스며들기 / 표·코드 블록 안 / 타자기 모드와 함께 쓸 때 / 가만히 둘 때 CPU / 스크롤 중 커서 위치.
 
 ### 2026-11-24 (v2.25.1: 한글 조합 확정 Enter에서 목록이 안 이어지던 문제)
 - 원인: 한글을 치고 조합이 끝나기 전에 Enter를 누르면 `editor_keys`가 조합 중(`ime_busy`)이라 이어쓰기를 건너뛰고, 편집창은 줄바꿈만 넣어 `2. ` 같은 접두어가 빠졌다(두 번째 Enter부터 정상).

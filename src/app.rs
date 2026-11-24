@@ -108,6 +108,10 @@ pub struct Config {
     pub hide_syntax: bool,
     /// 타자기 모드: 글을 쓰거나 키로 움직일 때 현재 줄을 화면 가운데에 둔다
     pub typewriter: bool,
+    /// 타이핑 효과: 0 = 끔, 1 = 커서만(부드러운 이동·서서히 깜박임), 2 = 커서+글자(새 글자가 스며듦)
+    pub typing_fx: u8,
+    /// 본문 커서 깜박임(egui 기본 커서와 직접 그리는 커서 모두)
+    pub caret_blink: bool,
     /// 숫자 목록(1. 2. 3.)을 고치면 번호를 자동으로 다시 매긴다
     pub auto_renumber: bool,
     pub sidebar: bool,
@@ -212,6 +216,8 @@ impl Default for Config {
             wrap: true,
             hide_syntax: true,
             typewriter: false,
+            typing_fx: 0,
+            caret_blink: true,
             auto_renumber: true,
             sidebar: true,
             links_panel: false,
@@ -542,6 +548,11 @@ pub struct App {
     tag_composing: bool,
     /// 포커스 모드: 양쪽 사이드바를 숨긴다(저장하지 않는 임시 상태, Ctrl+Alt+F)
     focus_mode: bool,
+    /// 타이핑 효과 상태: (직전 프레임의 본문 글자 수, 커서 위치), 직접 그린 커서의 줄 위쪽 y, 마지막 입력·이동 시각, 글자 덮개 (시작, 끝, 시각)
+    fx_prev: (Option<usize>, usize),
+    fx_caret_y: Option<f32>,
+    fx_input_at: f64,
+    fx_cover: Vec<(usize, usize, f64)>,
     col: col_ui::ColCut,
     hist: history_ui::Hist,
     index_win: index_ui::IndexWin,
@@ -722,6 +733,10 @@ impl App {
             tag_cache: (-1, Vec::new()),
             tag_composing: false,
             focus_mode: false,
+            fx_prev: (None, 0),
+            fx_caret_y: None,
+            fx_input_at: 0.0,
+            fx_cover: Vec::new(),
             col: Default::default(),
             hist: Default::default(),
             index_win: Default::default(),
@@ -931,6 +946,7 @@ impl App {
         }
         self.find_reset_for_doc();
         (self.link_sugg, self.link_pick, self.link_esc, self.link_popup_rect) = (None, None, None, None);
+        self.fx_reset();
         if let Some(old) = self.cur {
             if old != id {
                 let _ = self.db.delete_empty(old); // 쓰다 만 빈 문서 정리
@@ -1575,6 +1591,7 @@ impl App {
     fn apply_body_edit(&mut self, ctx: &egui::Context, id: egui::Id, text: String, sel: (usize, usize)) {
         use egui::text::{CCursor, CCursorRange};
         self.body = text;
+        self.fx_reset(); // 코드가 본문을 바꿨으면 효과·커서 위치 기록을 버린다(옛 위치에서 미끄러져 오지 않게)
         let sel = self.renumber_after(sel);
         let n = self.body.chars().count();
         let (x, y) = (sel.0.min(n), sel.1.min(n));
@@ -1585,6 +1602,13 @@ impl App {
         self.cursor_line = Some(md::line_of_char(&self.body, y));
         self.last_edit.get_or_insert_with(Instant::now);
         ctx.request_repaint();
+    }
+
+    /// 타이핑 효과 상태를 처음으로 되돌린다(문서를 바꿨거나 코드가 본문을 바꿨을 때).
+    fn fx_reset(&mut self) {
+        self.fx_prev = (None, 0);
+        self.fx_caret_y = None;
+        self.fx_cover.clear();
     }
 
     /// 포커스 모드·타자기 모드가 켜져 있는 동안 본문 영역 오른쪽 위에 작은 표시를 띄운다(누르면 그 모드를 끈다).
@@ -2438,11 +2462,29 @@ impl App {
         let typewriter = self.cfg.typewriter && editable;
         let tw_prev = self.cursor_idx;
         let tw_keys = ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Key { pressed: true, .. })));
+        // 타이핑 효과(typefx): 0 끔 / 1 커서만 / 2 커서+글자. 상태는 그리는 동안 지역 변수로 바꾸고 끝난 뒤 되돌려 담는다.
+        let fx = if editable { self.cfg.typing_fx.min(2) } else { 0 };
+        let blink_on = self.cfg.caret_blink;
+        let composing = self.body_composing;
+        let now = ctx.input(|i| i.time);
+        let (fx_prev_len, fx_prev_cur) = self.fx_prev;
+        let (fx_prev_y, fx_input_at) = (self.fx_caret_y, self.fx_input_at);
+        let mut fx_cover = std::mem::take(&mut self.fx_cover);
+        let (mut fx_new_len, mut fx_new_y, mut fx_input_new, mut fx_new_cur) = (None::<usize>, None::<f32>, false, fx_prev_cur);
+        let caret_stroke = ui.visuals().text_cursor.stroke;
         let sa = area
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 // 표·코드 박스는 글자 뒤에 깔아야 하므로 자리를 먼저 잡고, 편집창 바탕은 투명하게 한다.
                 let slot = ui.painter().add(egui::Shape::Noop);
+                // 본문 커서: 깜박임 설정을 적용하고, 효과가 켜져 있으면 egui 기본 커서를 숨긴다(직접 그림). 이 편집창 영역에서만 바꾼다.
+                if fx > 0 || ui.visuals().text_cursor.blink != blink_on {
+                    let v = ui.visuals_mut();
+                    v.text_cursor.blink = blink_on;
+                    if fx > 0 {
+                        v.text_cursor.stroke = egui::Stroke::NONE;
+                    }
+                }
                 let out = egui::TextEdit::multiline(&mut self.body)
                     .id(id)
                     .interactive(editable)
@@ -2476,8 +2518,72 @@ impl App {
                     }
                     ui.add_space(avail_h * 0.5); // 문서 끝 줄도 가운데까지 올라올 수 있게 아래 여백
                 }
+                if fx > 0 {
+                    use egui::text::CCursor;
+                    let painter = ui.painter().clone();
+                    if let Some(cr) = out.cursor_range {
+                        // 한글 조합 중에는 egui가 조합 글자를 선택으로 잡으므로 선택 끝을 커서로 본다.
+                        let (pi, si): (usize, usize) = (cr.primary.index.into(), cr.secondary.index.into());
+                        let idx = if composing { pi.max(si) } else { pi };
+                        let changed = out.response.changed();
+                        if changed || idx != fx_prev_cur {
+                            fx_input_new = true;
+                        }
+                        fx_new_cur = idx;
+                        // 글자 효과: 방금 친 글자 범위를 덮개 목록에 넣는다(표·코드 블록 안은 건너뜀)
+                        if fx == 2 && (changed || fx_prev_len.is_none()) {
+                            let n = out.galley.text().chars().count();
+                            if changed {
+                                if let Some((s, e)) = fx_prev_len.and_then(|pl| crate::typefx::typed_range(pl, n, fx_prev_cur, idx)) {
+                                    let line = md::line_of_char(&self.body, s);
+                                    let skip = blocks.iter().any(|b| matches!(b.kind, md::BlockKind::Code { .. } | md::BlockKind::Table { .. }) && line >= b.start && line <= b.end);
+                                    if !skip {
+                                        fx_cover.push((s, e, now));
+                                    }
+                                }
+                            }
+                            fx_new_len = Some(n);
+                        }
+                        // 부드러운 커서: 글자 배치 안의 x를 보간하고(스크롤해도 어긋나지 않게), 줄이 바뀌면 바로 이동한다.
+                        if ctx.memory(|m| m.has_focus(id)) && (pi == si || composing) {
+                            let r = out.galley.pos_from_cursor(CCursor::new(idx));
+                            let same_line = fx_prev_y.is_some_and(|y| (y - r.min.y).abs() < 0.5);
+                            #[allow(deprecated)]
+                            let ax = ctx.animate_value_with_time(egui::Id::new("fx_caret_x"), r.min.x, if same_line { 0.08 } else { 0.0 });
+                            let top = out.galley_pos + egui::vec2(ax, r.min.y);
+                            let since = (now - if fx_input_new { now } else { fx_input_at }) as f32;
+                            let alpha = crate::typefx::blink_alpha(since, blink_on);
+                            painter.line_segment([top, top + egui::vec2(0.0, r.height())], Stroke::new(caret_stroke.width, caret_stroke.color.gamma_multiply(alpha)));
+                            fx_new_y = Some(r.min.y);
+                            if blink_on {
+                                ctx.request_repaint_after(Duration::from_millis(50));
+                            }
+                        }
+                    }
+                    // 새 글자 위에 편집창 배경색 덮개를 얹고 투명도를 줄인다(글자 배치는 다시 계산하지 않음).
+                    fx_cover.retain(|c| (now - c.2) < crate::typefx::REVEAL_SECS as f64);
+                    for &(s, e, t0) in &fx_cover {
+                        let (a, b) = (out.galley.pos_from_cursor(CCursor::new(s)), out.galley.pos_from_cursor(CCursor::new(e)));
+                        if (a.min.y - b.min.y).abs() > 1.0 || b.min.x <= a.min.x {
+                            continue; // 줄이 바뀐 범위는 건너뜀
+                        }
+                        let rect = egui::Rect::from_min_max(a.min, egui::pos2(b.min.x, a.max.y)).translate(out.galley_pos.to_vec2());
+                        painter.rect_filled(rect, 0.0, bg.gamma_multiply(crate::typefx::reveal_cover((now - t0) as f32)));
+                        ctx.request_repaint();
+                    }
+                }
                 out
             });
+        if fx > 0 {
+            self.fx_cover = fx_cover;
+            self.fx_caret_y = fx_new_y;
+            if fx_input_new {
+                self.fx_input_at = now;
+            }
+            self.fx_prev = (fx_new_len.or(fx_prev_len), fx_new_cur);
+        } else {
+            self.fx_reset();
+        }
         let (scroll_off, view_h) = (sa.state.clamped_offset(), sa.inner_rect.height());
         let out = sa.inner;
         if ctx.memory(|m| m.has_focus(id)) {
@@ -2874,6 +2980,17 @@ impl App {
                     ui.checkbox(&mut self.cfg.auto_renumber, "숫자 목록 번호 자동 고침");
                     ui.checkbox(&mut self.cfg.hide_syntax, "커서가 없는 줄의 문법 기호 숨기기");
                     ui.checkbox(&mut self.cfg.typewriter, "타자기 모드: 글을 쓸 때 현재 줄을 화면 가운데에 둠 (Ctrl+Alt+Y)");
+                    ui.horizontal(|ui| {
+                        ui.label("타이핑 효과");
+                        let names = ["끔", "커서만", "커서+글자"];
+                        let cur = (self.cfg.typing_fx as usize).min(2);
+                        egui::ComboBox::from_id_salt("typing_fx").selected_text(names[cur]).show_ui(ui, |ui| {
+                            for (i, n) in names.iter().enumerate() {
+                                ui.selectable_value(&mut self.cfg.typing_fx, i as u8, *n);
+                            }
+                        });
+                    }).response.on_hover_text("커서만: 커서가 새 위치로 부드럽게 미끄러지고 서서히 깜박입니다.\n커서+글자: 새로 친 글자도 서서히 나타납니다(표·코드 블록 안은 제외).");
+                    ui.checkbox(&mut self.cfg.caret_blink, "본문 커서 깜박임");
                     ui.separator();
                     ui.label(egui::RichText::new("저장 방식").strong());
                     ui.horizontal(|ui| {
