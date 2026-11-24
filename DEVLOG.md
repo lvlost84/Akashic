@@ -4,18 +4,22 @@ KnowVault(WPF)를 Rust + eframe/egui 0.37 + rusqlite로 다시 만드는 프로�
 작업을 끝낼 때마다 아래 "기록" 맨 위에 항목을 추가합니다(날짜 · 무엇을 · 왜/어떻게 · 확인한 것 · 남은 것).
 
 - 빌드: `cargo build --release` → `out\Akashic.exe` (실행 중이라 잠기면 `Akashic-new.exe`)
-- 시험: `cargo test --release` (현재 366건 통과, 성능·실측 8건은 ignored. 2026-11-24 기준)
+- 시험: `cargo test --release` (현재 367건 통과, 성능·실측 8건은 ignored. 2026-11-24 기준)
 - 격리 실행: `AKASHIC_DATA=<폴더>`, `--seed`. 개발용 환경변수: `AKASHIC_OPEN_HELP/GRAPH/TITLE/OPT/INDEX`(INDEX: 제목이 `00.`으로 시작하는 문서를 인덱스로 지정하고 정리 창을 연다), `AKASHIC_RENDERER`, `AKASHIC_DIAG`
 - 스냅숏(커밋 대신): `snapshots\<날짜>-<번호>-<이름>\` (src, Cargo.toml, build.rs, .cargo, assets)
 - 오픈소스 고지: 빌드할 때 `LICENSE.md`가 자동 생성됨(build.rs)
 - 의존성 규칙: 직접 의존성 10개 이하, `default-features = false` 기본, 작업 후 미사용·중복·개수 점검
 
-## 현재 상태 (2026-11-24, 버전은 v2.21.1)
+## 현재 상태 (2026-11-24, 버전은 v2.22.0)
 - 직접 의존성 9개 + 빌드 의존성 1개(serde_json). Windows 대상 전체 크레이트 197개.
 - 이 PC에서 확인하지 못한 것: 사무실 PC(인텔 내장 그래픽)의 Vulkan 충돌 복구, 밝은 Windows 모드의 시작 시 글자 깨짐.
 - 남은 미개선 항목은 이 파일의 "미확인"·"남은 것" 표시와 로컬 `개선목록.md`(저장소에서는 제외) 참고(C5·C11은 2026-11-17에 처리).
 
 ## 기록
+
+### 2026-11-24 (v2.22.0: 내보내기에서 주소 링크 처리)
+- `mdhtml::inline`: 맨 주소(`https://`·`www.`·`mailto:`)를 `<a>` 링크로, `[[주소]]`·`[[주소|글]]`도 링크로(주소가 아니면 기존 위키 표시), `[글](www.…)`는 `https://`를 붙여 링크로 내보냄. 편집창과 같은 `md::safe_url`·`md::bare_url_len` 사용. 인라인 코드 안·앞에 글자가 붙은 주소는 제외. 경로 링크(`[[C:\…]]`)는 그대로 위키 표시.
+- 확인: `cargo test --release` 367건 통과(새 시험 `bare_and_wiki_urls_become_links`). **미확인(화면)**: 실제 내보낸 HTML·PDF에서 링크 동작.
 
 ### 2026-11-24 (v2.21.1: 시험 수정, 앱 동작 변화 없음)
 - `theme::tests::text_env_detects_theme_switch`가 egui의 "Dropped TexturesDelta" 패닉으로 실패하던 것을 고침: 시험의 `pass`가 `run_ui` 결과를 바로 버리던 것을 `textures_delta.clear()` 뒤에 버리도록 바꿈(`src/theme.rs` 시험 코드만). 전체 366건 통과, 8건 무시.

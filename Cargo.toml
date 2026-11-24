@@ -1,6 +1,6 @@
 [package]
 name = "akashic"
-version = "2.21.1"
+version = "2.22.0"
 edition = "2024"
 
 [dependencies]

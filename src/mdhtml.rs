@@ -17,6 +17,9 @@ pub fn esc(s: &str) -> String {
 
 fn safe_url(u: &str) -> Option<String> {
     let u = u.trim();
+    if let Some(w) = crate::md::safe_url(u).filter(|_| u.to_ascii_lowercase().starts_with("www.")) {
+        return Some(esc(&w));
+    }
     let l = u.to_ascii_lowercase();
     let ok = l.starts_with("http://") || l.starts_with("https://") || l.starts_with("mailto:") || l.starts_with('#') || (!l.contains(':') && !l.starts_with("//"));
     if ok { Some(esc(u)) } else { None }
@@ -80,7 +83,11 @@ pub fn inline(s: &str) -> String {
             if let Some(e) = find(i + 2, &[']', ']']) {
                 let inner: String = ch[i + 2..e].iter().collect();
                 let shown = inner.split_once('|').map(|x| x.1).unwrap_or(&inner);
-                o.push_str(&format!("<span class=\"wiki\">{}</span>", esc(shown)));
+                let target = inner.split('|').next().unwrap_or("");
+                match crate::md::safe_url(target) {
+                    Some(u) => o.push_str(&format!("<a href=\"{}\">{}</a>", esc(&u), esc(shown))),
+                    None => o.push_str(&format!("<span class=\"wiki\">{}</span>", esc(shown))),
+                }
                 i = e + 2;
                 continue;
             }
@@ -122,6 +129,18 @@ pub fn inline(s: &str) -> String {
                         i = p + 1;
                         continue;
                     }
+                }
+            }
+        }
+        // 맨 주소 (앞 글자가 영숫자가 아닐 때만)
+        if matches!(c, 'h' | 'H' | 'w' | 'W' | 'm' | 'M') && (i == 0 || !ch[i - 1].is_alphanumeric()) {
+            let rest: String = ch[i..].iter().collect();
+            if let Some(len) = crate::md::bare_url_len(&rest) {
+                let text = &rest[..len];
+                if let Some(u) = crate::md::safe_url(text) {
+                    o.push_str(&format!("<a href=\"{}\">{}</a>", esc(&u), esc(text)));
+                    i += text.chars().count();
+                    continue;
                 }
             }
         }
@@ -516,6 +535,16 @@ mod tests {
         assert_eq!(inline("[[문서|별칭]] 와 [[그냥]]"), "<span class=\"wiki\">별칭</span> 와 <span class=\"wiki\">그냥</span>");
         assert_eq!(inline("2 * 3 * 4"), "2 * 3 * 4");
         assert_eq!(inline("a_b_c"), "a_b_c");
+    }
+
+    #[test]
+    fn bare_and_wiki_urls_become_links() {
+        assert_eq!(inline("see https://a.b/c?x=1&y=2."), "see <a href=\"https://a.b/c?x=1&amp;y=2\">https://a.b/c?x=1&amp;y=2</a>.");
+        assert_eq!(inline("www.a.b"), "<a href=\"https://www.a.b\">www.a.b</a>");
+        assert_eq!(inline("[[https://a.b|사이트]]"), "<a href=\"https://a.b\">사이트</a>");
+        assert_eq!(inline("[글](www.a.b)"), "<a href=\"https://www.a.b\">글</a>");
+        assert_eq!(inline("`https://a.b`"), "<code>https://a.b</code>");
+        assert_eq!(inline("xhttps://a.b"), "xhttps://a.b");
     }
 
     #[test]
