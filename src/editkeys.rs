@@ -641,9 +641,49 @@ pub fn line_count(text: &str) -> usize {
     text.bytes().filter(|b| *b == b'\n').count() + 1
 }
 
+/// 한글 조합을 확정하는 Enter는 편집창이 그냥 줄바꿈만 넣으므로 목록 이어쓰기가 빠진다.
+/// 그 줄바꿈 직후(커서가 빈 줄 맨 앞, 바로 윗줄이 목록·인용·체크박스 항목)이면 접두어를 채워 넣는다.
+/// 돌려주는 것은 (새 본문, 새 커서 글자 위치). 해당 없으면 None.
+pub fn continue_after_plain_enter(text: &str, caret: usize) -> Option<(String, usize)> {
+    let bi = text.char_indices().nth(caret).map_or(text.len(), |(b, _)| b);
+    let before = &text[..bi];
+    if !before.ends_with('\n') || !(text[bi..].is_empty() || text[bi..].starts_with('\n') || text[bi..].starts_with('\r')) {
+        return None;
+    }
+    let prev_all = &before[..before.len() - 1];
+    let prev = prev_all[prev_all.rfind('\n').map_or(0, |p| p + 1)..].trim_end_matches('\r');
+    // 윗줄이 코드 블록 안이면 이어쓰지 않는다
+    let in_fence = prev_all.lines().filter(|l| l.trim_start().starts_with("```")).count() % 2 == 1;
+    if in_fence {
+        return None;
+    }
+    match crate::md::continue_list(prev) {
+        Some(crate::md::Enter::Insert(p)) => {
+            let mut t = String::with_capacity(text.len() + p.len());
+            t.push_str(before);
+            t.push_str(&p);
+            t.push_str(&text[bi..]);
+            Some((t, caret + p.chars().count()))
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plain_enter_after_ime_gets_list_prefix() {
+        // "1. 가나" + Enter가 그냥 줄바꿈만 넣은 뒤: 커서는 빈 줄 맨 앞(글자 위치 6)
+        assert_eq!(continue_after_plain_enter("1. 가나\n", 6), Some(("1. 가나\n2. ".to_string(), 9)));
+        assert_eq!(continue_after_plain_enter("- 항목\r\n", 6), Some(("- 항목\r\n- ".to_string(), 8)));
+        // 빈 줄이 아니거나 윗줄이 목록이 아니면 건드리지 않는다
+        assert_eq!(continue_after_plain_enter("1. 가나\n다", 6), None);
+        assert_eq!(continue_after_plain_enter("그냥 글\n", 5), None);
+        assert_eq!(continue_after_plain_enter("```\n- 코드\n", 9), None);
+        assert_eq!(continue_after_plain_enter("1. 가나", 5), None);
+    }
 
     fn ind(t: &str, lo: usize, hi: usize, out: bool) -> (String, usize, usize) {
         let e = indent(t, lo, hi, out).expect("바뀌어야 함");

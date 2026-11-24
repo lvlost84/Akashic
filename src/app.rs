@@ -479,6 +479,8 @@ pub struct App {
     last_edit: Option<Instant>,
     /// 본문 편집창에서 한글 등 IME 조합 중인지(조합을 끝내는 Enter가 목록 이어쓰기를 일으키지 않게)
     body_composing: bool,
+    /// 한글 조합 확정 Enter 뒤 목록 접두어를 채울 때까지 남은 프레임 수
+    enter_fix: u8,
     back: Vec<i64>,
     fwd: Vec<i64>,
     out_links: Vec<(String, Option<i64>)>,
@@ -677,6 +679,7 @@ impl App {
             cur_cat: None,
             last_edit: None,
             body_composing: false,
+            enter_fix: 0,
             back: vec![],
             fwd: vec![],
             out_links: vec![],
@@ -1850,6 +1853,22 @@ impl App {
             }
             if self.page_req.is_some() {
                 ctx.request_repaint();
+            }
+        }
+        // 한글 조합을 확정하는 Enter: 편집창이 줄바꿈만 넣으므로, 그 줄바꿈이 들어간 뒤 목록 접두어를 채운다(몇 프레임 기다림).
+        // (조합 중에는 egui가 조합 중인 글자를 선택으로 잡으므로 a == b를 요구하지 않는다. 줄바꿈이 들어간 뒤 커서가 모일 때 확인한다.)
+        if ime_busy && ctx.input(|i| i.key_pressed(Key::Enter) && !i.modifiers.any()) {
+            self.enter_fix = 4;
+        }
+        if self.enter_fix > 0 {
+            self.enter_fix -= 1;
+            if !changed && !ime_busy && a == b {
+                if let Some((t, c)) = crate::editkeys::continue_after_plain_enter(&self.body, a) {
+                    self.body = t;
+                    new_cursor = Some((c, c));
+                    changed = true;
+                    self.enter_fix = 0;
+                }
             }
         }
         // Enter: 목록·인용·체크박스 이어쓰기
