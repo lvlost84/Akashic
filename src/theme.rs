@@ -664,7 +664,9 @@ mod tests {
         let ctx = egui::Context::default();
         let mut env = TextEnv::default();
         let pass = |ctx: &egui::Context| {
-            let _ = ctx.run_ui(Default::default(), |_| {});
+            // 텍스처 변경분은 쓰지 않으니 버리기 전에 비운다(안 비우면 egui가 패닉).
+            let mut out = ctx.run_ui(Default::default(), |_| {});
+            out.textures_delta.clear();
         };
         pass(&ctx);
         assert!(env.changed(&ctx), "첫 호출은 항상 true");
