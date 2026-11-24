@@ -7,6 +7,7 @@ mod extras_ui;
 mod transfer_ui;
 mod attach_ui;
 mod link_ui;
+mod tag_ui;
 mod secret_ui;
 mod export_ui;
 mod find_ui;
@@ -105,6 +106,8 @@ pub struct Config {
     pub para_spacing: f32,
     pub wrap: bool,
     pub hide_syntax: bool,
+    /// 타자기 모드: 글을 쓰거나 키로 움직일 때 현재 줄을 화면 가운데에 둔다
+    pub typewriter: bool,
     /// 숫자 목록(1. 2. 3.)을 고치면 번호를 자동으로 다시 매긴다
     pub auto_renumber: bool,
     pub sidebar: bool,
@@ -208,6 +211,7 @@ impl Default for Config {
             para_spacing: 1.0,
             wrap: true,
             hide_syntax: true,
+            typewriter: false,
             auto_renumber: true,
             sidebar: true,
             links_panel: false,
@@ -514,6 +518,28 @@ pub struct App {
     last_sel: (usize, usize),
     /// 공백 정리가 마크다운 구조(목록 기호·표·코드 블록)를 건드리지 않게 함
     respace_md: bool,
+    /// `[[` 뒤에 글자를 치는 동안 보이는 문서 제목 후보
+    link_sugg: Option<LinkSugg>,
+    /// 후보에서 고른 확정 요청(입력 시작, 커서, 제목). 편집창을 그리기 전에 적용한다.
+    link_pick: Option<(usize, usize, String)>,
+    /// 제목 캐시: (db.rev(), (문서 번호, 제목) 목록). rev가 바뀔 때만 다시 읽는다.
+    link_titles: (i64, Vec<(i64, String)>),
+    /// Esc로 닫은 입력의 시작 위치(같은 입력에서는 다시 띄우지 않는다)
+    link_esc: Option<usize>,
+    /// 후보 팝업이 그려진 영역(팝업을 누르는 순간 편집창이 포커스를 잃어도 후보를 유지하려고)
+    link_popup_rect: Option<egui::Rect>,
+    /// `[[` 후보 옆에 보일 설명(제목 → "분류 경로 · #태그 …"). link_titles와 같이 rev가 바뀔 때 다시 만든다.
+    link_hints: std::collections::HashMap<String, String>,
+    /// 태그 입력칸 자동완성: 후보·고른 항목·팝업에서 고른 태그·Esc로 닫은 입력·팝업 영역·태그 목록 캐시(db.rev)·한글 조합 중
+    tag_items: Vec<String>,
+    tag_sel: Option<usize>,
+    tag_pick: Option<String>,
+    tag_esc: Option<String>,
+    tag_popup_rect: Option<egui::Rect>,
+    tag_cache: (i64, Vec<String>),
+    tag_composing: bool,
+    /// 포커스 모드: 양쪽 사이드바를 숨긴다(저장하지 않는 임시 상태, Ctrl+Alt+F)
+    focus_mode: bool,
     col: col_ui::ColCut,
     hist: history_ui::Hist,
     index_win: index_ui::IndexWin,
@@ -584,6 +610,19 @@ pub struct App {
     mcp_polled: Instant,
     mcp_since: i64,
     mcp_warned: i64,
+}
+
+/// `[[` 제목 후보 상태. `start`는 `[[` 바로 뒤, `caret`은 입력 끝(커서) 글자 위치.
+#[derive(Clone)]
+struct LinkSugg {
+    start: usize,
+    caret: usize,
+    query: String,
+    items: Vec<String>,
+    sel: usize,
+    /// 후보를 만든 때의 db.rev()와 현재 문서(같으면 후보를 다시 거르지 않는다)
+    rev: i64,
+    cur: Option<i64>,
 }
 
 /// 수정키가 정확히 `m`일 때만 `k`를 소비한다(egui의 `consume_key`는 Shift·Alt가 더 눌려도 맞다고 본다).
@@ -666,6 +705,20 @@ impl App {
             menu_path: None,
             last_sel: (0, 0),
             respace_md: true,
+            link_sugg: None,
+            link_pick: None,
+            link_titles: (-1, Vec::new()),
+            link_esc: None,
+            link_popup_rect: None,
+            link_hints: Default::default(),
+            tag_items: Vec::new(),
+            tag_sel: None,
+            tag_pick: None,
+            tag_esc: None,
+            tag_popup_rect: None,
+            tag_cache: (-1, Vec::new()),
+            tag_composing: false,
+            focus_mode: false,
             col: Default::default(),
             hist: Default::default(),
             index_win: Default::default(),
@@ -874,6 +927,7 @@ impl App {
             return; // 저장하지 못한 채 다른 문서로 가면 편집 내용이 사라진다
         }
         self.find_reset_for_doc();
+        (self.link_sugg, self.link_pick, self.link_esc, self.link_popup_rect) = (None, None, None, None);
         if let Some(old) = self.cur {
             if old != id {
                 let _ = self.db.delete_empty(old); // 쓰다 만 빈 문서 정리
@@ -1530,6 +1584,158 @@ impl App {
         ctx.request_repaint();
     }
 
+    /// 포커스 모드·타자기 모드가 켜져 있는 동안 본문 영역 오른쪽 위에 작은 표시를 띄운다(누르면 그 모드를 끈다).
+    fn mode_badge(&mut self, ctx: &egui::Context, area: egui::Rect) {
+        let mut labels: Vec<(&str, &str)> = Vec::new();
+        if self.focus_mode {
+            labels.push(("포커스 모드", "클릭하면 끕니다 (Ctrl+Alt+F)"));
+        }
+        if self.cfg.typewriter {
+            labels.push(("타자기 모드", "클릭하면 끕니다 (Ctrl+Alt+Y)"));
+        }
+        if labels.is_empty() {
+            return;
+        }
+        let accent = self.theme.accent;
+        #[allow(deprecated)]
+        let aid = egui::Id::new("mode_badge");
+        let mut off: Option<usize> = None;
+        egui::Area::new(aid).order(egui::Order::Foreground).pivot(egui::Align2::RIGHT_TOP).fixed_pos(area.right_top() + egui::vec2(-18.0, 6.0)).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                for (i, (txt, tip)) in labels.iter().enumerate() {
+                    let r = ui.add(egui::Button::new(egui::RichText::new(*txt).size(crate::theme::ui(-1.0)).color(accent)).small()).on_hover_text(*tip);
+                    if r.clicked() {
+                        off = Some(i);
+                    }
+                }
+            });
+        });
+        if let Some(i) = off {
+            if labels[i].0 == "포커스 모드" {
+                self.focus_mode = false;
+            } else {
+                self.cfg.typewriter = false;
+                self.graph_cfg_dirty = true; // 설정 저장
+            }
+        }
+    }
+
+    /// `[[` 제목 후보에서 고른 제목으로 입력 조각을 바꾼다. 편집창을 그리기 전에 바꿔 Ctrl+Z 한 번으로 되돌아간다.
+    fn apply_link_pick(&mut self, ctx: &egui::Context, id: egui::Id) {
+        let Some((start, caret, title)) = self.link_pick.take() else { return };
+        self.link_sugg = None;
+        self.link_popup_rect = None;
+        self.link_esc = None;
+        if self.cur_trashed {
+            return;
+        }
+        ctx.memory_mut(|m| m.request_focus(id)); // 팝업을 누르면 편집창이 포커스를 잃으므로 되돌린다
+        let (text, c) = crate::linksuggest::accept(&self.body, start, caret, &title);
+        self.apply_body_edit(ctx, id, text, (c, c));
+    }
+
+    /// 편집창을 그린 뒤: 커서 앞의 `[[입력`에 맞는 제목 후보를 갱신하고 팝업을 그린다.
+    fn link_suggest_ui(&mut self, ctx: &egui::Context, id: egui::Id, out: &egui::text_edit::TextEditOutput, editable: bool) {
+        use egui::text::CCursor;
+        let focused = ctx.memory(|m| m.has_focus(id));
+        // 팝업을 누르는 순간 편집창이 포커스를 잃으므로, 눌린 채 팝업 안에 있으면 후보를 유지한다.
+        let in_popup = self.link_popup_rect.is_some_and(|r| ctx.input(|i| i.pointer.any_down() && i.pointer.interact_pos().is_some_and(|p| r.contains(p))));
+        if !editable || (!focused && !in_popup) {
+            self.link_sugg = None;
+            self.link_popup_rect = None;
+            return;
+        }
+        if focused {
+            // 한글 조합 중에는 egui가 조합 중인 글자를 본문에 넣고 그 구간을 선택으로 잡는다. 이때는 선택 끝을 커서로 본다.
+            let composing = self.body_composing;
+            let caret = out
+                .cursor_range
+                .filter(|r| composing || r.primary.index == r.secondary.index)
+                .map(|r| usize::from(r.primary.index).max(usize::from(r.secondary.index)));
+            let found = caret
+                .filter(|&c| !crate::textcrypt::caret_in_marker(&self.body, c))
+                .and_then(|c| crate::linksuggest::query_at(&self.body, c).map(|(s, q)| (c, s, q)));
+            let Some((caret, start, query)) = found else {
+                self.link_sugg = None;
+                self.link_popup_rect = None;
+                self.link_esc = None;
+                return;
+            };
+            if self.link_esc == Some(start) {
+                self.link_sugg = None;
+                self.link_popup_rect = None;
+                return;
+            }
+            let rev = self.db.rev();
+            if self.link_titles.0 != rev {
+                self.link_titles = (rev, self.db.link_titles().unwrap_or_default());
+                // 후보 옆에 보일 설명: 분류 경로(미분류는 생략)와 태그
+                let meta = self.db.link_meta().unwrap_or_default();
+                let mut hints = std::collections::HashMap::new();
+                for (id, title) in &self.link_titles.1 {
+                    let Some((_, cat, tags)) = meta.iter().find(|m| m.0 == *id) else { continue };
+                    let mut parts: Vec<String> = Vec::new();
+                    if cat.is_some() {
+                        parts.push(self.cat_path(*cat));
+                    }
+                    let tags: Vec<String> = tags.split_whitespace().map(|t| format!("#{t}")).collect();
+                    if !tags.is_empty() {
+                        parts.push(tags.join(" "));
+                    }
+                    if !parts.is_empty() {
+                        hints.insert(title.trim().to_string(), parts.join(" · "));
+                    }
+                }
+                self.link_hints = hints;
+            }
+            // 입력 조각·제목 목록(rev)·현재 문서가 그대로면 이전 후보를 다시 쓴다(매 프레임 5000개 제목을 훑지 않게)
+            let items = match &self.link_sugg {
+                Some(s) if s.query == query && s.rev == rev && s.cur == self.cur => s.items.clone(),
+                _ => crate::linksuggest::candidates(&self.link_titles.1, &query, self.cur, crate::linksuggest::MAX_ITEMS),
+            };
+            if items.is_empty() {
+                self.link_sugg = None;
+                self.link_popup_rect = None;
+                return;
+            }
+            let sel = match &self.link_sugg {
+                Some(s) if s.query == query => s.sel.min(items.len() - 1),
+                _ => 0,
+            };
+            self.link_sugg = Some(LinkSugg { start, caret, query, items, sel, rev, cur: self.cur });
+        }
+        let Some(s) = self.link_sugg.clone() else { return };
+        let pos = out.galley.pos_from_cursor(CCursor::new(s.caret)).translate(out.galley_pos.to_vec2()).left_bottom() + egui::vec2(0.0, 4.0);
+        let pressed = ctx.input(|i| i.pointer.primary_pressed());
+        let mut pick: Option<String> = None;
+        let hints = self.link_hints.clone();
+        #[allow(deprecated)]
+        let aid = egui::Id::new("link_suggest");
+        let area = egui::Area::new(aid).order(egui::Order::Foreground).fixed_pos(pos).show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.set_max_width(440.0);
+                for (i, t) in s.items.iter().enumerate() {
+                    // 제목 뒤에 분류·태그를 흐리고 작게 붙인다(같은 이름의 문서를 구분하기 쉽게)
+                    let font = egui::TextStyle::Button.resolve(ui.style());
+                    let mut job = egui::text::LayoutJob::default();
+                    job.append(t, 0.0, egui::TextFormat { font_id: font.clone(), color: egui::Color32::PLACEHOLDER, ..Default::default() });
+                    if let Some(h) = hints.get(t) {
+                        job.append(&format!("   {h}"), 0.0, egui::TextFormat { font_id: egui::FontId::new(font.size * 0.85, font.family.clone()), color: ui.visuals().weak_text_color(), ..Default::default() });
+                    }
+                    let r = ui.add(egui::Button::selectable(i == s.sel, job).truncate());
+                    if r.clicked() || (pressed && r.hovered()) {
+                        pick = Some(t.clone());
+                    }
+                }
+            });
+        });
+        self.link_popup_rect = Some(area.response.rect);
+        if let Some(t) = pick {
+            self.link_pick = Some((s.start, s.caret, t));
+            ctx.request_repaint();
+        }
+    }
+
     // ------------------------------------------------------------ 편집기 키
     fn editor_keys(&mut self, ctx: &egui::Context, id: egui::Id) {
         use egui::text::{CCursor, CCursorRange};
@@ -1593,6 +1799,21 @@ impl App {
             }
         });
         let ime_busy = composing_before || self.body_composing || ime_this_frame;
+        // `[[` 제목 후보가 떠 있으면 ↑↓·Enter·Tab·Esc는 목록이 먼저 쓴다(아래 들여쓰기·줄 이동·이어쓰기보다 앞).
+        if let Some(s) = self.link_sugg.clone().filter(|s| !ime_busy && a == b && s.caret == a && !s.items.is_empty()) {
+            let n = s.items.len();
+            if key_exact(ctx, Modifiers::NONE, Key::ArrowDown) {
+                if let Some(x) = self.link_sugg.as_mut() { x.sel = (s.sel + 1) % n; }
+            } else if key_exact(ctx, Modifiers::NONE, Key::ArrowUp) {
+                if let Some(x) = self.link_sugg.as_mut() { x.sel = (s.sel + n - 1) % n; }
+            } else if key_exact(ctx, Modifiers::NONE, Key::Enter) || key_exact(ctx, Modifiers::NONE, Key::Tab) {
+                self.link_pick = Some((s.start, s.caret, s.items[s.sel.min(n - 1)].clone()));
+            } else if key_exact(ctx, Modifiers::NONE, Key::Escape) {
+                self.link_esc = Some(s.start);
+                self.link_sugg = None;
+                self.link_popup_rect = None;
+            }
+        }
         // 편집 키 묶음: 들여쓰기·줄 이동/복제/삭제·페이지 이동 (한글 조합 중에는 건드리지 않는다)
         if !changed && !ime_busy {
             use crate::editkeys as ek;
@@ -2083,11 +2304,7 @@ impl App {
                     acts.push(Act::RemoveTag(tag));
                 }
             }
-            let r = ui.add_enabled(!self.cur_trashed, egui::TextEdit::singleline(&mut self.new_tag).hint_text("태그 추가").desired_width(90.0));
-            if r.lost_focus() && ctx.input(|i| i.key_pressed(Key::Enter)) && !self.new_tag.trim().is_empty() {
-                acts.push(Act::AddTag);
-                r.request_focus();
-            }
+            self.tag_input(ui, &ctx, acts);
         });
         ui.separator();
 
@@ -2110,6 +2327,7 @@ impl App {
         }
         self.editor_keys(&ctx, id);
         self.apply_edit_req(&ctx, id);
+        self.apply_link_pick(&ctx, id);
         self.find_keys(&ctx, id);
         self.find_bar(ui, id);
         self.goto_bar(ui, id);
@@ -2197,6 +2415,10 @@ impl App {
         let avail_h = ui.available_height();
         self.img.begin_frame();
         let (img_cache, db_ref) = (&mut self.img, &self.db);
+        // 타자기 모드: 글을 쓰거나 키로 움직일 때만 현재 줄을 가운데로(마우스 클릭·휠 스크롤은 그대로 둔다)
+        let typewriter = self.cfg.typewriter && editable;
+        let tw_prev = self.cursor_idx;
+        let tw_keys = ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Key { pressed: true, .. })));
         let sa = area
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -2224,6 +2446,16 @@ impl App {
                     let r = out.galley.pos_from_cursor(egui::text::CCursor::new(idx));
                     let rect = r.translate(out.galley_pos.to_vec2());
                     ui.scroll_to_rect(rect.expand2(egui::vec2(0.0, 28.0)), Some(egui::Align::TOP));
+                }
+                if typewriter {
+                    if let Some(cr) = out.cursor_range {
+                        let idx: usize = cr.primary.index.into();
+                        if out.response.changed() || (idx != tw_prev && tw_keys) {
+                            let r = out.galley.pos_from_cursor(cr.primary).translate(out.galley_pos.to_vec2());
+                            ui.scroll_to_rect(r, Some(egui::Align::Center));
+                        }
+                    }
+                    ui.add_space(avail_h * 0.5); // 문서 끝 줄도 가운데까지 올라올 수 있게 아래 여백
                 }
                 out
             });
@@ -2344,6 +2576,7 @@ impl App {
                 ctx.request_repaint();
             }
         }
+        self.link_suggest_ui(&ctx, id, &out, editable);
         // 마우스를 올린 곳이 누를 수 있는 곳이면 알려 준다: 체크박스는 손가락 모양, [[문서 링크]]·각주는 Ctrl을 누른 동안 손가락 모양
         // (Ctrl 없이 누르면 동작하지 않으므로, 누르지 않은 때는 "Ctrl+클릭" 안내 말풍선만 띄운다).
         if editable && out.response.hovered() {
@@ -2621,6 +2854,7 @@ impl App {
                     ui.checkbox(&mut self.cfg.wrap, "줄바꿈");
                     ui.checkbox(&mut self.cfg.auto_renumber, "숫자 목록 번호 자동 고침");
                     ui.checkbox(&mut self.cfg.hide_syntax, "커서가 없는 줄의 문법 기호 숨기기");
+                    ui.checkbox(&mut self.cfg.typewriter, "타자기 모드: 글을 쓸 때 현재 줄을 화면 가운데에 둠 (Ctrl+Alt+Y)");
                     ui.separator();
                     ui.label(egui::RichText::new("저장 방식").strong());
                     ui.horizontal(|ui| {
@@ -2978,10 +3212,22 @@ impl eframe::App for App {
         }
         if new { acts.push(Act::NewDoc); }
         if ctx.input(|i| i.modifiers.command && i.modifiers.alt && i.key_pressed(Key::T)) { acts.push(Act::Today); }
-        if find { self.cfg.sidebar = true; self.focus_search = true; }
+        if find { self.cfg.sidebar = true; self.focus_mode = false; self.focus_search = true; }
         if save && self.flush() { self.say("저장했습니다"); }
         if opts { self.show_options = true; }
-        if side { self.cfg.sidebar = !self.cfg.sidebar; }
+        if side {
+            if self.focus_mode { self.focus_mode = false; } else { self.cfg.sidebar = !self.cfg.sidebar; }
+        }
+        // 포커스 모드(양쪽 사이드바 숨김)·타자기 모드(현재 줄을 가운데에)
+        if ctx.input(|i| i.modifiers.command && i.modifiers.alt && !i.modifiers.shift && i.key_pressed(Key::F)) {
+            self.focus_mode = !self.focus_mode;
+            self.say(if self.focus_mode { "포커스 모드: 사이드바를 숨겼습니다 (Ctrl+Alt+F로 해제)" } else { "포커스 모드를 껐습니다" });
+        }
+        if ctx.input(|i| i.modifiers.command && i.modifiers.alt && !i.modifiers.shift && i.key_pressed(Key::Y)) {
+            self.cfg.typewriter = !self.cfg.typewriter;
+            self.graph_cfg_dirty = true; // 마우스를 놓은 뒤 설정 저장
+            self.say(if self.cfg.typewriter { "타자기 모드를 켰습니다" } else { "타자기 모드를 껐습니다" });
+        }
         if pin { if let Some(id) = self.cur { acts.push(Act::Pin(id)); } }
         if back { acts.push(Act::Back); }
         if fwd { acts.push(Act::Forward); }
@@ -3045,7 +3291,7 @@ impl eframe::App for App {
             self.graph_cfg_dirty = false;
         }
         // 연결 그래프: 사이드바가 열려 있을 때만 유지한다(레이아웃은 저장하지 않음).
-        if !((self.cfg.links_panel && self.cfg.right_mode != 1) || self.graph_window) {
+        if !((self.cfg.links_panel && !self.focus_mode && self.cfg.right_mode != 1) || self.graph_window) {
             self.graph = None;
         } else if self.graph.is_none() || self.graph_stale {
             self.rebuild_graph();
@@ -3079,19 +3325,21 @@ impl eframe::App for App {
         // 하단 상태바 (status_ui.rs)
         self.status_bar(ui);
 
-        if self.cfg.sidebar {
-            egui::Panel::left("side").default_size(290.0).size_range(220.0..=480.0).resizable(true).show(ui, |ui| {
-                self.side_panel(ui, &mut acts);
-            });
-        }
-        if self.cfg.links_panel {
-            egui::Panel::right("links").default_size(320.0).size_range(240.0..=640.0).resizable(true).show(ui, |ui| {
-                self.links_panel(ui, &mut acts);
-            });
-        }
-        egui::CentralPanel::default().show(ui, |ui| {
+        // 포커스 모드로 사이드바가 접히고 펴질 때는 천천히(0.6초) 움직인다. 다른 애니메이션은 그대로 두려고 이 구간에서만 바꾼다.
+        let base_anim = ctx.global_style().animation_time;
+        ctx.global_style_mut(|s| s.animation_time = 0.6);
+        let (mut side_open, mut links_open) = (self.cfg.sidebar && !self.focus_mode, self.cfg.links_panel && !self.focus_mode);
+        egui::Panel::left("side").default_size(290.0).size_range(220.0..=480.0).resizable(true).show_collapsible(ui, &mut side_open, |ui| {
+            self.side_panel(ui, &mut acts);
+        });
+        egui::Panel::right("links").default_size(320.0).size_range(240.0..=640.0).resizable(true).show_collapsible(ui, &mut links_open, |ui| {
+            self.links_panel(ui, &mut acts);
+        });
+        ctx.global_style_mut(|s| s.animation_time = base_anim);
+        let central = egui::CentralPanel::default().show(ui, |ui| {
             self.central(ui, &mut acts);
         });
+        self.mode_badge(&ctx, central.response.rect);
 
         if self.show_options {
             self.options_window(&ctx);

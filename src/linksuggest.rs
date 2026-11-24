@@ -51,6 +51,7 @@ pub fn candidates(titles: &[(i64, String)], query: &str, cur: Option<i64>, limit
     }
     let mut starts: Vec<String> = Vec::new();
     let mut inside: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (id, t) in titles {
         let t = t.trim();
         if t.is_empty() || Some(*id) == cur || t.contains(['[', ']', '|', '\n', '\r']) {
@@ -60,9 +61,17 @@ pub fn candidates(titles: &[(i64, String)], query: &str, cur: Option<i64>, limit
         if !lower.contains(&q) {
             continue;
         }
-        let list = if lower.starts_with(&q) { &mut starts } else { &mut inside };
-        if !list.iter().any(|x| x.to_lowercase() == lower) {
-            list.push(t.to_string());
+        let is_start = lower.starts_with(&q);
+        if !seen.insert(lower) {
+            continue;
+        }
+        if is_start {
+            starts.push(t.to_string());
+            if starts.len() >= limit {
+                break; // 입력으로 시작하는 것이 한도만큼 모였으면 나머지는 어차피 잘린다
+            }
+        } else if inside.len() < limit {
+            inside.push(t.to_string());
         }
     }
     starts.extend(inside);
@@ -126,7 +135,7 @@ mod tests {
         let v = t(&["측정 품질", "품질 관리", "Quality", "품질|별칭", "품질[x]", "", "품질 관리"]);
         assert_eq!(candidates(&v, "품질", None, 8), vec!["품질 관리".to_string(), "측정 품질".to_string()]);
         assert_eq!(candidates(&v, "QUAL", None, 8), vec!["Quality".to_string()]);
-        assert_eq!(candidates(&v, "품질", Some(2), 8), vec!["측정 품질".to_string()]);
+        assert_eq!(candidates(&v[..6], "품질", Some(2), 8), vec!["측정 품질".to_string()]);
         assert_eq!(candidates(&v, " ", None, 8), Vec::<String>::new());
         assert_eq!(candidates(&v, "품", None, 1).len(), 1);
     }

@@ -13,6 +13,7 @@ mod import;
 mod img;
 mod layout;
 mod linksuggest;
+mod tagsuggest;
 mod math;
 mod mdhtml;
 mod md;

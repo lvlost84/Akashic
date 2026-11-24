@@ -737,6 +737,19 @@ COMMIT;",
         v.collect::<Result<Vec<_>, _>>().map_err(e)
     }
 
+    /// 휴지통이 아닌 문서의 (id, 분류 번호, 태그를 공백으로 이은 글) — `[[` 후보 옆 설명용.
+    pub fn link_meta(&self) -> Res<Vec<(i64, Option<i64>, String)>> {
+        let mut st = self
+            .conn
+            .prepare(
+                "SELECT d.id, d.category_id, COALESCE((SELECT group_concat(t.name, ' ') FROM doc_tags dt JOIN tags t ON t.id=dt.tag_id WHERE dt.doc_id=d.id), '')
+                 FROM docs d WHERE d.trashed_at IS NULL AND d.title<>''",
+            )
+            .map_err(e)?;
+        let v = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map_err(e)?;
+        v.collect::<Result<Vec<_>, _>>().map_err(e)
+    }
+
     /// 모든 (id, 제목, 본문)을 훑는다 — 링크 그래프·내보내기용(휴지통 제외).
     pub fn all_docs(&self) -> Res<Vec<(i64, String, String)>> {
         let mut st = self.conn.prepare("SELECT id,title,body FROM docs WHERE trashed_at IS NULL").map_err(e)?;
@@ -1222,6 +1235,50 @@ mod tests {
         assert_eq!(db.list_docs(&filter("100%")).unwrap().len(), 0);
         assert_eq!(db.list_docs(&filter("a\"b")).unwrap().len(), 0);
         assert!(db.integrity_ok());
+    }
+
+    /// 5000문서의 `[[`·태그 후보 조회 비용(제목 목록·분류/태그 정보·후보 거르기). `cargo test --release perf_link_suggest -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn perf_link_suggest() {
+        let db = Db::open(&tmp("perf-link")).unwrap();
+        db.conn.execute_batch("BEGIN").unwrap();
+        for i in 0..5000 {
+            let id = db.new_doc(None).unwrap();
+            db.save_doc(id, &format!("품질 문서 {i}"), "본문").unwrap();
+            db.add_tag(id, &format!("태그{}", i % 200)).unwrap();
+        }
+        db.conn.execute_batch("COMMIT").unwrap();
+        let t = std::time::Instant::now();
+        let titles = db.link_titles().unwrap();
+        let t_titles = t.elapsed();
+        let t = std::time::Instant::now();
+        let meta = db.link_meta().unwrap();
+        let t_meta = t.elapsed();
+        let t = std::time::Instant::now();
+        let mut n = 0;
+        for _ in 0..100 {
+            n += crate::linksuggest::candidates(&titles, "품질", None, 8).len();
+        }
+        let t_cand = t.elapsed() / 100;
+        let t = std::time::Instant::now();
+        let tags = db.all_tags().unwrap();
+        let t_tags = t.elapsed();
+        let t = std::time::Instant::now();
+        for _ in 0..100 {
+            n += crate::tagsuggest::candidates(&tags, &[], "태그1", 8).len();
+        }
+        let t_tcand = t.elapsed() / 100;
+        // 앱이 rev가 바뀔 때 하는 설명 표 만들기(문서마다 meta를 찾는 O(n²) 방식)와 같은 비용
+        let t = std::time::Instant::now();
+        let mut hits = 0;
+        for (id, _) in &titles {
+            if meta.iter().any(|m| m.0 == *id) {
+                hits += 1;
+            }
+        }
+        let t_hints = t.elapsed();
+        println!("제목 {:?}({}건) / 분류·태그 {:?}({}건) / 후보 거르기 {:?}/회(n={n}) / 전체 태그 {:?}({}개) / 태그 후보 {:?}/회 / 설명 표 찾기 {:?}(hit {hits})", t_titles, titles.len(), t_meta, meta.len(), t_cand, t_tags, tags.len(), t_tcand, t_hints);
     }
 
     /// 5000문서(약 20MB) 검색·목록 성능. `cargo test --release -- --ignored --nocapture`
