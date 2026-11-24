@@ -14,7 +14,7 @@ impl App {
         }
         ui.add_space(4.0);
         ui.label(egui::RichText::new("단축키").strong());
-        ui.label("Ctrl+N 새 문서 · Ctrl+E 검색 · Ctrl+F 문서 안 찾기 · Ctrl+S 저장 · Ctrl+\\ 목록 접기 · Ctrl+, 옵션 · F1 도움말\nCtrl+B 굵게 · Ctrl+I 기울임 · Ctrl+Shift+X 취소선 · Ctrl+` 코드 · Ctrl+K 링크\nCtrl+Shift+D 즐겨찾기 · Alt+←/→ 뒤로/앞으로 · Ctrl+클릭 문서 링크 이동 · Ctrl+Alt+D 라이트/다크");
+        ui.label("Ctrl+N 새 문서 · Ctrl+E 검색 · Ctrl+F 문서 안 찾기 · Ctrl+S 저장 · Ctrl+\\ 목록 접기 · Ctrl+, 옵션 · F1 도움말\nCtrl+B 굵게 · Ctrl+I 기울임 · Ctrl+Shift+X 취소선 · Ctrl+` 코드 · Ctrl+K 링크\nCtrl+Shift+D 즐겨찾기 · Alt+←/→ 뒤로/앞으로 · Ctrl+클릭 문서 링크 이동·인터넷 링크 열기 · Ctrl+Alt+D 라이트/다크");
         ui.add_space(6.0);
         ui.separator();
         self.update_section(ui);

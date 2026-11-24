@@ -131,6 +131,16 @@ fn inline(job: &mut LayoutJob, s: &str, mut st: St, hide: bool, cx: &Cx) {
                 continue;
             }
         }
+        // 그냥 쓴 인터넷 주소(https://… · www.… · mailto:…)도 링크 색·밑줄로 보인다
+        if matches!(ch, 'h' | 'H' | 'w' | 'W' | 'm' | 'M') && !is_word(s[..i].chars().next_back()) {
+            if let Some(len) = bare_url_len(rest) {
+                flush!();
+                push(job, &rest[..len], &St { link: true, ..st }, cx);
+                i += len;
+                start = i;
+                continue;
+            }
+        }
         // 각주 참조 [^이름]
         if rest.starts_with("[^") {
             if let Some(end) = rest[2..].find(']') {
@@ -1036,6 +1046,182 @@ pub fn wiki_at(text: &str, char_idx: usize) -> Option<String> {
             return if is_external_target(title) { None } else { Some(title.to_string()) };
         }
         from = end;
+    }
+    None
+}
+
+/// 글자가 브라우저·메일 앱으로 열어도 되는 주소인지 확인하고 열 주소로 돌려준다.
+/// `http://`·`https://`·`mailto:`·`www.`(→ `https://`)만 허용하고, 공백·제어 문자·따옴표가 있으면 거절한다.
+pub fn safe_url(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    let t = t.strip_prefix('<').unwrap_or(t);
+    let t = t.strip_suffix('>').unwrap_or(t);
+    if t.is_empty() || t.chars().any(|c| c.is_whitespace() || c.is_control() || c == '"') {
+        return None;
+    }
+    let l = t.to_ascii_lowercase();
+    let has_rest = |p: &str| l.len() > p.len() && l.starts_with(p);
+    if has_rest("http://") || has_rest("https://") || has_rest("mailto:") {
+        Some(t.to_string())
+    } else if has_rest("www.") {
+        Some(format!("https://{t}"))
+    } else {
+        None
+    }
+}
+
+/// `s`가 맨 주소(`http://`·`https://`·`www.`·`mailto:`)로 시작하면 그 주소의 바이트 길이.
+/// 공백·`<>"[]`에서 끝나고, 끝의 문장 부호·강조 기호·짝 없는 `)`는 주소에서 뺀다. 편집창 표시와 클릭 판정이 같이 쓴다.
+pub fn bare_url_len(s: &str) -> Option<usize> {
+    let head: String = s.chars().take(8).collect::<String>().to_ascii_lowercase();
+    let Some(scheme) = ["http://", "https://", "www.", "mailto:"].iter().find(|p| head.starts_with(**p)).map(|p| p.len()) else {
+        return None;
+    };
+    let mut e = s.find(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '"' | '[' | ']')).unwrap_or(s.len());
+    while e > 0 {
+        let t = &s[..e];
+        let c = t.chars().next_back()?;
+        let unbalanced = c == ')' && t.matches('(').count() < t.matches(')').count();
+        if matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | '\'' | '*' | '~') || unbalanced {
+            e -= c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if e > scheme { Some(e) } else { None }
+}
+
+/// 한 줄 안에서 글자 위치 `col`(글자 수 기준)이 인터넷 링크 위면 그 주소. 인라인 코드 안은 링크가 아니다.
+fn url_in_line(line: &str, col: usize) -> Option<String> {
+    let blanked = blank_code_spans(line);
+    let ch: Vec<char> = blanked.chars().collect();
+    let n = ch.len();
+    // [[주소]] / [[주소|글]]
+    let mut i = 0;
+    while i + 1 < n {
+        if ch[i] == '[' && ch[i + 1] == '[' {
+            let close = (i + 2..n.saturating_sub(1)).find(|&k| ch[k] == ']' && ch[k + 1] == ']')?;
+            let end = close + 2;
+            if col >= i && col <= end {
+                let inner: String = ch[i + 2..close].iter().collect();
+                return safe_url(inner.split('|').next().unwrap_or(""));
+            }
+            i = end;
+            continue;
+        }
+        i += 1;
+    }
+    // [글](주소) · ![글](주소)
+    let mut i = 0;
+    while i + 1 < n {
+        if ch[i] == ']' && ch[i + 1] == '(' {
+            let open = (0..i).rev().find(|&k| ch[k] == '[');
+            let mut depth = 0i32;
+            let mut close = None;
+            for (k, c) in ch.iter().enumerate().skip(i + 1) {
+                match c {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = Some(k);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let (Some(open), Some(close)) = (open, close) {
+                if col >= open && col <= close + 1 {
+                    let inner: String = ch[i + 2..close].iter().collect();
+                    return safe_url(inner.split_whitespace().next().unwrap_or(""));
+                }
+                i = close + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    // 그냥 쓴 주소: https://… · http://… · www.… · mailto:…
+    let mut byte_of: Vec<usize> = blanked.char_indices().map(|(b, _)| b).collect();
+    byte_of.push(blanked.len());
+    let mut i = 0;
+    while i < n {
+        if i == 0 || !ch[i - 1].is_alphanumeric() {
+            if let Some(len) = bare_url_len(&blanked[byte_of[i]..]) {
+                let e = i + blanked[byte_of[i]..byte_of[i] + len].chars().count();
+                if col >= i && col <= e {
+                    return safe_url(&blanked[byte_of[i]..byte_of[i] + len]);
+                }
+                i = e.max(i + 1);
+                continue;
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// 문자 위치가 있는 줄과 줄 안 글자 위치. 코드 블록(``` · ~~~) 줄과 그 안은 링크가 아니므로 `None`.
+fn link_line_at(text: &str, char_idx: usize) -> Option<(&str, usize)> {
+    let mut base = 0;
+    let mut in_fence = false;
+    for line in text.split('\n') {
+        let t = line.trim_start();
+        let fence = t.starts_with("```") || t.starts_with("~~~");
+        if fence {
+            in_fence = !in_fence;
+        }
+        let n = line.chars().count();
+        if char_idx <= base + n {
+            return if fence || in_fence { None } else { Some((line, char_idx - base)) };
+        }
+        base += n + 1;
+    }
+    None
+}
+
+/// 문자 위치가 인터넷 링크(`https://…`, `www.…`, `mailto:…`, `[글](주소)`, `[[주소]]`) 위면 열 주소를 돌려준다.
+/// 코드 블록 안은 링크로 보지 않는다.
+pub fn url_at(text: &str, char_idx: usize) -> Option<String> {
+    let (line, col) = link_line_at(text, char_idx)?;
+    url_in_line(line, col)
+}
+
+/// 글자가 열어 볼 수 있는 내 PC·공유 폴더 경로(`C:\폴더\파일`, `C:/폴더`, `\\서버\공유\…`)인지 보고, 탐색기용으로 `\`로 고쳐 돌려준다.
+pub fn local_path(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    if t.is_empty() || t.chars().any(|c| c.is_control() || matches!(c, '"' | '<' | '>' | '|' | '*' | '?')) {
+        return None;
+    }
+    let b = t.as_bytes();
+    let drive = b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/');
+    let unc = t.starts_with("\\\\") && t.len() > 3 && !t.starts_with("\\\\\\");
+    if drive || unc {
+        Some(t.replace('/', "\\"))
+    } else {
+        None
+    }
+}
+
+/// 문자 위치가 `[[C:\경로]]` · `[[\\서버\공유|글]]` 같은 경로 링크 위면 그 경로. 코드 블록·인라인 코드 안은 제외.
+pub fn path_at(text: &str, char_idx: usize) -> Option<String> {
+    let (line, col) = link_line_at(text, char_idx)?;
+    let ch: Vec<char> = blank_code_spans(line).chars().collect();
+    let n = ch.len();
+    let mut i = 0;
+    while i + 1 < n {
+        if ch[i] == '[' && ch[i + 1] == '[' {
+            let close = (i + 2..n.saturating_sub(1)).find(|&k| ch[k] == ']' && ch[k + 1] == ']')?;
+            let end = close + 2;
+            if col >= i && col <= end {
+                let inner: String = ch[i + 2..close].iter().collect();
+                return local_path(inner.split('|').next().unwrap_or(""));
+            }
+            i = end;
+            continue;
+        }
+        i += 1;
     }
     None
 }
@@ -1994,5 +2180,100 @@ mod code_span_link_tests {
     fn wiki_links_skip_inline_code() {
         let t = "본문 [[진짜]] 와 `[[코드]]` 그리고 `a` [[또 진짜|글]]\n```\n[[펜스]]\n```";
         assert_eq!(wiki_links(t), vec!["진짜".to_string(), "또 진짜".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod url_tests {
+    use super::*;
+
+    fn at(t: &str, needle: &str, off: usize) -> Option<String> {
+        let b = t.find(needle).unwrap();
+        url_at(t, t[..b].chars().count() + off)
+    }
+
+    #[test]
+    fn bare_urls() {
+        let t = "참고: https://a.b/c?x=1&y=2. 끝";
+        assert_eq!(at(t, "https://", 3).as_deref(), Some("https://a.b/c?x=1&y=2"));
+        assert_eq!(at(t, "https://", 0).as_deref(), Some("https://a.b/c?x=1&y=2"));
+        assert_eq!(at(t, "참고", 0), None);
+        assert_eq!(at(t, "끝", 0), None);
+        assert_eq!(url_at("www.naver.com", 4).as_deref(), Some("https://www.naver.com"));
+        assert_eq!(url_at("메일 mailto:a@b.kr 로", 5).as_deref(), Some("mailto:a@b.kr"));
+        assert_eq!(url_at("(https://a.b/c) 괄호", 5).as_deref(), Some("https://a.b/c"));
+        assert_eq!(url_at("https://a.b/(x)", 5).as_deref(), Some("https://a.b/(x)"));
+        assert_eq!(url_at("**https://a.b**", 5).as_deref(), Some("https://a.b"));
+    }
+
+    #[test]
+    fn markdown_and_wiki_urls() {
+        let t = "앞 [홈페이지](https://example.com/p) 뒤";
+        assert_eq!(at(t, "홈페이지", 1).as_deref(), Some("https://example.com/p"));
+        assert_eq!(at(t, "example", 2).as_deref(), Some("https://example.com/p"));
+        assert_eq!(at(t, "앞", 0), None);
+        assert_eq!(at(t, "뒤", 0), None);
+        assert_eq!(url_at("[a](https://x.y \"제목\")", 1).as_deref(), Some("https://x.y"));
+        assert_eq!(url_at("[[https://x.y|보기]]", 5).as_deref(), Some("https://x.y"));
+        assert_eq!(url_at("[[진짜 문서]]", 4), None);
+        assert_eq!(url_at("[a](상대/경로.md)", 1), None);
+    }
+
+    #[test]
+    fn rejects_unsafe_and_code() {
+        assert_eq!(safe_url("javascript:alert(1)"), None);
+        assert_eq!(safe_url("file:///C:/x.exe"), None);
+        assert_eq!(safe_url("https://"), None);
+        assert_eq!(safe_url("https://a b"), None);
+        assert_eq!(safe_url("<https://a.b>").as_deref(), Some("https://a.b"));
+        assert_eq!(url_at("`https://a.b`", 5), None);
+        assert_eq!(url_at("[x](javascript:alert(1))", 1), None);
+    }
+
+    #[test]
+    fn multi_line_and_korean_positions() {
+        let t = "가나다\n둘째 줄 https://a.b 끝\n셋째";
+        let b = t.find("https").unwrap();
+        let ci = t[..b].chars().count();
+        assert_eq!(url_at(t, ci + 2).as_deref(), Some("https://a.b"));
+        assert_eq!(url_at(t, 1), None);
+        assert_eq!(url_at(t, t.chars().count()), None);
+    }
+
+    #[test]
+    fn code_blocks_are_not_links() {
+        let t = "앞 https://a.b\n```\nhttps://c.d\n[[C:\\x\\y]]\n```\n뒤 https://e.f";
+        let ci = |needle: &str| t[..t.find(needle).unwrap()].chars().count() + 3;
+        assert_eq!(url_at(t, ci("https://a.b")).as_deref(), Some("https://a.b"));
+        assert_eq!(url_at(t, ci("https://c.d")), None);
+        assert_eq!(path_at(t, ci("[[C:")), None);
+        assert_eq!(url_at(t, ci("https://e.f")).as_deref(), Some("https://e.f"));
+        let t2 = "~~~\nhttps://c.d\n~~~";
+        assert_eq!(url_at(t2, 6), None);
+    }
+
+    #[test]
+    fn local_paths() {
+        assert_eq!(local_path("C:/문서/a b.docx").as_deref(), Some("C:\\문서\\a b.docx"));
+        assert_eq!(local_path("\\\\srv\\공유\\x").as_deref(), Some("\\\\srv\\공유\\x"));
+        assert_eq!(local_path("C:"), None);
+        assert_eq!(local_path("상대/경로"), None);
+        assert_eq!(local_path("C:\\a\"b"), None);
+        assert_eq!(local_path("\\\\\\x"), None);
+        let t = "앞 [[C:\\보고서\\a.docx|파일]] 뒤";
+        let ci = t[..t.find("보고서").unwrap()].chars().count();
+        assert_eq!(path_at(t, ci).as_deref(), Some("C:\\보고서\\a.docx"));
+        assert_eq!(path_at(t, 0), None);
+        assert_eq!(path_at("[[진짜 문서]]", 4), None);
+        assert_eq!(path_at("`[[C:\\x\\y]]`", 5), None);
+    }
+
+    #[test]
+    fn bare_url_len_trims_punctuation() {
+        assert_eq!(bare_url_len("https://a.b/c). 끝"), Some(13));
+        assert_eq!(bare_url_len("https://a.b/(x) 끝"), Some(15));
+        assert_eq!(bare_url_len("WWW.a.kr,"), Some(8));
+        assert_eq!(bare_url_len("http:// x"), None);
+        assert_eq!(bare_url_len("글자"), None);
     }
 }

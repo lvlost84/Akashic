@@ -6,6 +6,7 @@ mod index_ui;
 mod extras_ui;
 mod transfer_ui;
 mod attach_ui;
+mod link_ui;
 mod secret_ui;
 mod export_ui;
 mod find_ui;
@@ -402,6 +403,10 @@ enum Act {
     Attach(Option<(usize, usize)>),
     /// 첨부 파일 열기(해시, 이름)
     OpenFile(String, String),
+    /// 인터넷 링크를 브라우저로 열기
+    OpenUrl(String),
+    /// 경로 링크를 탐색기에서 선택해 보여 주기
+    ShowPath(String),
     ExportHtml,
     ExportPdf,
     Export,
@@ -501,6 +506,10 @@ pub struct App {
     edit_sel: Option<(usize, usize)>,
     /// 마지막 우클릭 순간의 선택
     menu_sel: (usize, usize),
+    /// 마지막 우클릭 자리에 있던 인터넷 링크 주소(없으면 None)
+    menu_url: Option<String>,
+    /// 마지막 우클릭 자리에 있던 경로 링크(`[[C:\…]]`)
+    menu_path: Option<String>,
     /// 편집창이 포커스를 가졌던 마지막 프레임의 선택(툴바 메뉴·대화상자를 누르면 포커스와 함께 선택이 풀리므로)
     last_sel: (usize, usize),
     /// 공백 정리가 마크다운 구조(목록 기호·표·코드 블록)를 건드리지 않게 함
@@ -653,6 +662,8 @@ impl App {
             edit_req: None,
             edit_sel: None,
             menu_sel: (0, 0),
+            menu_url: None,
+            menu_path: None,
             last_sel: (0, 0),
             respace_md: true,
             col: Default::default(),
@@ -1067,6 +1078,8 @@ impl App {
                 Act::KeyImport => self.key_import = Some(String::new()),
                 Act::Attach(sel) => self.attach_file(sel),
                 Act::OpenFile(h, n) => self.open_attachment(&h, &n),
+                Act::OpenUrl(u) => self.open_url(&u),
+                Act::ShowPath(p) => self.show_in_folder(&p),
                 Act::ExportHtml => self.export_html(),
                 Act::ExportPdf => self.export_pdf(),
                 Act::FromTemplate(i) => self.new_from_template(i),
@@ -2235,11 +2248,35 @@ impl App {
             let ed = !self.cur_trashed;
             if ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Secondary)) {
                 self.menu_sel = Self::sel_range(&ctx, id); // 우클릭 순간의 선택(복원 뒤)
+                self.menu_url = ctx.input(|i| i.pointer.interact_pos()).filter(|p| out.response.rect.contains(*p)).and_then(|p| {
+                    let at: usize = out.galley.cursor_from_pos(p - out.galley_pos).index.into();
+                    md::url_at(&self.body, at)
+                });
+                self.menu_path = ctx.input(|i| i.pointer.interact_pos()).filter(|p| out.response.rect.contains(*p)).and_then(|p| {
+                    let at: usize = out.galley.cursor_from_pos(p - out.galley_pos).index.into();
+                    md::path_at(&self.body, at)
+                });
             }
             let snap = self.menu_sel;
             let has_sel = snap.0 != snap.1;
+            let link_url = self.menu_url.clone();
+            let link_path = self.menu_path.clone();
+            let dim = self.theme.dim;
             out.response.context_menu(|ui| {
                 use crate::icons::{btn_ex, Icon};
+                // 인터넷 링크 위에서 우클릭하면 맨 위에 바로 보인다(하위 메뉴 없이)
+                if let Some(u) = link_url.as_deref() {
+                    ui.label(egui::RichText::new(link_ui::short_url(u, 48)).small().color(dim));
+                    if btn_ex(ui, Icon::Attach, "브라우저로 열기", true, None).on_hover_text(u).clicked() { acts.push(Act::OpenUrl(u.to_string())); ui.close(); }
+                    if btn_ex(ui, Icon::Copy, "링크 복사", true, None).on_hover_text(u).clicked() { ui.ctx().copy_text(u.to_string()); acts.push(Act::Say("링크를 복사했습니다".into())); ui.close(); }
+                    ui.separator();
+                }
+                if let Some(p) = link_path.as_deref() {
+                    ui.label(egui::RichText::new(link_ui::short_url(p, 48)).small().color(dim));
+                    if btn_ex(ui, Icon::Attach, "폴더에서 보기", true, None).on_hover_text("탐색기에서 이 파일(폴더)을 선택해 보여 줍니다. 파일은 실행하지 않습니다").clicked() { acts.push(Act::ShowPath(p.to_string())); ui.close(); }
+                    if btn_ex(ui, Icon::Copy, "경로 복사", true, None).on_hover_text(p).clicked() { ui.ctx().copy_text(p.to_string()); acts.push(Act::Say("경로를 복사했습니다".into())); ui.close(); }
+                    ui.separator();
+                }
                 if btn_ex(ui, Icon::Export, "잘라내기", ed && has_sel, None).clicked() { acts.push(Act::EditAt(snap, EditReq::Cut)); ui.close(); }
                 if btn_ex(ui, Icon::Copy, "복사", has_sel, None).clicked() { acts.push(Act::EditAt(snap, EditReq::Copy)); ui.close(); }
                 if btn_ex(ui, Icon::Import, "붙여넣기", ed, None).clicked() { acts.push(Act::EditAt(snap, EditReq::Paste)); ui.close(); }
@@ -2314,11 +2351,12 @@ impl App {
                 let hidx: usize = out.galley.cursor_from_pos(p - out.galley_pos).index.into();
                 if md::is_checkbox_at(&self.body, hidx) {
                     ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
-                } else if md::wiki_at(&self.body, hidx).is_some() || md::footnote_jump(&self.body, hidx).is_some() || md::file_at(&self.body, hidx).is_some() {
+                } else if md::wiki_at(&self.body, hidx).is_some() || md::footnote_jump(&self.body, hidx).is_some() || md::file_at(&self.body, hidx).is_some() || md::url_at(&self.body, hidx).is_some() || md::path_at(&self.body, hidx).is_some() {
                     if ctx.input(|i| i.modifiers.command) {
                         ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
                     } else {
-                        let _ = egui::Response::clone(&out.response).on_hover_text("Ctrl+클릭: 이동");
+                        let tip = if md::url_at(&self.body, hidx).is_some() { "Ctrl+클릭: 브라우저로 열기" } else if md::path_at(&self.body, hidx).is_some() { "Ctrl+클릭: 폴더에서 보기" } else { "Ctrl+클릭: 이동" };
+                        let _ = egui::Response::clone(&out.response).on_hover_text(tip);
                     }
                 }
             }
@@ -2330,6 +2368,10 @@ impl App {
                     acts.push(Act::Follow(title));
                 } else if let Some((h, n)) = md::file_at(&self.body, self.cursor_idx) {
                     acts.push(Act::OpenFile(h, n));
+                } else if let Some(u) = md::url_at(&self.body, self.cursor_idx) {
+                    acts.push(Act::OpenUrl(u));
+                } else if let Some(p) = md::path_at(&self.body, self.cursor_idx) {
+                    acts.push(Act::ShowPath(p));
                 } else if let Some(line) = md::footnote_jump(&self.body, self.cursor_idx) {
                     self.goto_line = Some(line);
                     ctx.request_repaint();
