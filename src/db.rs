@@ -591,11 +591,14 @@ COMMIT;",
         Ok(())
     }
 
+    /// 링크 제목으로 문서를 찾는다. 링크 쪽은 앞뒤 공백을 지우고 읽으므로, 저장된 제목에 앞뒤 공백(스페이스·탭·줄바꿈·전각 공백)이 붙어 있어도 맞게 비교한다.
     pub fn find_by_title(&self, title: &str) -> Res<Option<i64>> {
         self.conn
             .query_row(
-                "SELECT id FROM docs WHERE trashed_at IS NULL AND title=?1 COLLATE NOCASE ORDER BY updated DESC LIMIT 1",
-                [title],
+                "SELECT id FROM docs WHERE trashed_at IS NULL
+                 AND trim(title, ' '||char(9)||char(10)||char(13)||char(12288)) = ?1 COLLATE NOCASE
+                 ORDER BY updated DESC LIMIT 1",
+                [title.trim()],
                 |r| r.get(0),
             )
             .optional()
@@ -1107,6 +1110,19 @@ mod tests {
 
     fn filter(q: &str) -> Filter {
         Filter { view: View::All, tags: vec![], query: q.into(), sort: Sort::Updated }
+    }
+
+    #[test]
+    fn find_by_title_ignores_surrounding_whitespace() {
+        let db = Db::open(&tmp("findtitle")).unwrap();
+        let a = db.new_doc(None).unwrap();
+        db.save_doc(a, "11 17 성적서 ", "x").unwrap();
+        let b = db.new_doc(None).unwrap();
+        db.save_doc(b, "\t측정기 점검\u{3000}", "y").unwrap();
+        assert_eq!(db.find_by_title("11 17 성적서").unwrap(), Some(a));
+        assert_eq!(db.find_by_title(" 11 17 성적서 ").unwrap(), Some(a));
+        assert_eq!(db.find_by_title("측정기 점검").unwrap(), Some(b));
+        assert_eq!(db.find_by_title("없는 문서").unwrap(), None);
     }
 
     #[test]
