@@ -605,6 +605,27 @@ COMMIT;",
             .map_err(e)
     }
 
+    /// 다른 문서(휴지통 제외)가 이미 이 제목(앞뒤 공백·대소문자 무시)을 쓰고 있는지. 빈 제목은 겹쳐도 된다.
+    pub fn title_taken(&self, id: i64, title: &str) -> Res<bool> {
+        let t = title.trim();
+        if t.is_empty() {
+            return Ok(false);
+        }
+        self.conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM docs WHERE trashed_at IS NULL AND id<>?1
+                 AND trim(title, ' '||char(9)||char(10)||char(13)||char(12288)) = ?2 COLLATE NOCASE)",
+                params![id, t],
+                |r| r.get::<_, bool>(0),
+            )
+            .map_err(e)
+    }
+
+    /// 저장된 제목(없으면 빈 글).
+    pub fn stored_title(&self, id: i64) -> String {
+        self.conn.query_row("SELECT title FROM docs WHERE id=?", [id], |r| r.get(0)).unwrap_or_default()
+    }
+
     // ---------- 목록·검색 ----------
     pub fn list_docs(&self, f: &Filter) -> Res<Vec<DocRow>> {
         let mut sql = String::from(
@@ -681,15 +702,17 @@ COMMIT;",
             return Ok(vec![]);
         }
         let esc = like_escape(t);
+        // 인덱스 문서는 모든 문서를 가리키는 허브라서 "이 문서를 가리키는 문서"에서 뺀다.
+        let index = self.index_doc().unwrap_or(-1);
         let mut st = self
             .conn
             .prepare(
-                "SELECT id, title FROM docs WHERE trashed_at IS NULL AND id<>?1
+                "SELECT id, title FROM docs WHERE trashed_at IS NULL AND id<>?1 AND id<>?4
                  AND (body LIKE ?2 ESCAPE '\\' OR body LIKE ?3 ESCAPE '\\') ORDER BY updated DESC LIMIT 200",
             )
             .map_err(e)?;
         let v = st
-            .query_map(params![id, format!("%[[{esc}]]%"), format!("%[[{esc}|%")], |r| Ok((r.get(0)?, r.get(1)?)))
+            .query_map(params![id, format!("%[[{esc}]]%"), format!("%[[{esc}|%"), index], |r| Ok((r.get(0)?, r.get(1)?)))
             .map_err(e)?;
         v.collect::<Result<Vec<_>, _>>().map_err(e)
     }
@@ -699,6 +722,12 @@ COMMIT;",
         let mut st = self.conn.prepare("SELECT id, category_id FROM docs WHERE trashed_at IS NULL AND category_id IS NOT NULL").map_err(e)?;
         let v = st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))).map_err(e)?;
         v.collect::<Result<HashMap<_, _>, _>>().map_err(e)
+    }
+
+    /// 링크 그래프용 문서 목록: 휴지통과 인덱스 문서를 뺀다.
+    pub fn graph_docs(&self) -> Res<Vec<(i64, String, String)>> {
+        let index = self.index_doc();
+        Ok(self.all_docs()?.into_iter().filter(|d| Some(d.0) != index).collect())
     }
 
     /// 모든 (id, 제목, 본문)을 훑는다 — 링크 그래프·내보내기용(휴지통 제외).
@@ -1110,6 +1139,44 @@ mod tests {
 
     fn filter(q: &str) -> Filter {
         Filter { view: View::All, tags: vec![], query: q.into(), sort: Sort::Updated }
+    }
+
+    #[test]
+    fn title_taken_ignores_case_space_trash_and_self() {
+        let db = Db::open(&tmp("titletaken")).unwrap();
+        let a = db.new_doc(None).unwrap();
+        db.save_doc(a, "측정기 점검 ", "x").unwrap();
+        let b = db.new_doc(None).unwrap();
+        db.save_doc(b, "Report", "y").unwrap();
+        let c = db.new_doc(None).unwrap();
+        assert!(db.title_taken(c, "측정기 점검").unwrap());
+        assert!(db.title_taken(c, " report ").unwrap());
+        assert!(!db.title_taken(a, "측정기 점검").unwrap(), "자기 자신은 제외");
+        assert!(!db.title_taken(c, "").unwrap(), "빈 제목은 겹쳐도 된다");
+        assert!(!db.title_taken(c, "다른 제목").unwrap());
+        assert_eq!(db.stored_title(a), "측정기 점검 ");
+        db.trash(b).unwrap();
+        assert!(!db.title_taken(c, "report").unwrap(), "휴지통 문서는 제외");
+    }
+
+    #[test]
+    fn index_doc_hidden_from_graph_and_backlinks() {
+        let db = Db::open(&tmp("indexhidden")).unwrap();
+        let t = db.new_doc(None).unwrap();
+        db.save_doc_plain(t, "대상", "").unwrap();
+        let o = db.new_doc(None).unwrap();
+        db.save_doc_plain(o, "다른 글", "[[대상]]").unwrap();
+        let ix = db.new_doc(None).unwrap();
+        db.save_doc_plain(ix, "문서 지도", "- [[대상]]\n- [[다른 글]]").unwrap();
+        assert_eq!(db.backlinks(t, "대상").unwrap().len(), 2);
+        assert_eq!(db.graph_docs().unwrap().len(), 3);
+        db.set_index_doc(Some(ix)).unwrap();
+        let bl = db.backlinks(t, "대상").unwrap();
+        assert_eq!(bl.len(), 1);
+        assert_eq!(bl[0].0, o);
+        let g = db.graph_docs().unwrap();
+        assert_eq!(g.len(), 2);
+        assert!(g.iter().all(|d| d.0 != ix));
     }
 
     #[test]

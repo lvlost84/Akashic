@@ -524,6 +524,8 @@ pub struct App {
     page_scroll: Option<Vec2>,
 
     cursor_line: Option<usize>,
+    /// 지금 제목을 다른 문서가 이미 쓰고 있다(이 제목은 저장하지 않고 안내를 띄운다)
+    title_dup: bool,
     cursor_idx: usize,
     galley_cache: Option<(u64, Arc<egui::Galley>)>,
     /// 글꼴을 바꾼 패스 번호. egui는 새 글꼴을 다음 패스부터 쓰므로, 그 뒤에 한 번 더 글자 배치 캐시를 비운다.
@@ -666,6 +668,7 @@ impl App {
             ctx_for_windows: None,
             page_scroll: None,
             cursor_line: None,
+            title_dup: false,
             cursor_idx: 0,
             galley_cache: None,
             font_swap_pass: None,
@@ -815,7 +818,10 @@ impl App {
                     return false;
                 }
             };
-            match self.db.save_doc(id, &self.title, &stored) {
+            // 다른 문서와 제목이 같으면 제목은 예전 것을 두고 본문만 저장한다(링크가 엉뚱한 문서로 가는 것을 막는다).
+            self.title_dup = self.db.title_taken(id, &self.title).unwrap_or(false);
+            let title_to_save = if self.title_dup { self.db.stored_title(id) } else { self.title.clone() };
+            match self.db.save_doc(id, &title_to_save, &stored) {
                 Ok(true) => {
                     self.list_dirty = true;
                     self.ref_rev += 1;
@@ -876,6 +882,7 @@ impl App {
                 self.cur = Some(d.id);
                 self.cfg.last_doc = d.id; // 다음에 시작할 때 이 문서를 다시 연다(설정은 닫을 때 저장)
                 self.title = d.title;
+                self.title_dup = self.db.title_taken(d.id, &self.title).unwrap_or(false);
                 self.body = self.reveal_body(&d.body);
                 self.cur_trashed = d.trashed;
                 self.cur_pinned = d.pinned;
@@ -907,21 +914,31 @@ impl App {
     fn graph_signature(&self) -> u64 {
         let mut h = DefaultHasher::new();
         self.cur.hash(&mut h);
+        self.db.index_doc().hash(&mut h);
         self.title.trim().to_lowercase().hash(&mut h);
         md::wiki_links(&self.body).hash(&mut h);
         h.finish()
     }
 
+    /// 그래프에서 가운데로 삼을 문서(인덱스 문서는 그래프에 나오지 않으므로 없음).
+    fn graph_focus_id(&self) -> Option<i64> {
+        match (self.cur, self.db.index_doc()) {
+            (Some(c), Some(i)) if c == i => None,
+            (c, _) => c,
+        }
+    }
+
     fn rebuild_graph(&mut self) {
-        match self.db.all_docs() {
+        match self.db.graph_docs() {
             Ok(docs) => {
                 let cats = self.db.doc_categories().unwrap_or_default();
                 let g = Graph::build(&docs, &cats, self.cur, self.graph.as_ref(), &self.cfg.graph);
                 self.graph = Some(g);
                 if self.cur.is_some() {
                     let t = self.title.clone();
+                    let fid = self.graph_focus_id();
                     if let Some(g) = self.graph.as_mut() {
-                        g.focus(self.cur, &t);
+                        g.focus(fid, &t);
                     }
                 }
             }
@@ -2036,6 +2053,13 @@ impl App {
         );
         if tr.changed() {
             self.last_edit.get_or_insert_with(Instant::now);
+            self.title_dup = self.db.title_taken(cur, &self.title).unwrap_or(false);
+        }
+        if self.title_dup && !self.cur_trashed {
+            ui.colored_label(
+                egui::Color32::from_rgb(0xd9, 0x4a, 0x3d),
+                "같은 제목의 문서가 이미 있습니다. 제목을 바꿔 주세요(예: \"제목 (2)\"). 바꾸기 전까지 이 제목은 저장되지 않고 본문만 저장됩니다.",
+            );
         }
 
         // 태그 + 분류 경로
@@ -2986,8 +3010,9 @@ impl eframe::App for App {
         } else if self.graph_cur != self.cur {
             self.graph_cur = self.cur;
             let t = self.title.clone();
+            let fid = self.graph_focus_id();
             if let Some(g) = self.graph.as_mut() {
-                g.focus(self.cur, &t);
+                g.focus(fid, &t);
             }
             self.graph_sig = self.graph_signature();
         }

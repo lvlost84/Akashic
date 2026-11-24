@@ -16,6 +16,8 @@ impl App {
         match self.db.set_index_doc(on.then_some(doc)) {
             Ok(()) => {
                 self.index_win.open = false;
+                self.graph_stale = true; // 인덱스 문서는 그래프·백링크에서 빠지므로 다시 만든다
+                self.compute_links();
                 self.say(if on {
                     "이 문서를 인덱스로 지정했습니다. 새 문서에 제목이 생기면 알맞은 섹션에 [[링크]]를 덧붙입니다"
                 } else {
