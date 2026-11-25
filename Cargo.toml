@@ -2,6 +2,7 @@
 name = "akashic"
 version = "2.26.0"
 edition = "2024"
+license = "Apache-2.0"
 
 [dependencies]
 ttf-parser = "0.25"

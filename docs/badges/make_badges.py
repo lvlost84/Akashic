@@ -79,4 +79,5 @@ if __name__ == "__main__":
     badge("sync.svg", "동기화", "NAS WebDAV · 종단간 암호화", PURPLE)
     badge("ai.svg", "AI 연동", "MCP 서버 내장", ORANGE)
     badge("built.svg", "제작", "Rust · egui", "#8a3b12")
-    print("배지 7개를 만들었습니다:", OUT)
+    badge("license.svg", "라이선스", "Apache-2.0", "#c0392b")
+    print("배지 8개를 만들었습니다:", OUT)

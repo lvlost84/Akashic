@@ -12,6 +12,7 @@
   <img src="docs/badges/sync.svg" alt="동기화: NAS WebDAV · 종단간 암호화">
   <img src="docs/badges/ai.svg" alt="AI 연동: MCP 서버 내장">
   <img src="docs/badges/built.svg" alt="제작: Rust · egui">
+  <a href="LICENSE"><img src="docs/badges/license.svg" alt="라이선스: Apache-2.0"></a>
 </p>
 
 ## 주요 기능
@@ -46,5 +47,9 @@ cargo test --release
 ```
 릴리스는 `Cargo.toml`의 `version`을 올리고 커밋한 뒤 `git tag v2.12.0` → `git push origin main v2.12.0`을 하면 GitHub Actions가 시험·빌드를 거쳐 `Akashic.exe`와 `SHA256SUMS`를 Releases에 올립니다. 업데이트 확인은 `AKASHIC_REPO` 환경변수가 설정된 빌드에서만 켜집니다.
 
-## 기록·라이선스
-개발 기록은 [DEVLOG.md](DEVLOG.md), 사용한 오픈소스 목록은 빌드 때 자동 생성되는 `LICENSE.md`에 있습니다.
+## 라이선스
+[Apache License 2.0](LICENSE)입니다. 복사·수정·재배포·상업적 이용이 모두 가능하며, 재배포할 때 라이선스 전문과 고지를 함께 두어야 합니다. 보증은 없습니다(AS IS).
+사용한 오픈소스(모두 MIT·Apache-2.0 등 허용적 라이선스)의 목록은 빌드 때 자동 생성되는 `LICENSE.md`에 있습니다.
+
+## 기록
+개발 기록은 [DEVLOG.md](DEVLOG.md)에 있습니다.

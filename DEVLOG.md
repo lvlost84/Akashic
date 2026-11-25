@@ -17,6 +17,10 @@ KnowVault(WPF)를 Rust + eframe/egui 0.37 + rusqlite로 다시 만드는 프로�
 
 ## 기록
 
+### 2026-11-25 (라이선스 Apache-2.0 추가, 커밋 전)
+- 저장소에 자체 라이선스가 없어 다른 사람이 쓸 수 있는지 알 수 없었다. 사용한 오픈소스(`LICENSE.md`)는 전부 MIT·Apache 등 허용적 라이선스(self_cell은 Apache OR GPL 이중이라 Apache 선택)여서 어느 것이든 가능했고, **Apache-2.0**으로 정함(사용자가 "라이선스 파일을 보고 판단"하라고 맡김). 저작권자 이름을 적지 말라는 요청이라, 표준 전문을 고치지 않고 그대로 둠(부록의 `[name of copyright owner]` 자리표시자 그대로) — MIT는 저작권자 이름 줄이 필요해서 제외.
+- 루트 `LICENSE`(표준 전문, GitHub이 라이선스로 인식하는 파일), `Cargo.toml`의 `license = "Apache-2.0"`, README "라이선스" 구역과 배지(`docs/badges/license.svg`) 추가. 빌드 때 자동 생성되는 `LICENSE.md`(사용한 오픈소스 목록)는 그대로. **미확인**: GitHub 저장소 첫 화면 오른쪽의 라이선스 표시(푸시 후 인식 여부). 알려 둘 점: 코드를 AI가 작성했으므로 저작권 귀속은 법적으로 불확실할 수 있어, 필요하면 전문가 확인 권장.
+
 ### 2026-11-25 (README 배지, 커밋 전)
 - README 맨 위에 다운로드 단추와 배지 6개(운영체제·설치·저장·동기화·AI 연동·제작)를 추가. 외부 서비스(shields.io) 없이 `docs/badges/*.svg`를 쓰고, `docs/badges/make_badges.py`로 다시 만든다(문구·색은 이 파일 맨 위에서 바꿈). 한글 글꼴이 없는 환경에서도 `textLength`로 상자 밖으로 넘치지 않게 함. Edge 헤드리스로 밝은·어두운 배경 모두 눈으로 확인. **미확인**: GitHub 페이지에서의 실제 모양(푸시 후).
 
