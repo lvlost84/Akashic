@@ -297,13 +297,33 @@ fn heading_level(line: &str) -> Option<usize> {
     if (1..=6).contains(&n) { Some(n) } else { None }
 }
 
-fn is_hr(line: &str) -> bool {
+/// 제목 줄이면 (수준, 기호 뒤 글). 화면과 같은 규칙: 줄 맨 앞의 `#` 1~6개이고, 바로 뒤 공백 하나는 기호에 속한다.
+pub fn heading_parts(line: &str) -> Option<(usize, &str)> {
+    let lv = heading_level(line)?;
+    let sp = usize::from(line[lv..].starts_with(' '));
+    Some((lv, &line[lv + sp..]))
+}
+
+/// `i`번 줄이 여러 줄 수식의 여는 `$$`(그 줄에는 `$$`만 있다)이면, 닫는 `$$`의 줄 번호.
+/// 빈 줄·코드 울타리를 먼저 만나면 짝이 없는 것으로 보고(문서 뒤쪽을 삼키지 않는다) `None`.
+pub fn math_fence_end(lines: &[&str], i: usize) -> Option<usize> {
+    if lines.get(i)?.trim() != "$$" {
+        return None;
+    }
+    let mut j = i + 1;
+    while j < lines.len() && lines[j].trim() != "$$" && !lines[j].trim().is_empty() && !is_fence_line(lines[j]) {
+        j += 1;
+    }
+    (j < lines.len() && lines[j].trim() == "$$").then_some(j)
+}
+
+pub fn is_hr(line: &str) -> bool {
     let t = line.trim();
     t.len() >= 3 && ["-", "*", "_"].iter().any(|c| t.chars().all(|x| c.starts_with(x) || x == ' ') && t.chars().filter(|x| *x != ' ').count() >= 3)
 }
 
 /// 목록 기호 길이(들여쓰기 포함)를 돌려준다.
-fn list_marker_len(line: &str) -> Option<usize> {
+pub fn list_marker_len(line: &str) -> Option<usize> {
     let ind = line.len() - line.trim_start().len();
     let r = &line[ind..];
     if r.starts_with("- ") || r.starts_with("* ") || r.starts_with("+ ") {
@@ -672,19 +692,13 @@ pub fn scan_blocks(text: &str) -> Vec<Block> {
                 }
             }
         }
-        if line.trim() == "$$" {
-            // 여러 줄 수식: 다음 `$$`만 있는 줄까지. 빈 줄·코드 펜스를 만나면 짝이 없는 것으로 보고(문서 뒤쪽을 삼키지 않는다) 그냥 글로 둔다.
-            let mut j = i + 1;
-            while j < lines.len() && lines[j].trim() != "$$" && !lines[j].trim().is_empty() && !is_fence_line(lines[j]) {
-                j += 1;
+        // 여러 줄 수식: 다음 `$$`만 있는 줄까지. 짝이 없으면 그냥 글로 둔다.
+        if let Some(j) = math_fence_end(&lines, i) {
+            if let Some(node) = crate::math::parse_multi(&lines[i + 1..j].join(" ")) {
+                out.push(Block { kind: BlockKind::Math { node }, start: i, end: j });
             }
-            if j < lines.len() && lines[j].trim() == "$$" {
-                if let Some(node) = crate::math::parse_multi(&lines[i + 1..j].join(" ")) {
-                    out.push(Block { kind: BlockKind::Math { node }, start: i, end: j });
-                }
-                i = j + 1; // 틀린 수식이어도 닫는 `$$`가 다음 수식의 여는 줄이 되지 않게 한다
-                continue;
-            }
+            i = j + 1; // 틀린 수식이어도 닫는 `$$`가 다음 수식의 여는 줄이 되지 않게 한다
+            continue;
         }
         if heading_level(line).is_none() && is_hr(line) {
             out.push(Block { kind: BlockKind::Hr, start: i, end: i });
