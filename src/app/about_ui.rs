@@ -1,4 +1,4 @@
-//! 옵션의 "정보" 탭: 프로그램 정보와 단축키. 오픈소스 라이선스 고지는 빌드할 때 만들어지는 LICENSE.md에 있다.
+//! 옵션의 "정보" 탭: 프로그램 정보와 단축키. 오픈소스 라이선스 고지는 빌드할 때 만들어지는 THIRD-PARTY-LICENSES.md에 있다.
 use super::*;
 impl App {
     /// 정보·라이선스 탭 내용.
@@ -22,6 +22,6 @@ impl App {
         ui.separator();
 
         ui.label(egui::RichText::new("오픈소스 라이선스").strong());
-        ui.label(egui::RichText::new("사용한 오픈소스의 목록과 라이선스 전문은 프로그램 옆의 LICENSE.md 파일에 있습니다 (빌드할 때 자동으로 만들어집니다).").color(dim));
+        ui.label(egui::RichText::new("사용한 오픈소스의 목록과 라이선스 전문은 프로그램 옆의 THIRD-PARTY-LICENSES.md 파일에 있습니다 (빌드할 때 자동으로 만들어집니다).").color(dim));
     }
 }

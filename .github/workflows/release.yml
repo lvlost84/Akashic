@@ -38,7 +38,7 @@ jobs:
           Copy-Item target/release/akashic.exe dist/Akashic.exe
           $h = (Get-FileHash dist/Akashic.exe -Algorithm SHA256).Hash.ToLower()
           "$h  Akashic.exe" | Out-File -Encoding ascii -NoNewline dist/SHA256SUMS
-          if (Test-Path LICENSE.md) { Copy-Item LICENSE.md dist/LICENSE.md }
+          if (Test-Path THIRD-PARTY-LICENSES.md) { Copy-Item THIRD-PARTY-LICENSES.md dist/THIRD-PARTY-LICENSES.md }
       - name: 릴리스 만들기
         if: startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
@@ -46,5 +46,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $files = @("dist/Akashic.exe", "dist/SHA256SUMS")
-          if (Test-Path dist/LICENSE.md) { $files += "dist/LICENSE.md" }
+          if (Test-Path dist/THIRD-PARTY-LICENSES.md) { $files += "dist/THIRD-PARTY-LICENSES.md" }
           gh release create "${{ github.ref_name }}" @files --title "아카식 ${{ github.ref_name }}" --generate-notes

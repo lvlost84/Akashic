@@ -48,8 +48,14 @@ cargo test --release
 릴리스는 `Cargo.toml`의 `version`을 올리고 커밋한 뒤 `git tag v2.12.0` → `git push origin main v2.12.0`을 하면 GitHub Actions가 시험·빌드를 거쳐 `Akashic.exe`와 `SHA256SUMS`를 Releases에 올립니다. 업데이트 확인은 `AKASHIC_REPO` 환경변수가 설정된 빌드에서만 켜집니다.
 
 ## 라이선스
-[Apache License 2.0](LICENSE)입니다. 복사·수정·재배포·상업적 이용이 모두 가능하며, 재배포할 때 라이선스 전문과 고지를 함께 두어야 합니다. 보증은 없습니다(AS IS).
-사용한 오픈소스(모두 MIT·Apache-2.0 등 허용적 라이선스)의 목록은 빌드 때 자동 생성되는 `LICENSE.md`에 있습니다.
+아카식은 **Apache License 2.0**입니다. 복사·수정·재배포·상업적 이용이 모두 가능하며, 재배포할 때 라이선스 전문과 고지를 함께 두어야 합니다. 보증은 없습니다(AS IS).
+
+| 파일 | 내용 |
+|---|---|
+| [LICENSE](LICENSE) | 아카식의 라이선스 전문 (Apache-2.0) |
+| [THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md) | 사용한 오픈소스 약 200개의 이름·버전·라이선스와 전문 (모두 MIT·Apache-2.0 등 허용적 라이선스) |
+
+`THIRD-PARTY-LICENSES.md`는 빌드할 때 자동으로 만들어지며, 의존 라이브러리가 바뀌면 함께 갱신해 저장소에 올립니다.
 
 ## 기록
 개발 기록은 [DEVLOG.md](DEVLOG.md)에 있습니다.

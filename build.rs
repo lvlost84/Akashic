@@ -53,7 +53,7 @@ fn embed_resources() {
         println!("cargo:warning=리소스 컴파일에 실패해 exe 아이콘을 넣지 않습니다");
     }
 }
-/// 실제로 exe에 링크되는 라이브러리만 모아 프로젝트 폴더의 LICENSE.md를 만든다.
+/// 실제로 exe에 링크되는 라이브러리만 모아 프로젝트 폴더의 THIRD-PARTY-LICENSES.md를 만든다.
 /// 기준: cargo metadata(대상 플랫폼, 현재 feature)의 일반(normal) 의존만. 빌드 전용·시험 전용·다른 OS 전용과
 /// proc-macro(와 그 아래에만 달린 크레이트)는 exe에 들어가지 않으므로 제외한다. 실패해도 빌드는 계속한다.
 fn license_md() {
@@ -149,14 +149,14 @@ fn license_md() {
     match run() {
         Ok(md) => {
             let dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into());
-            let path = std::path::Path::new(&dir).join("LICENSE.md");
+            let path = std::path::Path::new(&dir).join("THIRD-PARTY-LICENSES.md");
             // 내용이 같으면 다시 쓰지 않는다(수정 시각이 바뀌어 불필요한 재빌드·동기화가 생기는 것을 막는다).
             if std::fs::read_to_string(&path).map_or(true, |old| old != md) {
                 if let Err(e) = std::fs::write(&path, md) {
-                    println!("cargo:warning=LICENSE.md를 쓰지 못했습니다: {e}");
+                    println!("cargo:warning=THIRD-PARTY-LICENSES.md를 쓰지 못했습니다: {e}");
                 }
             }
         }
-        Err(e) => println!("cargo:warning=LICENSE.md를 만들지 못했습니다: {}", e.lines().next().unwrap_or("")),
+        Err(e) => println!("cargo:warning=THIRD-PARTY-LICENSES.md를 만들지 못했습니다: {}", e.lines().next().unwrap_or("")),
     }
 }

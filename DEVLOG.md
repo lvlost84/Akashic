@@ -7,7 +7,7 @@ KnowVault(WPF)를 Rust + eframe/egui 0.37 + rusqlite로 다시 만드는 프로�
 - 시험: `cargo test --release` (현재 379건 통과, 성능·실측 9건은 ignored. 2026-11-24 기준)
 - 격리 실행: `AKASHIC_DATA=<폴더>`, `--seed`. 개발용 환경변수: `AKASHIC_OPEN_HELP/GRAPH/TITLE/OPT/INDEX`(INDEX: 제목이 `00.`으로 시작하는 문서를 인덱스로 지정하고 정리 창을 연다), `AKASHIC_RENDERER`, `AKASHIC_DIAG`
 - 스냅숏(커밋 대신): `snapshots\<날짜>-<번호>-<이름>\` (src, Cargo.toml, build.rs, .cargo, assets)
-- 오픈소스 고지: 빌드할 때 `LICENSE.md`가 자동 생성됨(build.rs)
+- 오픈소스 고지: 빌드할 때 `THIRD-PARTY-LICENSES.md`가 자동 생성됨(build.rs)
 - 의존성 규칙: 직접 의존성 10개 이하, `default-features = false` 기본, 작업 후 미사용·중복·개수 점검
 
 ## 현재 상태 (2026-11-24, 버전은 v2.26.0)
@@ -16,6 +16,10 @@ KnowVault(WPF)를 Rust + eframe/egui 0.37 + rusqlite로 다시 만드는 프로�
 - 남은 미개선 항목은 이 파일의 "미확인"·"남은 것" 표시와 로컬 `개선목록.md`(저장소에서는 제외) 참고(C5·C11은 2026-11-17에 처리).
 
 ## 기록
+
+### 2026-11-25 (오픈소스 고지를 저장소에 올림: THIRD-PARTY-LICENSES.md)
+- 자동 생성 파일 `LICENSE.md`를 `THIRD-PARTY-LICENSES.md`로 이름을 바꿔 저장소에 올림(`.gitignore`에서 뺌). 이름을 바꾼 이유: 루트에 `LICENSE`(Apache-2.0)와 `LICENSE.md`(고지 목록)가 함께 있으면 GitHub이 라이선스를 하나로 못 정하고 "Other"로 표시할 수 있음. 바꾼 곳: `build.rs`(생성 경로·메시지), `.github/workflows/release.yml`(릴리스에 첨부하는 파일 이름도 바뀜), 정보 탭 안내 문구(`about_ui.rs`), README(라이선스 구역에 두 파일 링크 표), DEVLOG 사용법 줄. 내용은 그대로(208개 구성 요소).
+- 확인: `cargo test --release` 379건 통과, build.rs가 새 이름으로 돌아도 파일 내용 변화 없음. **미확인**: 푸시 뒤 GitHub 첫 화면의 라이선스 표시가 Apache-2.0인지, 다음 릴리스에 `THIRD-PARTY-LICENSES.md`가 첨부되는지(릴리스 때 확인). 의존 라이브러리가 바뀌면 빌드 뒤 이 파일을 함께 커밋해야 함.
 
 ### 2026-11-25 (라이선스 Apache-2.0 추가, 커밋 전)
 - 저장소에 자체 라이선스가 없어 다른 사람이 쓸 수 있는지 알 수 없었다. 사용한 오픈소스(`LICENSE.md`)는 전부 MIT·Apache 등 허용적 라이선스(self_cell은 Apache OR GPL 이중이라 Apache 선택)여서 어느 것이든 가능했고, **Apache-2.0**으로 정함(사용자가 "라이선스 파일을 보고 판단"하라고 맡김). 저작권자 이름을 적지 말라는 요청이라, 표준 전문을 고치지 않고 그대로 둠(부록의 `[name of copyright owner]` 자리표시자 그대로) — MIT는 저작권자 이름 줄이 필요해서 제외.
