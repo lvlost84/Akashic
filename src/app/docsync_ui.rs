@@ -259,6 +259,28 @@ impl App {
         }
     }
 
+    /// 편집창 본문을 바꾸되 커서는 (줄, 칸)을 기억해 새 본문의 같은 자리로 옮기고, 되돌리기 기록은 비운다(밖에서 합친 내용을 반영할 때).
+    pub(super) fn replace_body_keep_cursor(&mut self, new_body: String) {
+        let line = md::line_of_char(&self.body, self.cursor_idx);
+        let col = self.cursor_idx.saturating_sub(md::char_of_line(&self.body, line));
+        let nl = line.min(new_body.lines().count().saturating_sub(1));
+        let line_len = new_body.lines().nth(nl).map_or(0, |l| l.chars().count());
+        let new_idx = md::char_of_line(&new_body, nl) + col.min(line_len);
+        self.body = new_body;
+        self.cursor_idx = new_idx;
+        self.compute_links();
+        if let Some(ctx) = DS.with(|d| d.borrow().ctx.clone()) {
+            use egui::text::{CCursor, CCursorRange};
+            #[allow(deprecated)]
+            let eid = egui::Id::new("body_edit");
+            let mut st = egui::TextEdit::load_state(&ctx, eid).unwrap_or_default();
+            st.cursor.set_char_range(Some(CCursorRange::one(CCursor::new(new_idx))));
+            st.clear_undoer();
+            st.store(&ctx, eid);
+            ctx.request_repaint();
+        }
+    }
+
     /// 동기화가 끝난 뒤 화면 상태를 새 DB에 맞춘다(목록·그래프·이미지 캐시·열려 있는 문서).
     fn ds_after(&mut self, rep: &docsync::Report, snap: OpenSnap) {
         self.list_dirty = true;
@@ -282,6 +304,7 @@ impl App {
             return;
         }
         let Ok(Some(d)) = self.db.get_doc(id) else { return };
+        self.base = Some((d.id, d.title.clone(), d.body.clone())); // 화면을 이 DB 내용에 맞춘다
         let (anc_title, anc_body) = match snap {
             Some((sid, t, b)) if sid == id => (t, b),
             _ => (self.title.clone(), self.body.clone()),

@@ -84,6 +84,7 @@ impl App {
             return;
         }
         if let Ok(Some(d)) = self.db.get_doc(id) {
+            self.base = Some((d.id, d.title.clone(), d.body.clone()));
             self.title = d.title;
             self.body = self.reveal_body(&d.body);
             self.cursor_idx = self.cursor_idx.min(self.body.chars().count());

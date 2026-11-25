@@ -80,13 +80,52 @@ impl App {
         } else if d.updated > self.last_saved_ts.max(self.mcp_since) && d.updated != self.mcp_warned {
             // 편집 중인 문서가 밖에서 바뀐 듯하다. 덮어쓰지는 않고 알린다(저장하면 이 편집이 이기고, 이전 내용은 변경 이력에 남는다).
             self.mcp_warned = d.updated;
-            self.say("이 문서가 다른 곳(MCP)에서 바뀐 것 같습니다. 지금 저장하면 편집 중인 내용이 우선하며, 이전 내용은 변경 이력에서 되살릴 수 있습니다");
+            self.say("이 문서가 다른 곳(MCP)에서 바뀐 것 같습니다. 저장할 때 편집 중인 내용과 자동으로 합칩니다(같은 줄이 겹치면 편집 중인 내용을 두고 바깥 내용은 '충돌' 사본으로 남깁니다)");
         }
+    }
+
+    /// 저장하기 직전에 부른다. 이 문서를 읽은 뒤 DB에서 바뀌었으면(MCP 등) 그 내용을 편집 중인 내용과 합쳐 `stored`(저장할 본문)에 넣고
+    /// 화면도 합친 결과로 바꾼다. 같은 줄이 겹치면 편집 중인 내용을 두고 바깥 내용은 '충돌' 사본 문서로 남긴다. 안내할 문구를 돌려준다.
+    pub(super) fn merge_external(&mut self, id: i64, stored: &mut String) -> Option<&'static str> {
+        let (bid, base_title, base_body) = self.base.clone()?;
+        if bid != id {
+            return None;
+        }
+        let theirs = self.db.get_doc(id).ok().flatten().filter(|d| !d.trashed)?;
+        if theirs.body == base_body && theirs.title == base_title {
+            return None;
+        }
+        let mut note = "밖에서 바뀐 내용을 편집 중인 내용과 합쳐 저장했습니다";
+        if theirs.body != base_body {
+            let merged = match crate::app::merge_texts(&base_body, stored, &theirs.body) {
+                Some(m) => m,
+                None => {
+                    if let Ok(nid) = self.db.new_doc(theirs.category) {
+                        let t = format!("{} (충돌 · 외부 · {})", theirs.title, chrono::Local::now().format("%Y-%m-%d %H:%M"));
+                        let _ = self.db.save_doc_plain(nid, &t, &theirs.body);
+                        let _ = self.db.add_tag(nid, crate::docsync::CONFLICT_TAG);
+                        self.list_dirty = true;
+                    }
+                    note = "밖에서 바뀐 내용과 같은 줄에서 겹쳐 편집 중인 내용을 두고, 바깥 내용은 '충돌' 사본 문서로 남겼습니다";
+                    stored.clone()
+                }
+            };
+            if merged != *stored {
+                let shown = self.reveal_body(&merged);
+                self.replace_body_keep_cursor(shown);
+            }
+            *stored = merged;
+        }
+        if self.title == base_title && theirs.title != base_title {
+            self.title = theirs.title.clone();
+        }
+        Some(note)
     }
 
     /// 편집하지 않던 열린 문서를 DB의 새 내용으로 바꿔 보인다.
     fn mcp_reload_cur(&mut self, ctx: &egui::Context, d: crate::db::Doc) {
         let id = d.id;
+        self.base = Some((d.id, d.title.clone(), d.body.clone()));
         self.title = d.title;
         self.body = self.reveal_body(&d.body);
         self.cur_trashed = d.trashed;

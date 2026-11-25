@@ -592,6 +592,8 @@ pub struct App {
     close_warned: bool,
     /// 문서 동기화 중이라 저장을 미룬다고 이번 동기화에서 이미 알렸는지
     ds_hold_said: bool,
+    /// 열려 있는 문서를 DB에서 마지막으로 읽거나 저장했을 때의 (id, 제목, 저장된 본문). 저장 직전에 DB와 비교해 밖에서 바뀐 것을 알아챈다.
+    base: Option<(i64, String, String)>,
     /// 마지막으로 쓰기 로그를 본 파일에 병합한 시각
     last_merge: Instant,
     /// 마지막 병합 시각(표시용, epoch 초)
@@ -769,6 +771,7 @@ impl App {
             last_saved_ts: 0,
             close_warned: false,
             ds_hold_said: false,
+            base: None,
             last_merge: Instant::now(),
             last_merge_ts: 0,
             pos_cache: (usize::MAX, 0, 1, 1),
@@ -916,23 +919,30 @@ impl App {
                 }
                 return false;
             }
-            let stored = match self.conceal_body() {
+            let mut stored = match self.conceal_body() {
                 Ok(s) => s,
                 Err(x) => {
                     self.say(&format!("저장 실패: {x} (편집 내용은 그대로 두었습니다)"));
                     return false;
                 }
             };
+            // 읽은 뒤 밖(MCP·다른 앱 창)에서 이 문서가 바뀌었으면 그 내용을 편집 중인 내용과 합친 뒤 저장한다(덮어쓰지 않는다).
+            let merged_note = self.merge_external(id, &mut stored);
             // 다른 문서와 제목이 같으면 제목은 예전 것을 두고 본문만 저장한다(링크가 엉뚱한 문서로 가는 것을 막는다).
             self.title_dup = self.db.title_taken(id, &self.title).unwrap_or(false);
             let title_to_save = if self.title_dup { self.db.stored_title(id) } else { self.title.clone() };
             match self.db.save_doc(id, &title_to_save, &stored) {
-                Ok(true) => {
-                    self.list_dirty = true;
-                    self.ref_rev += 1;
-                    self.last_saved_ts = now();
+                Ok(saved) => {
+                    if saved {
+                        self.list_dirty = true;
+                        self.ref_rev += 1;
+                        self.last_saved_ts = now();
+                    }
+                    self.base = Some((id, title_to_save.clone(), stored.clone()));
+                    if let Some(n) = merged_note {
+                        self.say(n);
+                    }
                 }
-                Ok(false) => {}
                 Err(x) => {
                     self.say(&format!("저장 실패: {x} (편집 내용은 그대로 두었습니다)"));
                     return false;
@@ -989,6 +999,7 @@ impl App {
                     }
                     self.fwd.clear();
                 }
+                self.base = Some((d.id, d.title.clone(), d.body.clone()));
                 self.cur = Some(d.id);
                 self.cfg.last_doc = d.id; // 다음에 시작할 때 이 문서를 다시 연다(설정은 닫을 때 저장)
                 self.title = d.title;
@@ -3665,5 +3676,35 @@ mod view_bar_tests {
             };
             assert_eq!(got, Some(expect), "{name} 칸을 눌렀을 때");
         }
+    }
+}
+
+/// 밖에서 바뀐 본문(`theirs`)과 편집 중인 본문(`mine`)을, 둘 다 `base`에서 갈라진 변경으로 보고 합친다. 같은 줄이 겹치면 `None`.
+pub(crate) fn merge_texts(base: &str, mine: &str, theirs: &str) -> Option<String> {
+    if mine == base {
+        return Some(theirs.to_string()); // 내가 본문을 안 고쳤다: 바깥 내용을 그대로 받는다
+    }
+    if theirs == base || theirs == mine {
+        return Some(mine.to_string());
+    }
+    diffy::merge(base, mine, theirs).ok()
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::merge_texts;
+
+    #[test]
+    fn external_and_local_edits_are_combined() {
+        let base = "하나\n둘\n셋\n넷\n다섯\n";
+        // 내가 안 고쳤으면 바깥 것을 받는다, 바깥이 안 고쳤으면 내 것을 둔다
+        assert_eq!(merge_texts(base, base, "하나\n둘\n셋\n넷\n다섯\n여섯\n").as_deref(), Some("하나\n둘\n셋\n넷\n다섯\n여섯\n"));
+        assert_eq!(merge_texts(base, "내 편집\n", base).as_deref(), Some("내 편집\n"));
+        // 서로 다른 줄을 고치면 둘 다 남는다
+        assert_eq!(merge_texts(base, "하나!\n둘\n셋\n넷\n다섯\n", "하나\n둘\n셋\n넷\n다섯!\n").as_deref(), Some("하나!\n둘\n셋\n넷\n다섯!\n"));
+        // 같은 줄을 서로 다르게 고치면 합칠 수 없다
+        assert_eq!(merge_texts(base, "하나\n둘\nA\n넷\n다섯\n", "하나\n둘\nB\n넷\n다섯\n"), None);
+        // 같은 내용으로 고쳤으면 충돌이 아니다
+        assert_eq!(merge_texts(base, "x\n", "x\n").as_deref(), Some("x\n"));
     }
 }
