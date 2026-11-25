@@ -331,6 +331,13 @@ impl Config {
         }
     }
     pub fn save(&self) {
+        // 내용(암호화 전)이 마지막으로 쓴 것과 같고 파일이 그대로 있으면 디스크에 쓰지 않는다.
+        // 창 크기·업데이트 확인처럼 값이 안 바뀐 채 부르는 저장이 시작 때 여러 번 일어나서다.
+        let digest = save_digest(self);
+        let last = LAST_SAVED.lock().ok().and_then(|g| *g);
+        if skip_save(last, digest, config_path().exists()) {
+            return;
+        }
         let _ = std::fs::create_dir_all(app_dir());
         // 비밀번호·복구 문자열은 암호화해서 쓴다. 암호화에 실패하면 평문으로 쓰지 않고 이번 저장을 건너뛴다.
         let mut c = self.clone();
@@ -349,11 +356,27 @@ impl Config {
         }
         if let Ok(s) = serde_json::to_string_pretty(&c) {
             let tmp = config_path().with_extension("tmp");
-            if std::fs::write(&tmp, s).is_ok() {
-                let _ = std::fs::rename(&tmp, config_path());
+            if std::fs::write(&tmp, s).is_ok() && std::fs::rename(&tmp, config_path()).is_ok() {
+                if let Ok(mut g) = LAST_SAVED.lock() {
+                    *g = digest; // 실제로 쓴 뒤에만 기억한다(실패하면 다음에 다시 시도)
+                }
             }
         }
     }
+}
+
+/// 마지막으로 실제로 쓴 설정(암호화 전 내용)의 SHA-256. 같은 내용을 다시 저장하지 않으려고 보관한다(비밀값 자체는 두지 않는다).
+static LAST_SAVED: std::sync::Mutex<Option<[u8; 32]>> = std::sync::Mutex::new(None);
+
+fn save_digest(c: &Config) -> Option<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    let bytes = serde_json::to_vec(c).ok()?;
+    Some(Sha256::digest(&bytes).into())
+}
+
+/// 저장을 건너뛸지: 마지막으로 쓴 내용과 같고(`last`) 설정 파일이 아직 있을 때만. 실행 후 첫 저장(`last` 없음)은 항상 쓴다.
+fn skip_save(last: Option<[u8; 32]>, now: Option<[u8; 32]>, file_exists: bool) -> bool {
+    file_exists && last.is_some() && last == now
 }
 
 // ---------------------------------------------------------------- 상태
@@ -3706,5 +3729,29 @@ mod merge_tests {
         assert_eq!(merge_texts(base, "하나\n둘\nA\n넷\n다섯\n", "하나\n둘\nB\n넷\n다섯\n"), None);
         // 같은 내용으로 고쳤으면 충돌이 아니다
         assert_eq!(merge_texts(base, "x\n", "x\n").as_deref(), Some("x\n"));
+    }
+}
+
+#[cfg(test)]
+mod save_skip_tests {
+    use super::*;
+
+    #[test]
+    fn identical_config_is_not_written_again() {
+        let mut c = Config::default();
+        let d0 = save_digest(&c);
+        assert!(d0.is_some());
+        // 실행 후 첫 저장은 항상 쓴다
+        assert!(!skip_save(None, d0, true));
+        // 같은 내용이고 파일이 있으면 건너뛴다
+        assert!(skip_save(d0, save_digest(&c), true));
+        // 파일이 지워졌으면 다시 쓴다
+        assert!(!skip_save(d0, save_digest(&c), false));
+        // 값이 하나라도 바뀌면 쓴다(창 크기, 비밀값 포함)
+        c.win_w += 1.0;
+        assert!(!skip_save(d0, save_digest(&c), true));
+        let d1 = save_digest(&c);
+        c.wd_pass = "새 비밀번호".into();
+        assert_ne!(d1, save_digest(&c));
     }
 }
