@@ -590,6 +590,8 @@ pub struct App {
     last_saved_ts: i64,
     /// 저장하지 못한 채 닫기를 한 번 막았는지(두 번째 닫기는 그대로 닫는다)
     close_warned: bool,
+    /// 문서 동기화 중이라 저장을 미룬다고 이번 동기화에서 이미 알렸는지
+    ds_hold_said: bool,
     /// 마지막으로 쓰기 로그를 본 파일에 병합한 시각
     last_merge: Instant,
     /// 마지막 병합 시각(표시용, epoch 초)
@@ -766,6 +768,7 @@ impl App {
             storage: Default::default(),
             last_saved_ts: 0,
             close_warned: false,
+            ds_hold_said: false,
             last_merge: Instant::now(),
             last_merge_ts: 0,
             pos_cache: (usize::MAX, 0, 1, 1),
@@ -901,6 +904,18 @@ impl App {
                 self.last_edit = None;
                 return true;
             }
+            // 문서 동기화가 도는 동안은 DB에 쓰지 않는다. 동기화가 같은 문서 행을 읽고 고치므로 그 사이의 저장은 병합 기준을 어긋나게 한다.
+            // 편집 내용은 화면에 그대로 두고(수정됨 표시도 유지), 동기화가 끝나면 바로 저장한다. 아직 저장 안 된 것이 없으면 그냥 통과.
+            if Self::ds_busy() {
+                if self.last_edit.is_none() {
+                    return true;
+                }
+                if !self.ds_hold_said {
+                    self.ds_hold_said = true;
+                    self.say("동기화 중에는 이 문서를 저장하지 않고, 끝난 뒤에 저장합니다");
+                }
+                return false;
+            }
             let stored = match self.conceal_body() {
                 Ok(s) => s,
                 Err(x) => {
@@ -950,6 +965,9 @@ impl App {
 
     fn open_doc(&mut self, id: i64, record: bool) {
         if !self.flush() {
+            if Self::ds_busy() {
+                self.say("동기화가 끝나면 다른 문서로 이동할 수 있습니다(편집 중인 내용은 끝난 뒤 저장됩니다)");
+            }
             return; // 저장하지 못한 채 다른 문서로 가면 편집 내용이 사라진다
         }
         self.find_reset_for_doc();
@@ -1199,8 +1217,10 @@ impl App {
                     self.list_dirty = true;
                 }
                 Act::Trash(id) => {
-                    if self.cur == Some(id) {
-                        self.flush();
+                    // 저장하지 못한 편집이 남은 채 휴지통으로 보내면 그 내용이 사라진다(동기화 중 저장을 미루는 동안 등)
+                    if self.cur == Some(id) && !self.flush() {
+                        self.say("편집 내용을 아직 저장하지 못해 휴지통으로 옮기지 않았습니다. 잠시 뒤 다시 시도하세요");
+                        continue;
                     }
                     if let Err(x) = self.db.trash(id) {
                         self.say(&format!("휴지통으로 옮기지 못했습니다: {x}"));
@@ -3416,7 +3436,11 @@ impl eframe::App for App {
             if !self.flush() && !self.close_warned {
                 self.close_warned = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                self.say("저장하지 못해 닫지 않았습니다. 다시 닫으면 편집 내용이 사라집니다");
+                if Self::ds_busy() {
+                    self.say("동기화 중이라 편집 내용을 저장하지 못해 닫지 않았습니다. 끝난 뒤 닫거나, 다시 닫으면 편집 내용이 사라집니다");
+                } else {
+                    self.say("저장하지 못해 닫지 않았습니다. 다시 닫으면 편집 내용이 사라집니다");
+                }
                 return;
             }
             if let Some(c) = self.cur {

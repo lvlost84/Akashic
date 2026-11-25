@@ -330,6 +330,22 @@ impl Server {
         Ok(d)
     }
 
+    /// 문서를 읽고 `f`가 정한 (제목, 본문)으로 바꾼다. 읽은 뒤 다른 쪽이 먼저 고쳤으면 새로 읽어 다시 한다(최대 5번).
+    /// `f`가 `None`이거나 결과가 같으면 바꾸지 않고 `false`. 앱 화면의 저장과 겹쳐도 그쪽 내용을 덮어쓰지 않는다.
+    fn modify(&mut self, id: i64, mut f: impl FnMut(&db::Doc) -> Result<Option<(String, String)>, String>) -> Result<bool, String> {
+        for _ in 0..5 {
+            let d = self.editable(id)?;
+            let Some((title, body)) = f(&d)? else { return Ok(false) };
+            if title == d.title && body == d.body {
+                return Ok(false);
+            }
+            if self.db.save_doc_if(id, &d.title, &d.body, &title, &body)? {
+                return Ok(true);
+            }
+        }
+        Err("문서가 계속 다른 곳에서 바뀌고 있어 저장하지 못했습니다. 잠시 뒤 다시 시도하세요".into())
+    }
+
     fn create_document(&mut self, a: &Value) -> Result<String, String> {
         let title = str_arg(a, "title").unwrap_or("");
         let body = str_arg(a, "body").unwrap_or("");
@@ -371,7 +387,12 @@ impl Server {
                 return Err("암호화한 글이 있는 문서의 본문은 바꿀 수 없습니다(암호문이 지워질 수 있어서). append_to_document로 덧붙이세요".into());
             }
         }
-        let changed = self.db.save_doc(id, title.unwrap_or(&d.title), body.unwrap_or(&d.body))?;
+        let changed = self.modify(id, |d| {
+            if body.is_some() && d.body.contains(OPEN) {
+                return Err("암호화한 글이 있는 문서의 본문은 바꿀 수 없습니다(암호문이 지워질 수 있어서). append_to_document로 덧붙이세요".to_string());
+            }
+            Ok(Some((title.unwrap_or(&d.title).to_string(), body.unwrap_or(&d.body).to_string())))
+        })?;
         Ok(if changed { format!("문서 {id}을(를) 바꿨습니다(이전 내용은 변경 이력에 남았습니다)") } else { "바뀐 내용이 없습니다".into() })
     }
 
@@ -379,13 +400,13 @@ impl Server {
         let id = int_arg(a, "id").ok_or("id가 필요합니다")?;
         let text = str_arg(a, "text").ok_or("text가 필요합니다")?;
         Self::check_text(text, "덧붙일 글")?;
-        let d = self.editable(id)?;
-        if d.body.len() + text.len() > WRITE_MAX * 4 {
-            return Err("문서가 너무 커집니다".into());
-        }
-        let sep = if d.body.is_empty() || d.body.ends_with('\n') { "" } else { "\n" };
-        let body = format!("{}{}{}", d.body, sep, text);
-        self.db.save_doc(id, &d.title, &body)?;
+        self.modify(id, |d| {
+            if d.body.len() + text.len() > WRITE_MAX * 4 {
+                return Err("문서가 너무 커집니다".to_string());
+            }
+            let sep = if d.body.is_empty() || d.body.ends_with('\n') { "" } else { "\n" };
+            Ok(Some((d.title.clone(), format!("{}{}{}", d.body, sep, text))))
+        })?;
         Ok(format!("문서 {id} 끝에 덧붙였습니다"))
     }
 }

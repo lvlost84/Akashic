@@ -505,6 +505,22 @@ COMMIT;",
         Ok(changed)
     }
 
+    /// 제목·본문이 `expect_*`와 같을 때만 바꾼다. 읽은 뒤 다른 쪽(앱 화면 등)이 먼저 고쳤다면 `false`.
+    /// 비교와 쓰기가 한 문장이라 그 사이에 끼어들 수 없다(읽고 → 고치고 → 저장하는 사이의 갱신 손실을 막는다).
+    pub fn save_doc_if(&self, id: i64, expect_title: &str, expect_body: &str, title: &str, body: &str) -> Res<bool> {
+        let n = self
+            .conn
+            .execute(
+                "UPDATE docs SET title=?1, body=?2, updated=?3 WHERE id=?4 AND title=?5 AND body=?6 AND trashed_at IS NULL",
+                params![title, body, now(), id, expect_title, expect_body],
+            )
+            .map_err(e)?;
+        if n > 0 && expect_title.trim().is_empty() && !title.trim().is_empty() {
+            self.auto_index(id);
+        }
+        Ok(n > 0)
+    }
+
     /// 인덱스 훅 없이 저장한다(동기화로 들어오는 문서, 인덱스 문서 자신 등).
     pub fn save_doc_plain(&self, id: i64, title: &str, body: &str) -> Res<bool> {
         let n = self
@@ -1805,6 +1821,20 @@ mod tests {
         let ap: String = db.conn.query_row("SELECT value FROM meta WHERE key='applying'", [], |r| r.get(0)).unwrap();
         assert_eq!(ap, "0");
     }
+    #[test]
+    fn save_doc_if_only_when_nothing_changed_in_between() {
+        let db = Db::open(&tmp("cas")).unwrap();
+        let id = db.new_doc(None).unwrap();
+        db.save_doc(id, "제목", "원래").unwrap();
+        // 읽은 값 그대로면 바뀐다
+        assert!(db.save_doc_if(id, "제목", "원래", "제목", "원래+추가").unwrap());
+        // 그 사이 다른 쪽이 고쳤다면(기대한 본문이 더 이상 아님) 덮어쓰지 않는다
+        assert!(!db.save_doc_if(id, "제목", "원래", "제목", "오래된 내용으로 덮기").unwrap());
+        assert_eq!(db.get_doc(id).unwrap().unwrap().body, "원래+추가");
+        // 휴지통 문서는 바꾸지 않는다
+        db.trash(id).unwrap();
+        assert!(!db.save_doc_if(id, "제목", "원래+추가", "제목", "x").unwrap());
+    }
 }
 
 #[cfg(test)]
@@ -1826,4 +1856,5 @@ mod wal_tests {
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
 }

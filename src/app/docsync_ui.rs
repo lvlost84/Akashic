@@ -62,6 +62,9 @@ pub(super) fn report_text(r: &docsync::Report) -> String {
     if r.pruned > 0 {
         s += &format!(" · 옛 로그 {}개 정리", r.pruned);
     }
+    if !r.skipped_logs.is_empty() {
+        s += &format!(" · 읽을 수 없는 로그 {}개 건너뜀(다른 PC가 체크포인트를 올리면 채워집니다)", r.skipped_logs.len());
+    }
     s
 }
 
@@ -248,6 +251,11 @@ impl App {
                 }
                 self.fs_invalidate(true);
             }
+        }
+        // 동기화가 끝났다: 미뤄 둔 저장을 한다(동기화 결과를 합친 뒤의 내용이 저장된다)
+        self.ds_hold_said = false;
+        if self.last_edit.is_some() {
+            self.flush();
         }
     }
 

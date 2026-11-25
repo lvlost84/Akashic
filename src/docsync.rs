@@ -561,6 +561,8 @@ pub struct Report {
     pub deleted_docs: Vec<i64>,
     pub ckpt_written: bool,
     pub pruned: usize,
+    /// 여러 번 읽지 못해 건너뛴 다른 기기의 로그(이름과 이유).
+    pub skipped_logs: Vec<String>,
 }
 
 struct Ctx<'a> {
@@ -1014,9 +1016,29 @@ fn cursor(db: &Db, dev: &str) -> u64 {
     mget_u64(db, &format!("ds_cur:{dev}"))
 }
 
-fn read_batch(remote: &dyn Remote, key: &VaultKey, name: &str) -> Res<Batch> {
-    let (data, _) = remote.get(name).map_err(rerr)?.ok_or_else(|| format!("{name}: 서버에서 사라졌습니다"))?;
-    decode::<Batch>(key, name, &data)
+/// 묶음 읽기 실패의 종류. 네트워크처럼 다시 하면 될 수 있는 것과, 파일 자체를 읽을 수 없는 것(복호화·형식·이름 불일치)을 가른다.
+enum BatchErr {
+    Transient(String),
+    Permanent(String),
+}
+
+impl BatchErr {
+    fn msg(self) -> String {
+        match self {
+            BatchErr::Transient(m) | BatchErr::Permanent(m) => m,
+        }
+    }
+}
+
+/// 같은 로그가 이 횟수만큼 연속으로 "읽을 수 없음"이면 영구 오류로 보고 건너뛴다(클라우드 폴더에서 덜 받은 파일 등 일시적인 경우를 거르려고 여러 번 본다).
+const BAD_LOG_LIMIT: u64 = 3;
+
+fn read_batch(remote: &dyn Remote, key: &VaultKey, name: &str) -> Result<Batch, BatchErr> {
+    let (data, _) = remote
+        .get(name)
+        .map_err(|x| BatchErr::Transient(rerr(x)))?
+        .ok_or_else(|| BatchErr::Transient(format!("{name}: 서버에서 사라졌습니다")))?;
+    decode::<Batch>(key, name, &data).map_err(BatchErr::Permanent)
 }
 
 /// 문서 단위 동기화를 한 번 한다: 받기 → 적용(병합) → 올리기 → (가끔) 체크포인트·정리.
@@ -1042,18 +1064,26 @@ pub fn sync(db: &Db, remote: &dyn Remote, key: &VaultKey, o: &Opts) -> Res<Repor
     });
     if (fresh || gap) && !ix.ckpts.is_empty() {
         o.check()?;
-        let name = ix.ckpts.last().unwrap().0.clone();
-        match read_batch(remote, key, &name) {
-            Ok(b) => {
-                for (d, s) in &b.upto {
-                    if *d != me {
-                        new_cur.insert(d.clone(), (*s).max(cursor(db, d)));
+        // 가장 새 체크포인트부터. 읽을 수 없는 것(손상)이면 더 오래된 것으로 넘어간다. 일시적 오류면 거기서 멈춘다.
+        for (name, _) in ix.ckpts.iter().rev() {
+            match read_batch(remote, key, name) {
+                Ok(b) => {
+                    for (d, s) in &b.upto {
+                        if *d != me {
+                            new_cur.insert(d.clone(), (*s).max(cursor(db, d)));
+                        }
                     }
+                    recs.extend(b.recs);
+                    rep.pulled_batches += 1;
+                    pull_err = None;
+                    break;
                 }
-                recs.extend(b.recs);
-                rep.pulled_batches += 1;
+                Err(BatchErr::Permanent(m)) => pull_err = Some(m),
+                Err(BatchErr::Transient(m)) => {
+                    pull_err = Some(m);
+                    break;
+                }
             }
-            Err(x) => pull_err = Some(x),
         }
     }
     if pull_err.is_none() {
@@ -1067,19 +1097,33 @@ pub fn sync(db: &Db, remote: &dyn Remote, key: &VaultKey, o: &Opts) -> Res<Repor
                 }
                 o.check()?; // 아직 아무것도 적용하지 않았다: 여기서 멈추면 읽은 위치도 그대로라 다음에 처음부터 다시 받는다
                 let name = log_name(d, *s);
-                match read_batch(remote, key, &name) {
-                    Ok(b) if b.dev == *d && b.seq == *s => {
+                let got = read_batch(remote, key, &name).and_then(|b| {
+                    if b.dev == *d && b.seq == *s { Ok(b) } else { Err(BatchErr::Permanent(format!("{name}: 이름과 내용이 맞지 않습니다"))) }
+                });
+                match got {
+                    Ok(b) => {
                         recs.extend(b.recs);
                         c = *s;
                         new_cur.insert(d.clone(), c);
                         rep.pulled_batches += 1;
                     }
-                    Ok(_) => {
-                        pull_err = Some(format!("{name}: 이름과 내용이 맞지 않습니다"));
-                        continue 'devs;
+                    Err(BatchErr::Permanent(m)) => {
+                        // 읽을 수 없는 로그가 올리기를 영원히 막지 않도록, 여러 번 연속 실패하면 건너뛰고 경고로 남긴다.
+                        // (그 로그의 변경은 이 기기에 없을 수 있다. 다른 기기가 체크포인트를 올리면 채워진다.)
+                        let bad = format!("ds_bad:{name}");
+                        let n = mget_u64(db, &bad) + 1;
+                        mset(db, &bad, &n.to_string())?;
+                        if n >= BAD_LOG_LIMIT {
+                            rep.skipped_logs.push(format!("{name}: {m}"));
+                            c = *s;
+                            new_cur.insert(d.clone(), c);
+                        } else {
+                            pull_err = Some(format!("{m} ({n}/{BAD_LOG_LIMIT}번째 실패. 계속되면 건너뜁니다)"));
+                            continue 'devs;
+                        }
                     }
                     Err(x) => {
-                        pull_err = Some(x);
+                        pull_err = Some(x.msg());
                         continue 'devs;
                     }
                 }

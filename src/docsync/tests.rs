@@ -654,3 +654,27 @@ fn 취소하면_서버에_아무것도_올리지_않고_다음_동기화가_이�
     settle(&[&a, &b], &r);
     assert_eq!(body(&b.db, id_of(&b.db, "취소 전 문서")), "내용");
 }
+
+#[test]
+fn 읽을_수_없는_로그는_여러_번_실패한_뒤_건너뛰고_올리기를_계속한다() {
+    let r = MemoryRemote::new();
+    let (a, b) = (node("a-bad", Connect::New), node("b-bad", Connect::New));
+    doc(&a.db, "A문서", "a");
+    sync1(&a, &r).unwrap();
+    // a의 로그를 읽을 수 없게 망가뜨린다(복호화 실패)
+    let dev_a = device_id(&a.db).unwrap();
+    r.set_raw(&log_name(&dev_a, 1), b"garbage".to_vec());
+    doc(&b.db, "B문서", "b");
+    // 처음 두 번은 실패하고(일시적일 수 있어서), 올리기도 막힌다
+    for _ in 0..2 {
+        assert!(sync1(&b, &r).is_err());
+    }
+    assert!(!r.names().iter().any(|n| n.contains(&device_id(&b.db).unwrap()) && n.starts_with("log-")), "읽기에 실패한 동기화가 올렸다");
+    // 세 번째에 건너뛰고 올린다
+    let rep = sync1(&b, &r).unwrap();
+    assert_eq!(rep.skipped_logs.len(), 1);
+    assert!(rep.pushed > 0);
+    // 건너뛴 로그가 있어도 이후 동기화는 계속된다: a가 b의 문서를 받는다
+    settle(&[&a, &b], &r);
+    assert_eq!(body(&a.db, id_of(&a.db, "B문서")), "b");
+}

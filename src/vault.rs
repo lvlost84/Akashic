@@ -156,13 +156,33 @@ impl Remote for FolderRemote {
         }
         fs::create_dir_all(&self.dir).map_err(|e| RemoteError::Other(e.to_string()))?;
         let tmp = self.dir.join(format!("{name}{}", tmp_suffix()));
+        let mut raced = false;
         let res = (|| -> std::io::Result<()> {
             let mut f = File::create(&tmp)?;
             f.write_all(data)?;
             f.sync_all()?;
             drop(f);
+            // "없을 때만 쓰기"는 하드 링크로 만든다: 이미 있으면 운영체제가 실패시키므로 위의 확인과 쓰기 사이에 끼어든
+            // 다른 프로세스를 놓치지 않는다. 하드 링크를 못 쓰는 곳(일부 네트워크·FAT 드라이브)은 아래 이름 바꾸기로 대신한다.
+            if matches!(cond, PutCond::IfNoneMatch) {
+                match fs::hard_link(&tmp, &path) {
+                    Ok(()) => {
+                        let _ = fs::remove_file(&tmp);
+                        return Ok(());
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        raced = true;
+                        return Ok(());
+                    }
+                    Err(_) => {}
+                }
+            }
             fs::rename(&tmp, &path)
         })();
+        if raced {
+            let _ = fs::remove_file(&tmp);
+            return Err(RemoteError::Conflict);
+        }
         if let Err(e) = res {
             let _ = fs::remove_file(&tmp);
             return Err(RemoteError::Other(e.to_string()));
@@ -469,27 +489,29 @@ fn read_full(f: &mut File, buf: &mut [u8]) -> std::io::Result<usize> {
     Ok(n)
 }
 
-/// DB 스냅숏 파일을 암호화해 올린다.
-/// - `base`: 마지막으로 읽은 서버 상태(`read_state` 결과). `None` 이면 "서버에 아직 없다"는 뜻으로 `If-None-Match: *`.
-///   서버가 그 사이 바뀌었으면 manifest 올리기에서 `Err(Conflict)`.
-/// - 조각은 먼저, manifest 는 마지막에 올리므로 도중에 끊겨도 이전 저장본이 유지된다.
-/// - `base` 의 조각과 평문 해시·길이가 같고 서버에 있는 조각은 다시 올리지 않는다.
-pub fn push_snapshot(
+/// 세대 번호가 다른 기기와 부딪혔을 때 처음부터 다시 올리는 최대 횟수.
+const MAX_GENERATION_RETRIES: usize = 8;
+
+struct Uploaded {
+    parts: Vec<PartEntry>,
+    total: u64,
+    sha256: String,
+    stats: PushStats,
+}
+
+/// 스냅숏을 조각으로 나눠 `generation` 번호로 올린다. 새로 올린 조각 이름은 `mine`에 남긴다(부딪혀서 다시 할 때 지우려고).
+/// 같은 이름이 이미 있으면(`Conflict`) 다른 기기가 같은 세대 번호를 쓴 것이다.
+#[allow(clippy::too_many_arguments)]
+fn upload_parts(
     remote: &dyn Remote,
     key: &VaultKey,
     snapshot: &Path,
     base: Option<&RemoteState>,
-    device: &str,
-    now: i64,
+    existing: &HashSet<String>,
+    generation: i64,
     chunk: usize,
-) -> Result<PushStats, VaultError> {
-    let chunk = chunk.max(1);
-    let existing: HashSet<String> = remote.list()?.into_iter().collect();
-    // 세대 번호: 서버에 이미 있는 어떤 조각 이름(끊긴 올리기의 찌꺼기 포함)과도 겹치지 않는 값.
-    let mut generation = now;
-    while existing.iter().any(|n| is_part_name(n) && n.starts_with(&format!("{generation}."))) {
-        generation += 1;
-    }
+    mine: &mut Vec<String>,
+) -> Result<Uploaded, VaultError> {
     let mut f = File::open(snapshot).map_err(|e| VaultError::Io(format!("스냅숏을 열 수 없음: {e}")))?;
     let mut buf = vec![0u8; chunk];
     let mut all = Sha256::new();
@@ -517,7 +539,8 @@ pub fn push_snapshot(
             None => {
                 let e = PartEntry { generation, index: i as u64, len: n as u64, sha256: sha };
                 let ct = seal(key, &aad(key, KIND_PART, e.generation, e.index), data)?;
-                remote.put(&e.name(), &ct, PutCond::Any)?;
+                remote.put(&e.name(), &ct, PutCond::IfNoneMatch)?;
+                mine.push(e.name());
                 parts.push(e);
                 st.uploaded += 1;
             }
@@ -526,6 +549,49 @@ pub fn push_snapshot(
             break;
         }
     }
+    Ok(Uploaded { parts, total, sha256: hex(&all.finalize()), stats: st })
+}
+
+/// DB 스냅숏 파일을 암호화해 올린다.
+/// - `base`: 마지막으로 읽은 서버 상태(`read_state` 결과). `None` 이면 "서버에 아직 없다"는 뜻으로 `If-None-Match: *`.
+///   서버가 그 사이 바뀌었으면 manifest 올리기에서 `Err(Conflict)`.
+/// - 조각은 먼저, manifest 는 마지막에 올리므로 도중에 끊겨도 이전 저장본이 유지된다.
+/// - `base` 의 조각과 평문 해시·길이가 같고 서버에 있는 조각은 다시 올리지 않는다.
+pub fn push_snapshot(
+    remote: &dyn Remote,
+    key: &VaultKey,
+    snapshot: &Path,
+    base: Option<&RemoteState>,
+    device: &str,
+    now: i64,
+    chunk: usize,
+) -> Result<PushStats, VaultError> {
+    let chunk = chunk.max(1);
+    let existing: HashSet<String> = remote.list()?.into_iter().collect();
+    // 세대 번호: 서버에 이미 있는 어떤 조각 이름(끊긴 올리기의 찌꺼기 포함)과도 겹치지 않는 값.
+    // 목록을 본 뒤 다른 기기가 같은 번호로 조각을 올릴 수 있으므로, 조각은 "없을 때만" 올리고(IfNoneMatch)
+    // 부딪히면 우리가 올린 조각을 지우고 다음 번호로 처음부터 다시 올린다. 확정된 남의 조각을 덮어쓰지 않는다.
+    let mut generation = now;
+    let mut retries = 0;
+    let up = loop {
+        while existing.iter().any(|n| is_part_name(n) && n.starts_with(&format!("{generation}."))) {
+            generation += 1;
+        }
+        let mut mine: Vec<String> = Vec::new();
+        match upload_parts(remote, key, snapshot, base, &existing, generation, chunk, &mut mine) {
+            Ok(u) => break u,
+            Err(VaultError::Conflict) if retries < MAX_GENERATION_RETRIES => {
+                for n in &mine {
+                    let _ = remote.delete(n);
+                }
+                retries += 1;
+                generation += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    };
+    let Uploaded { parts, total, sha256, stats } = up;
+    let mut st = stats;
     let m = VaultManifest {
         version: 1,
         generation,
@@ -533,7 +599,7 @@ pub fn push_snapshot(
         saved_at: now,
         chunk_size: chunk as u64,
         total_len: total,
-        sha256: hex(&all.finalize()),
+        sha256,
         parts,
     };
     let json = serde_json::to_vec(&m).map_err(|e| VaultError::Corrupt(e.to_string()))?;
@@ -978,5 +1044,67 @@ mod tests {
         assert!(f.get("../x").is_err());
         assert!(f.put("a/b", b"1", PutCond::Any).is_err());
         assert!(f.delete("..").is_err());
+    }
+
+    /// 첫 조각을 올리려는 순간 다른 기기가 같은 이름의 조각을 먼저 올린 것처럼 만드는 서버.
+    struct RacyRemote {
+        inner: MemoryRemote,
+        raced: std::cell::Cell<bool>,
+        foreign: std::cell::RefCell<String>,
+    }
+
+    impl Remote for RacyRemote {
+        fn get(&self, name: &str) -> Result<Option<(Vec<u8>, Etag)>, RemoteError> {
+            self.inner.get(name)
+        }
+        fn put(&self, name: &str, data: &[u8], cond: PutCond) -> Result<Etag, RemoteError> {
+            if !self.raced.get() && cond == PutCond::IfNoneMatch && is_part_name(name) {
+                self.raced.set(true);
+                self.inner.set_raw(name, "다른 기기의 조각".as_bytes().to_vec());
+                *self.foreign.borrow_mut() = name.to_string();
+            }
+            self.inner.put(name, data, cond)
+        }
+        fn delete(&self, name: &str) -> Result<(), RemoteError> {
+            self.inner.delete(name)
+        }
+        fn list(&self) -> Result<Vec<String>, RemoteError> {
+            self.inner.list()
+        }
+    }
+
+    #[test]
+    fn 세대_번호가_부딪히면_남의_조각을_두고_다음_번호로_다시_올린다() {
+        let d = tmpdir("racy");
+        let k = key(5);
+        let plain = data(CHUNK * 2 + 77, 9);
+        let snap = write(&d, "snap", &plain);
+        let r = RacyRemote { inner: MemoryRemote::new(), raced: std::cell::Cell::new(false), foreign: Default::default() };
+        let st = push_snapshot(&r, &k, &snap, None, "pc1", 100, CHUNK).unwrap();
+        // 부딪힌 번호(100)는 남의 것이므로 건드리지 않고 다음 번호로 올렸다
+        assert!(r.raced.get());
+        assert_eq!(st.generation, 101);
+        assert_eq!(r.inner.raw(&r.foreign.borrow()).unwrap(), "다른 기기의 조각".as_bytes());
+        // 우리가 부딪히기 전에 올린 조각은 남지 않는다: 100번 조각은 남의 것 하나뿐이다
+        assert_eq!(r.inner.names().iter().filter(|n| n.starts_with("100.")).count(), 1);
+        // 올린 저장본은 온전히 받아진다
+        let s = read_state(&r, &k).unwrap().unwrap();
+        assert_eq!(s.manifest.generation, 101);
+        let out = d.join("out");
+        fetch_snapshot(&r, &k, &s.manifest, &out).unwrap();
+        assert_eq!(fs::read(&out).unwrap(), plain);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn 폴더_remote는_없을_때만_쓰기를_원자적으로_거절한다() {
+        let d = tmpdir("excl");
+        let f = FolderRemote::new(d.join("srv"));
+        f.put("x.part", b"first", PutCond::IfNoneMatch).unwrap();
+        assert_eq!(f.put("x.part", b"second", PutCond::IfNoneMatch).unwrap_err(), RemoteError::Conflict);
+        assert_eq!(f.get("x.part").unwrap().unwrap().0, b"first");
+        // 임시 파일이 남지 않는다
+        assert!(!f.list().unwrap().iter().any(|n| n.ends_with(".akashic-tmp")));
+        let _ = fs::remove_dir_all(&d);
     }
 }
