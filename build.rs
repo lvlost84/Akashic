@@ -46,7 +46,19 @@ fn embed_resources() {
         println!("cargo:warning=rc.exe를 찾지 못해 exe 아이콘을 넣지 않습니다");
         return;
     };
-    let ok = Command::new(rc).args(["/nologo", "/fo"]).arg(&res).arg("assets/app.rc").status().map(|s| s.success()).unwrap_or(false);
+    // app.rc의 버전 자리표시자를 Cargo.toml의 version으로 채워 OUT_DIR에 쓴다(exe 속성의 파일·제품 버전).
+    let ver = env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".into());
+    let mut n: Vec<u32> = ver.split(|c: char| !c.is_ascii_digit()).filter(|x| !x.is_empty()).map(|x| x.parse().unwrap_or(0)).collect();
+    n.resize(4, 0);
+    let comma = format!("{},{},{},{}", n[0], n[1], n[2], n[3]);
+    let Ok(tpl) = std::fs::read_to_string("assets/app.rc") else {
+        println!("cargo:warning=assets/app.rc를 읽지 못해 exe 아이콘을 넣지 않습니다");
+        return;
+    };
+    let rc_src = PathBuf::from(env::var("OUT_DIR").unwrap()).join("app.rc");
+    let _ = std::fs::write(&rc_src, tpl.replace("@VER_COMMA@", &comma).replace("@VER@", &ver));
+    let icon_dir = std::fs::canonicalize("assets").unwrap_or_else(|_| PathBuf::from("assets"));
+    let ok = Command::new(rc).args(["/nologo", "/i"]).arg(&icon_dir).arg("/fo").arg(&res).arg(&rc_src).status().map(|s| s.success()).unwrap_or(false);
     if ok {
         println!("cargo:rustc-link-arg-bins={}", res.display());
     } else {

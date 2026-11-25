@@ -10,12 +10,17 @@ KnowVault(WPF)를 Rust + eframe/egui 0.37 + rusqlite로 다시 만드는 프로�
 - 오픈소스 고지: 빌드할 때 `THIRD-PARTY-LICENSES.md`가 자동 생성됨(build.rs)
 - 의존성 규칙: 직접 의존성 10개 이하, `default-features = false` 기본, 작업 후 미사용·중복·개수 점검
 
-## 현재 상태 (2026-11-24, 버전은 v2.26.0)
+## 현재 상태 (2026-11-25, 버전은 v2.26.1)
 - 직접 의존성 9개 + 빌드 의존성 1개(serde_json). Windows 대상 전체 크레이트 197개.
 - 이 PC에서 확인하지 못한 것: 사무실 PC(인텔 내장 그래픽)의 Vulkan 충돌 복구, 밝은 Windows 모드의 시작 시 글자 깨짐.
 - 남은 미개선 항목은 이 파일의 "미확인"·"남은 것" 표시와 로컬 `개선목록.md`(저장소에서는 제외) 참고(C5·C11은 2026-11-17에 처리).
 
 ## 기록
+
+### 2026-11-25 (v2.26.1: exe 속성의 파일·제품 버전이 늘 2.0.0이던 문제)
+- 원인: `assets/app.rc`에 버전이 2.0.0으로 고정돼 있었음(앱 안 정보 화면은 Cargo.toml을 읽어 정상).
+- 수정: app.rc에 `@VER@`·`@VER_COMMA@` 자리표시자를 두고, build.rs가 `CARGO_PKG_VERSION`으로 채운 사본을 OUT_DIR에 만들어 rc.exe로 컴파일(아이콘은 `/i assets`).
+- 확인: fast 빌드 exe의 파일·제품 버전이 2.26.0으로 표시됨. Actions 릴리스 빌드에서의 표시는 v2.26.1 릴리스 후 확인 필요.
 
 ### 2026-11-25 (오픈소스 고지를 저장소에 올림: THIRD-PARTY-LICENSES.md)
 - 자동 생성 파일 `LICENSE.md`를 `THIRD-PARTY-LICENSES.md`로 이름을 바꿔 저장소에 올림(`.gitignore`에서 뺌). 이름을 바꾼 이유: 루트에 `LICENSE`(Apache-2.0)와 `LICENSE.md`(고지 목록)가 함께 있으면 GitHub이 라이선스를 하나로 못 정하고 "Other"로 표시할 수 있음. 바꾼 곳: `build.rs`(생성 경로·메시지), `.github/workflows/release.yml`(릴리스에 첨부하는 파일 이름도 바뀜), 정보 탭 안내 문구(`about_ui.rs`), README(라이선스 구역에 두 파일 링크 표), DEVLOG 사용법 줄. 내용은 그대로(208개 구성 요소).
