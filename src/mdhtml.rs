@@ -562,7 +562,7 @@ mod tests {
             border: "#3a3f47".into(),
             ..Style::default()
         };
-        let mut measure = |s: &str, sc: f32| s.chars().map(|c| if c.is_ascii() { 0.52 } else { 1.0 }).sum::<f32>() * sc;
+        let measure = |s: &str, sc: f32| s.chars().map(|c| if c.is_ascii() { 0.52 } else { 1.0 }).sum::<f32>() * sc;
         let size = 15.0;
         let inner = to_html(body, &|_| None, &|n| Some(crate::math::to_svg(n, size, &mut |s, sc| measure(s, sc))));
         std::fs::write(out, page_styled("샘플 문서", &inner, &dark)).unwrap();
