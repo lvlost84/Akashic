@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="194" height="22" viewBox="0 0 194 22" role="img" aria-label="저장: 오프라인 · SQLite 한 파일">
+<title>저장: 오프라인 · SQLite 한 파일</title>
+<clipPath id="c"><rect width="194" height="22" rx="4"/></clipPath>
+<g clip-path="url(#c)">
+<rect width="40" height="22" fill="#273043"/>
+<rect x="40" width="154" height="22" fill="#0f8f84"/>
+</g>
+<g fill="#fff" font-family="'Malgun Gothic','Apple SD Gothic Neo','Noto Sans CJK KR','Segoe UI',Verdana,sans-serif" font-size="11" text-anchor="middle">
+<text x="20.0" y="15.0" textLength="29" lengthAdjust="spacingAndGlyphs">저장</text>
+<text x="117.1" y="15.0" font-weight="bold" textLength="143" lengthAdjust="spacingAndGlyphs">오프라인 · SQLite 한 파일</text>
+</g></svg>

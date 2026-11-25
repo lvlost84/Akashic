@@ -2,7 +2,17 @@
 
 문서를 분류와 태그로 모아 두고 빠르게 편집하는 **오프라인 마크다운 노트**입니다. 미리보기 없이 쓰는 즉시 서식이 적용되고, 모든 문서는 SQLite 파일 하나에 저장됩니다.
 
-Rust + eframe/egui + SQLite · Windows 전용 · 설치 과정 없는 단일 `Akashic.exe`
+<p align="center">
+  <a href="../../releases/latest"><img src="docs/badges/download.svg" alt="다운로드 Windows .exe"></a>
+</p>
+<p align="center">
+  <img src="docs/badges/platform.svg" alt="운영체제: Windows 10 · 11">
+  <img src="docs/badges/install.svg" alt="설치: 필요 없음 · 단일 exe">
+  <img src="docs/badges/storage.svg" alt="저장: 오프라인 · SQLite 한 파일">
+  <img src="docs/badges/sync.svg" alt="동기화: NAS WebDAV · 종단간 암호화">
+  <img src="docs/badges/ai.svg" alt="AI 연동: MCP 서버 내장">
+  <img src="docs/badges/built.svg" alt="제작: Rust · egui">
+</p>
 
 ## 주요 기능
 - **실시간 서식 편집**: 제목·굵게·목록·표·코드 블록·체크박스 등이 입력하는 즉시 그 모양으로 보입니다.

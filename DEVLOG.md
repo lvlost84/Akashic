@@ -17,6 +17,9 @@ KnowVault(WPF)를 Rust + eframe/egui 0.37 + rusqlite로 다시 만드는 프로�
 
 ## 기록
 
+### 2026-11-25 (README 배지, 커밋 전)
+- README 맨 위에 다운로드 단추와 배지 6개(운영체제·설치·저장·동기화·AI 연동·제작)를 추가. 외부 서비스(shields.io) 없이 `docs/badges/*.svg`를 쓰고, `docs/badges/make_badges.py`로 다시 만든다(문구·색은 이 파일 맨 위에서 바꿈). 한글 글꼴이 없는 환경에서도 `textLength`로 상자 밖으로 넘치지 않게 함. Edge 헤드리스로 밝은·어두운 배경 모두 눈으로 확인. **미확인**: GitHub 페이지에서의 실제 모양(푸시 후).
+
 ### 2026-11-24 (v2.26.0: 타이핑 효과, 부드러운 커서·글자 스며들기)
 - 옵션 "타이핑 효과"(끔/커서만/커서+글자, 기본 끔, `cfg.typing_fx`)와 "본문 커서 깜박임"(`cfg.caret_blink`, 기본 켬). 구현안 `docs/타이핑효과-구현안.md`를 egui 내장 기능 기준으로 고쳐서 진행(새 크레이트 없음).
 - 순수 함수 `src/typefx.rs`: `blink_alpha`(입력 직후 0.5초 선명, 그 뒤 코사인으로 서서히), `reveal_cover`(120ms, `emath::easing::exponential_out`), `typed_range`(1~20자 늘고 커서가 그만큼 움직였을 때만 방금 친 글자). 시험 3건.

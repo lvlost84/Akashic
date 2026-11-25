@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="215" height="22" viewBox="0 0 215 22" role="img" aria-label="동기화: NAS WebDAV · 종단간 암호화">
+<title>동기화: NAS WebDAV · 종단간 암호화</title>
+<clipPath id="c"><rect width="215" height="22" rx="4"/></clipPath>
+<g clip-path="url(#c)">
+<rect width="51" height="22" fill="#273043"/>
+<rect x="51" width="164" height="22" fill="#7a5af8"/>
+</g>
+<g fill="#fff" font-family="'Malgun Gothic','Apple SD Gothic Neo','Noto Sans CJK KR','Segoe UI',Verdana,sans-serif" font-size="11" text-anchor="middle">
+<text x="25.5" y="15.0" textLength="40" lengthAdjust="spacingAndGlyphs">동기화</text>
+<text x="133.2" y="15.0" font-weight="bold" textLength="154" lengthAdjust="spacingAndGlyphs">NAS WebDAV · 종단간 암호화</text>
+</g></svg>
