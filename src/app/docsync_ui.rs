@@ -25,6 +25,8 @@ struct Ds {
     auto: bool,
     snap: OpenSnap,
     ctx: Option<egui::Context>,
+    /// 실행 중인 작업에 멈추라고 알리는 표시. 20분이 넘으면 켠다.
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 thread_local! {
@@ -93,6 +95,8 @@ impl App {
         let name = device_label();
         let (tx, rx) = channel();
         let ctx = DS.with(|d| d.borrow().ctx.clone());
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_job = cancel.clone();
         std::thread::spawn(move || {
             let r = (|| -> Result<DsMsg, String> {
                 let db = crate::db::Db::open(&path)?;
@@ -107,7 +111,7 @@ impl App {
                         Some(m) => docsync::connect(&db, &key, m)?,
                     }
                 }
-                docsync::sync(&db, &remote, &key, &Opts::new(&name, crate::db::now())).map(|r| DsMsg::Done(Ok(r)))
+                docsync::sync(&db, &remote, &key, &Opts::new(&name, crate::db::now()).with_cancel(cancel_job)).map(|r| DsMsg::Done(Ok(r)))
             })();
             let _ = tx.send(r.unwrap_or_else(|x| DsMsg::Done(Err(x))));
             if let Some(c) = ctx {
@@ -120,6 +124,7 @@ impl App {
             d.started = Some(Instant::now());
             d.auto = auto;
             d.snap = snap;
+            d.cancel = Some(cancel);
         });
         Ok(true)
     }
@@ -193,20 +198,30 @@ impl App {
 
     /// 매 프레임: 작업 결과를 받아 반영한다.
     pub(super) fn ds_poll(&mut self) {
-        let (msg, stuck) = DS.with(|d| {
+        // 20분이 넘으면 작업 스레드에 취소를 알린다. 스레드가 실제로 끝날 때까지 rx를 두어 새 동기화가 겹쳐 시작되지 않게 한다.
+        let (msg, newly_stuck) = DS.with(|d| {
             let mut d = d.borrow_mut();
             let stuck = d.rx.is_some() && d.started.is_some_and(|t| t.elapsed() > STUCK);
+            let mut newly = false;
+            if stuck {
+                if let Some(c) = &d.cancel {
+                    newly = !c.swap(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
             let m = match d.rx.as_ref().map(|r| r.try_recv()) {
                 Some(Ok(m)) => Some(m),
                 Some(Err(TryRecvError::Disconnected)) => Some(DsMsg::Done(Err("동기화 작업이 중단되었습니다".into()))),
                 _ => None,
             };
-            if m.is_some() || stuck {
+            if m.is_some() {
                 d.rx = None;
+                d.cancel = None;
             }
-            (m, stuck)
+            (m, newly)
         });
-        let msg = if stuck { Some(DsMsg::Done(Err("동기화가 20분 넘게 끝나지 않아 중단했습니다(서버 접근을 확인하세요)".into()))) } else { msg };
+        if newly_stuck {
+            self.say("동기화가 20분 넘게 끝나지 않아 취소를 요청했습니다(서버 접근을 확인하세요). 작업이 멈출 때까지 새 동기화는 시작하지 않습니다");
+        }
         let Some(msg) = msg else { return };
         let (auto, snap) = DS.with(|d| {
             let mut d = d.borrow_mut();

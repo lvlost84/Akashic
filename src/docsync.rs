@@ -846,8 +846,9 @@ fn image_hashes(recs: &[Rec]) -> BTreeSet<String> {
     s
 }
 
-fn push_images(db: &Db, remote: &dyn Remote, key: &VaultKey, hashes: &BTreeSet<String>, have: &HashSet<String>, rep: &mut Report) -> Res<()> {
+fn push_images(db: &Db, remote: &dyn Remote, key: &VaultKey, hashes: &BTreeSet<String>, have: &HashSet<String>, rep: &mut Report, o: &Opts) -> Res<()> {
     for h in hashes {
+        o.check()?;
         let name = img_name(h);
         if have.contains(&name) {
             continue;
@@ -875,8 +876,9 @@ fn file_hashes(recs: &[Rec]) -> BTreeSet<String> {
 }
 
 /// 올리는 문서가 가리키는 첨부 파일을 서버에 올린다(이미 있으면 건너뜀).
-fn push_files(db: &Db, remote: &dyn Remote, key: &VaultKey, hashes: &BTreeSet<String>, have: &HashSet<String>) -> Res<()> {
+fn push_files(db: &Db, remote: &dyn Remote, key: &VaultKey, hashes: &BTreeSet<String>, have: &HashSet<String>, o: &Opts) -> Res<()> {
     for h in hashes {
+        o.check()?;
         let name = file_name(h);
         if have.contains(&name) {
             continue;
@@ -892,7 +894,7 @@ fn push_files(db: &Db, remote: &dyn Remote, key: &VaultKey, hashes: &BTreeSet<St
 }
 
 /// 본문이 가리키는데 로컬에 없는 첨부 파일을 받는다. 못 받은 것이 있으면 true.
-fn pull_files(db: &Db, remote: &dyn Remote, key: &VaultKey) -> Res<bool> {
+fn pull_files(db: &Db, remote: &dyn Remote, key: &VaultKey, o: &Opts) -> Res<bool> {
     let mut want: BTreeSet<String> = BTreeSet::new();
     {
         let mut st = db.conn.prepare("SELECT body FROM docs WHERE body LIKE '%[[file:%'").map_err(e)?;
@@ -902,6 +904,7 @@ fn pull_files(db: &Db, remote: &dyn Remote, key: &VaultKey) -> Res<bool> {
     }
     let mut missing = false;
     for h in want {
+        o.check()?;
         if db.has_file(&h)? {
             continue;
         }
@@ -918,7 +921,7 @@ fn pull_files(db: &Db, remote: &dyn Remote, key: &VaultKey) -> Res<bool> {
 }
 
 /// 본문이 가리키는데 로컬에 없는 이미지를 받는다. 못 받은 것이 있으면 다음 동기화 때 다시 시도하도록 표시한다.
-fn pull_images(db: &Db, remote: &dyn Remote, key: &VaultKey, rep: &mut Report) -> Res<()> {
+fn pull_images(db: &Db, remote: &dyn Remote, key: &VaultKey, rep: &mut Report, o: &Opts) -> Res<()> {
     let mut want: BTreeSet<String> = BTreeSet::new();
     {
         let mut st = db.conn.prepare("SELECT body FROM docs WHERE body LIKE '%img:%'").map_err(e)?;
@@ -928,6 +931,7 @@ fn pull_images(db: &Db, remote: &dyn Remote, key: &VaultKey, rep: &mut Report) -
     }
     let mut missing = false;
     for h in want {
+        o.check()?;
         if db.get_image(&h)?.is_some() {
             continue;
         }
@@ -945,7 +949,7 @@ fn pull_images(db: &Db, remote: &dyn Remote, key: &VaultKey, rep: &mut Report) -
             None => missing = true,
         }
     }
-    let files_missing = pull_files(db, remote, key)?;
+    let files_missing = pull_files(db, remote, key, o)?;
     mset(db, "ds_img_pending", if missing || files_missing { "1" } else { "0" })
 }
 
@@ -957,11 +961,30 @@ pub struct Opts<'a> {
     pub now: i64,
     pub ckpt_every: u64,
     pub retain_days: i64,
+    /// 켜지면 `sync`가 안전한 지점에서 멈춘다(올리기 도중 쪼개지 않는다). 없으면 취소할 수 없다.
+    pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
+
+/// 취소로 멈췄을 때의 오류 문구.
+pub const CANCELLED: &str = "동기화를 취소했습니다";
 
 impl<'a> Opts<'a> {
     pub fn new(name: &'a str, now: i64) -> Self {
-        Opts { name, now, ckpt_every: CKPT_EVERY, retain_days: RETAIN_DAYS }
+        Opts { name, now, ckpt_every: CKPT_EVERY, retain_days: RETAIN_DAYS, cancel: None }
+    }
+
+    pub fn with_cancel(mut self, cancel: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel.as_ref().is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// 취소됐으면 오류를 돌려 `?`로 빠져나가게 한다. 서버에 쓰는 한 단계(올리기 → 순번 기록)의 사이에는 부르지 않는다.
+    fn check(&self) -> Res<()> {
+        if self.cancelled() { Err(CANCELLED.into()) } else { Ok(()) }
     }
 }
 
@@ -1004,6 +1027,7 @@ pub fn sync(db: &Db, remote: &dyn Remote, key: &VaultKey, o: &Opts) -> Res<Repor
     }
     let me = device_id(db).ok_or("기기 ID가 없습니다")?;
     let mut rep = Report::default();
+    o.check()?;
     let names = remote.list().map_err(rerr)?;
     let ix = index(&names);
     let mut pull_err: Option<String> = None;
@@ -1017,6 +1041,7 @@ pub fn sync(db: &Db, remote: &dyn Remote, key: &VaultKey, o: &Opts) -> Res<Repor
         seqs.iter().any(|s| *s > c) && !seqs.contains(&(c + 1))
     });
     if (fresh || gap) && !ix.ckpts.is_empty() {
+        o.check()?;
         let name = ix.ckpts.last().unwrap().0.clone();
         match read_batch(remote, key, &name) {
             Ok(b) => {
@@ -1040,6 +1065,7 @@ pub fn sync(db: &Db, remote: &dyn Remote, key: &VaultKey, o: &Opts) -> Res<Repor
                     pull_err = Some(format!("{d}의 로그 {}번이 없습니다(정리되었거나 누락). 체크포인트로 다시 시작해야 합니다", c + 1));
                     continue 'devs;
                 }
+                o.check()?; // 아직 아무것도 적용하지 않았다: 여기서 멈추면 읽은 위치도 그대로라 다음에 처음부터 다시 받는다
                 let name = log_name(d, *s);
                 match read_batch(remote, key, &name) {
                     Ok(b) if b.dev == *d && b.seq == *s => {
@@ -1062,6 +1088,7 @@ pub fn sync(db: &Db, remote: &dyn Remote, key: &VaultKey, o: &Opts) -> Res<Repor
     }
 
     // 2) 적용 + 읽은 위치 저장(한 트랜잭션처럼: 적용 뒤 위치 저장, 실패해도 멱등이라 다시 받아도 안전)
+    o.check()?;
     apply_records(db, &recs, &me, o.name, &mut rep)?;
     for (d, s) in &new_cur {
         mset(db, &format!("ds_cur:{d}"), &s.to_string())?;
@@ -1073,16 +1100,18 @@ pub fn sync(db: &Db, remote: &dyn Remote, key: &VaultKey, o: &Opts) -> Res<Repor
         return Err(x);
     }
     if rep.applied > 0 || mget(db, "ds_img_pending").as_deref() == Some("1") {
-        pull_images(db, remote, key, &mut rep)?;
+        pull_images(db, remote, key, &mut rep, o)?;
     }
 
     // 3) 올리기
+    o.check()?;
     let out = collect_dirty(db, &me, o.name)?;
     let mut seq = mget_u64(db, "ds_seq");
     if !out.is_empty() {
         let have: HashSet<String> = names.iter().cloned().collect();
-        push_images(db, remote, key, &image_hashes(&out), &have, &mut rep)?;
-        push_files(db, remote, key, &file_hashes(&out), &have)?;
+        push_images(db, remote, key, &image_hashes(&out), &have, &mut rep, o)?;
+        push_files(db, remote, key, &file_hashes(&out), &have, o)?;
+        o.check()?; // 로그를 올리고 순번을 기록하는 사이에는 멈추지 않는다
         let mut tries = 0;
         loop {
             let n = seq + 1;
@@ -1106,7 +1135,13 @@ pub fn sync(db: &Db, remote: &dyn Remote, key: &VaultKey, o: &Opts) -> Res<Repor
         rep.pushed = out.len();
     }
 
-    // 4) 기기 파일, 체크포인트, 정리(실패해도 동기화 자체는 성공)
+    // 4) 기기 파일, 체크포인트, 정리(실패해도 동기화 자체는 성공). 여기까지 왔으면 올리기는 끝났으므로
+    // 취소돼도 오류가 아니라 성공으로 마친다(남은 정리는 다음 동기화가 한다).
+    if o.cancelled() {
+        rep.changed_docs.sort_unstable();
+        rep.changed_docs.dedup();
+        return Ok(rep);
+    }
     let mut cursors: BTreeMap<String, u64> = BTreeMap::new();
     {
         let mut st = db.conn.prepare("SELECT key,value FROM meta WHERE key LIKE 'ds_cur:%'").map_err(e)?;

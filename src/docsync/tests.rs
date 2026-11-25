@@ -23,7 +23,7 @@ fn node(tag: &str, mode: Connect) -> Node {
 }
 
 fn sync_with(n: &Node, r: &MemoryRemote, ckpt_every: u64) -> Res<Report> {
-    sync(&n.db, r, &key(), &Opts { name: &n.name, now: NOW, ckpt_every, retain_days: 90 })
+    sync(&n.db, r, &key(), &Opts { name: &n.name, now: NOW, ckpt_every, retain_days: 90, cancel: None })
 }
 fn sync1(n: &Node, r: &MemoryRemote) -> Res<Report> {
     sync_with(n, r, 1000)
@@ -335,7 +335,7 @@ fn 오래_접속_안_한_기기는_체크포인트로_다시_시작하고_로컬
     b.db.save_doc(id_of(&b.db, "문서"), "문서", &LINES.replace("일곱", "B일곱")).unwrap();
     for i in 0..6 {
         a.db.save_doc(id_of(&a.db, "문서"), "문서", &LINES.replace("하나", &format!("A{i}"))).unwrap();
-        sync(&a.db, &r, &key(), &Opts { name: "a", now: NOW + 200 * 86400, ckpt_every: 2, retain_days: 90 }).unwrap();
+        sync(&a.db, &r, &key(), &Opts { name: "a", now: NOW + 200 * 86400, ckpt_every: 2, retain_days: 90, cancel: None }).unwrap();
     }
     // 90일이 지난 기기는 정리 기준에서 빠져, b가 읽지 않은 로그도 지워졌다
     assert!(!r.names().contains(&log_name(&device_id(&a.db).unwrap(), 1)) || true);
@@ -638,4 +638,19 @@ fn perf_docsync() {
     let rep = sync1(&c, &r).unwrap();
     println!("C 새 기기 시작 {}개: {:?}", rep.applied, t.elapsed());
     assert_eq!(state(&a.db).len(), state(&c.db).len());
+}
+
+#[test]
+fn 취소하면_서버에_아무것도_올리지_않고_다음_동기화가_이어받는다() {
+    let r = MemoryRemote::new();
+    let (a, b) = (node("a-cancel", Connect::New), node("b-cancel", Connect::New));
+    doc(&a.db, "취소 전 문서", "내용");
+    let before = r.list().unwrap().len();
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let o = Opts::new(&a.name, NOW).with_cancel(flag);
+    assert_eq!(sync(&a.db, &r, &key(), &o).unwrap_err(), CANCELLED);
+    assert_eq!(r.list().unwrap().len(), before, "취소했는데 서버가 바뀌었다");
+    // 취소는 아무것도 확정하지 않았으므로 다음 동기화가 그대로 올린다
+    settle(&[&a, &b], &r);
+    assert_eq!(body(&b.db, id_of(&b.db, "취소 전 문서")), "내용");
 }
