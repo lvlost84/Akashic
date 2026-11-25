@@ -273,7 +273,7 @@ pub fn footnote_jump(text: &str, char_idx: usize) -> Option<usize> {
     let mut in_fence = false;
     for (n, l) in text.lines().enumerate() {
         let l = l.trim_end_matches('\r');
-        if l.trim_start().starts_with("```") {
+        if is_fence_line(l) {
             in_fence = !in_fence;
             continue;
         }
@@ -643,10 +643,11 @@ pub fn scan_blocks(text: &str) -> Vec<Block> {
     while i < lines.len() {
         let line = lines[i];
         let tl = line.trim_start();
-        if tl.starts_with("```") {
-            let lang = tl[3..].split_whitespace().next().unwrap_or("").trim_matches('`').to_string();
+        if let Some(marker) = fence_marker(line) {
+            let lang = tl[3..].split_whitespace().next().unwrap_or("").trim_matches(marker).to_string();
             let mut j = i + 1;
-            while j < lines.len() && !lines[j].trim_start().starts_with("```") {
+            // 여는 표지와 같은 표지의 울타리 줄에서만 닫힌다(``` 블록 안의 ~~~ 줄은 코드다)
+            while j < lines.len() && fence_marker(lines[j]) != Some(marker) {
                 j += 1;
             }
             let closed = j < lines.len();
@@ -661,7 +662,7 @@ pub fn scan_blocks(text: &str) -> Vec<Block> {
                 if split_cells(line).len() == n {
                     let mut rows = vec![fix_cols(split_cells(line), n)];
                     let mut j = i + 2;
-                    while j < lines.len() && lines[j].contains('|') && !lines[j].trim_start().starts_with("```") {
+                    while j < lines.len() && lines[j].contains('|') && !is_fence_line(lines[j]) {
                         rows.push(fix_cols(split_cells(lines[j]), n));
                         j += 1;
                     }
@@ -674,7 +675,7 @@ pub fn scan_blocks(text: &str) -> Vec<Block> {
         if line.trim() == "$$" {
             // 여러 줄 수식: 다음 `$$`만 있는 줄까지. 빈 줄·코드 펜스를 만나면 짝이 없는 것으로 보고(문서 뒤쪽을 삼키지 않는다) 그냥 글로 둔다.
             let mut j = i + 1;
-            while j < lines.len() && lines[j].trim() != "$$" && !lines[j].trim().is_empty() && !lines[j].trim_start().starts_with("```") {
+            while j < lines.len() && lines[j].trim() != "$$" && !lines[j].trim().is_empty() && !is_fence_line(lines[j]) {
                 j += 1;
             }
             if j < lines.len() && lines[j].trim() == "$$" {
@@ -869,7 +870,7 @@ pub fn headings(text: &str) -> Vec<Heading> {
     let mut out = Vec::new();
     let mut in_fence = false;
     for (n, line) in text.lines().enumerate() {
-        if line.trim_start().starts_with("```") {
+        if is_fence_line(line) {
             in_fence = !in_fence;
             continue;
         }
@@ -949,7 +950,7 @@ pub fn wiki_links(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut in_fence = false;
     for line in text.lines() {
-        if line.trim_start().starts_with("```") {
+        if is_fence_line(line) {
             in_fence = !in_fence;
             continue;
         }
@@ -1163,13 +1164,30 @@ fn url_in_line(line: &str, col: usize) -> Option<String> {
     None
 }
 
+/// 코드 울타리 줄이면 그 표지 글자(``` 는 '`', ~~~ 는 '~'). CommonMark·GFM처럼 둘 다 울타리로 본다.
+pub fn fence_marker(line: &str) -> Option<char> {
+    let t = line.trim_start();
+    if t.starts_with("```") {
+        Some('`')
+    } else if t.starts_with("~~~") {
+        Some('~')
+    } else {
+        None
+    }
+}
+
+/// 코드 울타리 줄인가. 모든 울타리 판정이 이 함수(또는 `fence_marker`)를 쓴다.
+/// 열고 닫는 표지가 같아야 하는 규칙은 코드 블록을 그리는 `scan_blocks`에서 지키고, 줄 단위로 켜고 끄는 단순 판정은 표지를 구분하지 않는다.
+pub fn is_fence_line(line: &str) -> bool {
+    fence_marker(line).is_some()
+}
+
 /// 문자 위치가 있는 줄과 줄 안 글자 위치. 코드 블록(``` · ~~~) 줄과 그 안은 링크가 아니므로 `None`.
 fn link_line_at(text: &str, char_idx: usize) -> Option<(&str, usize)> {
     let mut base = 0;
     let mut in_fence = false;
     for line in text.split('\n') {
-        let t = line.trim_start();
-        let fence = t.starts_with("```") || t.starts_with("~~~");
+        let fence = is_fence_line(line);
         if fence {
             in_fence = !in_fence;
         }
@@ -1274,7 +1292,7 @@ fn checkbox_hit(text: &str, char_idx: usize) -> Option<(usize, usize, bool)> {
         return None;
     }
     // 코드 블록 안은 체크박스가 아니다.
-    let fences = text[..ls].lines().filter(|l| l.trim_start().starts_with("```")).count();
+    let fences = text[..ls].lines().filter(|l| is_fence_line(l)).count();
     if fences % 2 == 1 {
         return None;
     }
@@ -1956,7 +1974,7 @@ pub fn renumber(text: &str, cursor: usize) -> Option<(String, usize)> {
     let mut fence = vec![false; lines.len()];
     let mut inf = false;
     for (i, l) in lines.iter().enumerate() {
-        if l.trim_start().starts_with("```") {
+        if is_fence_line(l) {
             inf = !inf;
             fence[i] = true;
         } else {
@@ -2116,7 +2134,7 @@ pub fn hang_info(text: &str) -> (Vec<Option<usize>>, usize) {
     let mut in_fence = false;
     for line in text.split('\n') {
         let line = line.trim_end_matches('\r');
-        if line.trim_start().starts_with("```") {
+        if is_fence_line(line) {
             in_fence = !in_fence;
             out.push(None);
             continue;
@@ -2251,6 +2269,15 @@ mod url_tests {
         assert_eq!(url_at(t, ci("https://e.f")).as_deref(), Some("https://e.f"));
         let t2 = "~~~\nhttps://c.d\n~~~";
         assert_eq!(url_at(t2, 6), None);
+        assert!(is_fence_line("  ```rust") && is_fence_line("~~~") && !is_fence_line("글 ```") && !is_fence_line("~~물결~~"));
+    }
+
+    #[test]
+    fn fence_closes_only_with_the_same_marker() {
+        let b = scan_blocks("~~~\n```\n코드\n```\n~~~\n뒤");
+        let codes: Vec<_> = b.iter().filter(|x| matches!(x.kind, BlockKind::Code { .. })).collect();
+        assert_eq!(codes.len(), 1);
+        assert_eq!((codes[0].start, codes[0].end), (0, 4));
     }
 
     #[test]

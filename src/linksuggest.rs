@@ -35,7 +35,7 @@ pub fn query_at(text: &str, caret: usize) -> Option<(usize, String)> {
     }
     // 코드 블록 안(앞에서 ``` 또는 ~~~ 펜스가 홀수 번 나옴)이면 링크가 아니다
     let before: String = chars[..line_start].iter().collect();
-    let fences = before.lines().filter(|l| { let t = l.trim_start(); t.starts_with("```") || t.starts_with("~~~") }).count();
+    let fences = before.lines().filter(|l| crate::md::is_fence_line(l)).count();
     if fences % 2 == 1 {
         return None;
     }

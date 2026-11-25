@@ -1909,7 +1909,7 @@ impl App {
             let ls = self.body[..bi].rfind('\n').map_or(0, |p| p + 1);
             let le = self.body[bi..].find('\n').map_or(self.body.len(), |p| bi + p);
             let line = self.body[ls..le].trim_end_matches('\r').to_string();
-            let in_fence = self.body[..ls].lines().filter(|l| l.trim_start().starts_with("```")).count() % 2 == 1;
+            let in_fence = self.body[..ls].lines().filter(|l| crate::md::is_fence_line(l)).count() % 2 == 1;
             if !in_fence && bi == ls + line.len() {
                 match md::continue_list(&line) {
                     Some(md::Enter::Insert(p)) => {

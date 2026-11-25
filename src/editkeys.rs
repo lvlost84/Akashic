@@ -85,7 +85,7 @@ fn fence_flags(lines: &Lines) -> Vec<bool> {
         .content
         .iter()
         .map(|l| {
-            if l.trim_start().starts_with("```") {
+            if is_fence_line(l) {
                 inf = !inf;
                 true // 펜스 줄 자체는 코드 블록 취급
             } else {
@@ -345,8 +345,7 @@ fn respace_line(line: &str, mode: SpaceMode) -> String {
 
 /// 코드 울타리(``` 또는 ~~~) 줄인가
 fn is_fence_line(line: &str) -> bool {
-    let t = line.trim_start();
-    t.starts_with("```") || t.starts_with("~~~")
+    crate::md::is_fence_line(line)
 }
 
 /// 표 줄인가(들여쓰기 뒤가 `|`로 시작)
@@ -653,7 +652,7 @@ pub fn continue_after_plain_enter(text: &str, caret: usize) -> Option<(String, u
     let prev_all = &before[..before.len() - 1];
     let prev = prev_all[prev_all.rfind('\n').map_or(0, |p| p + 1)..].trim_end_matches('\r');
     // 윗줄이 코드 블록 안이면 이어쓰지 않는다
-    let in_fence = prev_all.lines().filter(|l| l.trim_start().starts_with("```")).count() % 2 == 1;
+    let in_fence = prev_all.lines().filter(|l| is_fence_line(l)).count() % 2 == 1;
     if in_fence {
         return None;
     }

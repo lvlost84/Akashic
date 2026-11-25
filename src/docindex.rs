@@ -38,7 +38,7 @@ fn code_flags(lines: &[String]) -> Vec<bool> {
     lines
         .iter()
         .map(|l| {
-            if l.trim_start().starts_with("```") {
+            if crate::md::is_fence_line(l) {
                 in_fence = !in_fence;
                 true
             } else {

@@ -406,7 +406,7 @@ fn show_result(ui: &mut egui::Ui, t: &Topic, theme: &Theme, size: f32) {
                 if !lines.is_empty() {
                     lines.remove(0);
                 }
-                if lines.last().map_or(false, |l| l.trim_start().starts_with("```")) {
+                if lines.last().map_or(false, |l| crate::md::is_fence_line(l)) {
                     lines.pop();
                 }
                 egui::Frame::new().fill(theme.code_bg).stroke(Stroke::new(1.0, theme.border)).inner_margin(egui::Margin::same(8)).show(ui, |ui| {

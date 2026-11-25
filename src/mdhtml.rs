@@ -167,8 +167,7 @@ fn heading(t: &str) -> Option<(usize, &str)> {
 }
 
 fn is_fence(t: &str) -> bool {
-    let t = t.trim_start();
-    t.starts_with("```") || t.starts_with("~~~")
+    crate::md::is_fence_line(t)
 }
 
 /// 목록 줄이면 (들여쓰기 폭, 숫자 목록인가, 기호 뒤 내용)
