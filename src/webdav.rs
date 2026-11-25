@@ -12,6 +12,8 @@ use crate::vault::{Etag, PutCond, Remote, RemoteError};
 /// 연결 시간 제한(초)과 요청 하나의 전체 시간 제한(초).
 const CONNECT_SECS: u32 = 15;
 const MAX_SECS: u32 = 180;
+/// 약한 ETag 서버에서 manifest를 고칠 때 거는 잠금의 만료 시간(초). 비정상 종료로 UNLOCK을 못 해도 이 시간이 지나면 서버가 푼다.
+const LOCK_SECS: u32 = 60;
 
 // ───────────────────────── 순수 함수 ─────────────────────────
 
@@ -180,6 +182,30 @@ pub fn parse_propfind(xml: &str) -> Vec<String> {
     names
 }
 
+// ───────────────────────── 잠금(LOCK) ─────────────────────────
+
+/// 독점 쓰기 잠금 요청 본문(RFC 4918).
+pub fn lock_request_xml() -> &'static str {
+    "<?xml version=\"1.0\" encoding=\"utf-8\"?><D:lockinfo xmlns:D=\"DAV:\"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype><D:owner>Akashic</D:owner></D:lockinfo>"
+}
+
+/// LOCK 응답에서 잠금 토큰을 뽑는다. `Lock-Token: <토큰>` 헤더가 먼저, 없으면 본문의 `<locktoken><href>토큰</href>`.
+pub fn parse_lock_token(header: Option<&str>, body: &str) -> Option<String> {
+    let clean = |s: &str| {
+        let t = s.trim().trim_start_matches('<').trim_end_matches('>').trim().to_string();
+        (!t.is_empty() && t.len() <= 512 && !t.chars().any(|c| c.is_control() || c.is_whitespace() || c == '<' || c == '>')).then_some(t)
+    };
+    if let Some(t) = header.and_then(clean) {
+        return Some(t);
+    }
+    let lower = body.to_ascii_lowercase();
+    let from = lower.find("locktoken")?;
+    let after = &body[from..];
+    let h = after.to_ascii_lowercase().find("href>")?;
+    let text = &after[h + 5..];
+    clean(&xml_unescape(&text[..text.find('<').unwrap_or(text.len())]))
+}
+
 // ───────────────────────── curl ─────────────────────────
 
 fn curl_cmd() -> Command {
@@ -212,6 +238,21 @@ pub struct WebDavRemote {
     folder: String,
     user: String,
     pass: String,
+}
+
+/// 잠금을 잡고 있는 동안만 산다. 버려질 때(오류로 빠져나갈 때도) 잠금을 푼다. 풀지 못해도 만료 시간이 지나면 서버가 푼다.
+struct LockGuard<'a> {
+    remote: &'a WebDavRemote,
+    name: &'a str,
+    token: String,
+}
+
+impl Drop for LockGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(url) = self.remote.file_url(self.name) {
+            let _ = self.remote.run(Req { method: "UNLOCK", url, headers: vec![format!("Lock-Token: <{}>", self.token)], body: None });
+        }
+    }
 }
 
 impl WebDavRemote {
@@ -266,8 +307,9 @@ impl WebDavRemote {
             cfg.push_str("head
 ");
         } else if req.body.is_some() {
-            cfg.push_str("request = \"PUT\"
-");
+            // 본문이 있는 요청(PUT, LOCK)은 그 메서드로 보낸다.
+            cfg.push_str(&format!("request = \"{}\"
+", req.method));
         } else {
             cfg.push_str(&format!("request = \"{}\"
 ", req.method));
@@ -307,6 +349,22 @@ impl WebDavRemote {
         }
     }
 
+    /// 파일에 독점 쓰기 잠금을 건다. 서버가 잠금을 지원하지 않거나 예상 밖으로 답하면 `None`(호출한 쪽이 잠금 없이 진행한다).
+    /// 다른 기기가 이미 잠갔으면(423) `Conflict`.
+    fn try_lock(&self, name: &str) -> Result<Option<String>, RemoteError> {
+        let r = self.run(Req {
+            method: "LOCK",
+            url: self.file_url(name)?,
+            headers: vec!["Content-Type: application/xml; charset=utf-8".into(), "Depth: 0".into(), format!("Timeout: Second-{LOCK_SECS}")],
+            body: Some(lock_request_xml().as_bytes()),
+        })?;
+        match r.status {
+            200 | 201 => Ok(parse_lock_token(r.header("lock-token"), &String::from_utf8_lossy(&r.body))),
+            423 => Err(RemoteError::Conflict),
+            _ => Ok(None),
+        }
+    }
+
     fn head_etag(&self, name: &str) -> Result<Etag, RemoteError> {
         let r = self.run(Req { method: "HEAD", url: self.file_url(name)?, headers: vec![], body: None })?;
         if let Some(e) = status_error(r.status) {
@@ -332,13 +390,19 @@ impl Remote for WebDavRemote {
     fn put(&self, name: &str, data: &[u8], cond: PutCond) -> Result<Etag, RemoteError> {
         let url = self.file_url(name)?;
         let mut headers = vec!["Content-Type: application/octet-stream".to_string()];
+        let mut _lock: Option<LockGuard> = None; // 이 함수가 끝날 때까지 잠금을 쥐고 있다가 푼다
         match &cond {
             PutCond::Any => {}
             PutCond::IfMatch(tok) => {
                 let (etag, lm) = split_token(tok);
                 if is_weak(etag) {
-                    // 약한 ETag(W/"…")는 If-Match 가 받아 주지 않는다(강한 비교만 허용). 올리기 직전에 지금 값이 내가 본 값과
-                    // 같은지 직접 확인하고, 서버가 지켜 주는 If-Unmodified-Since(마지막으로 본 수정 시각 + 1초)를 함께 건다.
+                    // 약한 ETag(W/"…")는 If-Match 가 받아 주지 않는다(강한 비교만 허용). 서버가 WebDAV 잠금(LOCK)을 지원하면
+                    // 파일을 잠근 채로 지금 값이 내가 본 값과 같은지 확인하고 올려서, 확인과 올리기 사이에 다른 기기가 끼어들지 못하게 한다.
+                    if let Some(token) = self.try_lock(name)? {
+                        headers.push(format!("If: (<{token}>)"));
+                        _lock = Some(LockGuard { remote: self, name, token });
+                    }
+                    // 잠금이 없는 서버는 올리기 직전에 직접 확인하고, 서버가 지켜 주는 If-Unmodified-Since(마지막으로 본 수정 시각 + 1초)를 함께 건다.
                     // 서버의 수정 시각은 마이크로초라 같은 초를 그대로 주면 맞는 값도 거절되므로 1초를 더한다.
                     let cur = self.head_etag(name)?;
                     if split_token(&cur).0 != etag {
@@ -714,5 +778,20 @@ mod tests {
         }
         assert!(remote.list().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lock_request_and_token_parsing() {
+        let x = lock_request_xml();
+        assert!(x.contains("<D:exclusive/>") && x.contains("<D:write/>") && !x.contains("사용자"));
+        // 헤더가 있으면 꺾쇠를 떼고 쓴다
+        assert_eq!(parse_lock_token(Some("<opaquelocktoken:abc-123>"), "").as_deref(), Some("opaquelocktoken:abc-123"));
+        // 헤더가 없으면 본문의 locktoken/href
+        let body = "<?xml version=\"1.0\"?><D:prop xmlns:D=\"DAV:\"><D:lockdiscovery><D:activelock><D:locktoken><D:href>opaquelocktoken:f81d4fae</D:href></D:locktoken></D:activelock></D:lockdiscovery></D:prop>";
+        assert_eq!(parse_lock_token(None, body).as_deref(), Some("opaquelocktoken:f81d4fae"));
+        // 토큰을 못 읽으면 None, 이상한 글자가 든 값은 거절
+        assert_eq!(parse_lock_token(None, "<D:prop/>"), None);
+        assert_eq!(parse_lock_token(Some("<a b>"), ""), None);
+        assert_eq!(parse_lock_token(Some(""), ""), None);
     }
 }
