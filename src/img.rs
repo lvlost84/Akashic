@@ -7,6 +7,33 @@ const MAX_INPUT_BYTES: usize = 100 * 1024 * 1024;
 /// 디코딩해도 되는 픽셀 수 상한(1억).
 const MAX_PIXELS: u64 = 100_000_000;
 
+/// 저장 방식. 손실·무손실 모두 WebP라서 옛 버전 앱도 풀 수 있다(동기화 호환).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Mode {
+    /// 손실과 무손실을 둘 다 만들어 화질을 우선하며 작은 쪽(스크린샷·글자 캡처는 무손실이 더 작고 선명하다).
+    #[default]
+    Auto,
+    /// 손실(품질 슬라이더). 사진에 작다.
+    Lossy,
+    /// 무손실. 글자·도표가 선명하지만 사진은 커진다.
+    Lossless,
+}
+
+impl Mode {
+    pub fn from_cfg(v: u8) -> Mode {
+        match v {
+            1 => Mode::Lossy,
+            2 => Mode::Lossless,
+            _ => Mode::Auto,
+        }
+    }
+}
+
+/// 자동 모드에서 무손실이 손실보다 이 배수까지 커도 무손실을 쓴다(화질 우선).
+const AUTO_LOSSLESS_BIAS: f64 = 1.25;
+/// 자동 모드에서 무손실을 시도하는 픽셀 수 상한(너무 큰 그림은 시간이 오래 걸려 손실만 쓴다).
+const AUTO_LOSSLESS_MAX_PIXELS: u64 = 8_000_000;
+
 /// 압축을 마친 이미지.
 pub struct Processed {
     /// 원본 픽셀·크기의 SHA-256 앞 16자리(소문자 16진수). 같은 그림이면 품질·크기 설정과 상관없이 같다.
@@ -30,7 +57,7 @@ fn check_pixels(w: u32, h: u32) -> Result<(), String> {
 }
 
 /// 파일 바이트(png/jpg/bmp/gif/webp)를 읽어 줄인다.
-pub fn process(bytes: &[u8], name: &str, max_side: u32, quality: u32) -> Result<Processed, String> {
+pub fn process(bytes: &[u8], name: &str, max_side: u32, quality: u32, mode: Mode) -> Result<Processed, String> {
     if bytes.is_empty() {
         return Err("빈 파일입니다".into());
     }
@@ -43,11 +70,11 @@ pub fn process(bytes: &[u8], name: &str, max_side: u32, quality: u32) -> Result<
     check_pixels(w, h)?;
     let img = image::load_from_memory(bytes).map_err(|x| format!("이미지를 읽을 수 없습니다: {x}"))?;
     let rgba = img.to_rgba8();
-    process_rgba(rgba.as_raw(), rgba.width(), rgba.height(), name, max_side, quality)
+    process_rgba(rgba.as_raw(), rgba.width(), rgba.height(), name, max_side, quality, mode)
 }
 
 /// RGBA 픽셀(클립보드 등)을 줄여 WebP로 만든다.
-pub fn process_rgba(rgba: &[u8], w: u32, h: u32, name: &str, max_side: u32, quality: u32) -> Result<Processed, String> {
+pub fn process_rgba(rgba: &[u8], w: u32, h: u32, name: &str, max_side: u32, quality: u32, mode: Mode) -> Result<Processed, String> {
     check_pixels(w, h)?;
     if rgba.len() as u64 != w as u64 * h as u64 * 4 {
         return Err("이미지 데이터의 길이가 맞지 않습니다".into());
@@ -76,15 +103,31 @@ pub fn process_rgba(rgba: &[u8], w: u32, h: u32, name: &str, max_side: u32, qual
     };
 
     let enc = webp::Encoder::from_rgba(data, nw, nh);
-    let mut best: Vec<u8> = enc.encode(quality.clamp(1, 100) as f32).to_vec();
-    // 아주 작고 투명하지 않은 그림(UI 캡처 등)은 무손실이 더 작을 수 있어 둘 중 작은 쪽을 쓴다.
-    let has_alpha = data.chunks_exact(4).any(|p| p[3] != 255);
-    if !has_alpha && nw.max(nh) <= 256 {
-        let ll = enc.encode_lossless();
-        if ll.len() < best.len() {
-            best = ll.to_vec();
+    let best: Vec<u8> = match mode {
+        Mode::Lossless => enc.encode_lossless().to_vec(),
+        Mode::Lossy => {
+            let mut best: Vec<u8> = enc.encode(quality.clamp(1, 100) as f32).to_vec();
+            // 아주 작고 투명하지 않은 그림(UI 캡처 등)은 무손실이 더 작을 수 있어 둘 중 작은 쪽을 쓴다.
+            let has_alpha = data.chunks_exact(4).any(|p| p[3] != 255);
+            if !has_alpha && nw.max(nh) <= 256 {
+                let ll = enc.encode_lossless();
+                if ll.len() < best.len() {
+                    best = ll.to_vec();
+                }
+            }
+            best
         }
-    }
+        Mode::Auto => {
+            let lossy: Vec<u8> = enc.encode(quality.clamp(1, 100) as f32).to_vec();
+            if nw as u64 * nh as u64 <= AUTO_LOSSLESS_MAX_PIXELS {
+                let ll = enc.encode_lossless();
+                // 글자·UI 캡처는 무손실이 더 작거나 비슷하다. 사진은 몇 배로 커지므로 손실을 쓴다.
+                if ll.len() as f64 <= lossy.len() as f64 * AUTO_LOSSLESS_BIAS { ll.to_vec() } else { lossy }
+            } else {
+                lossy
+            }
+        }
+    };
     let stem = std::path::Path::new(name).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     Ok(Processed { hash, webp: best, w: nw, h: nh, alt: crate::md::clean_alt(&stem) })
 }
@@ -127,6 +170,8 @@ struct Entry<T> {
 /// 해시 → 텍스처 캐시(가장 오래 안 쓴 것부터 버림). 텍스처 타입은 제네릭이라 egui 없이도 시험할 수 있다.
 pub struct ImgCache<T> {
     map: HashMap<String, Entry<T>>,
+    /// (해시, 목표 가로, 목표 세로) → 고품질로 줄여 둔 텍스처. 화면 픽셀에 1:1로 그리려고 따로 둔다.
+    scaled: HashMap<(String, u32, u32), Entry<T>>,
     missing: HashSet<String>,
     bytes: usize,
     max_items: usize,
@@ -145,7 +190,7 @@ impl<T: Clone> ImgCache<T> {
     }
 
     pub fn with_limits(max_items: usize, max_bytes: usize) -> Self {
-        ImgCache { map: HashMap::new(), missing: HashSet::new(), bytes: 0, max_items, max_bytes, tick: 0, budget: DECODES_PER_FRAME }
+        ImgCache { map: HashMap::new(), scaled: HashMap::new(), missing: HashSet::new(), bytes: 0, max_items, max_bytes, tick: 0, budget: DECODES_PER_FRAME }
     }
 
     /// 매 프레임 처음에 부른다(디코딩 예산을 되돌린다).
@@ -156,8 +201,37 @@ impl<T: Clone> ImgCache<T> {
     /// 모두 비운다(DB를 통째로 바꿔 넣은 뒤 등).
     pub fn clear(&mut self) {
         self.map.clear();
+        self.scaled.clear();
         self.missing.clear();
         self.bytes = 0;
+    }
+
+    /// 목표 크기 `tw × th`로 줄인 텍스처(Lanczos). 이미 있으면 돌려주고, 없으면 디코딩 예산이 남았을 때만 만든다(`None` = 이번 프레임은 못 만듦).
+    /// 줄이는 게 아니면(목표가 원본 이상) 호출하지 않는다.
+    pub fn get_scaled(&mut self, db: &Db, hash: &str, tw: u32, th: u32, make: impl FnOnce(u32, u32, Vec<u8>) -> T) -> Option<T> {
+        self.tick += 1;
+        let key = (hash.to_string(), tw, th);
+        if let Some(e) = self.scaled.get_mut(&key) {
+            e.used = self.tick;
+            return Some(e.tex.clone());
+        }
+        if self.budget == 0 {
+            return None;
+        }
+        let blob = db.get_image(hash).ok().flatten()?.0;
+        self.budget -= 1;
+        let (w, h, rgba) = decode_webp(&blob).ok()?;
+        let src = image::RgbaImage::from_raw(w, h, rgba)?;
+        let small = image::imageops::resize(&src, tw.max(1), th.max(1), image::imageops::FilterType::Lanczos3);
+        let bytes = small.as_raw().len();
+        let tex = make(tw, th, small.into_raw());
+        self.scaled.insert(key, Entry { tex: tex.clone(), bytes, used: self.tick });
+        // 창 크기를 끌 때마다 목표 크기가 달라지므로 오래 안 쓴 것부터 버린다(개수·용량은 원본 캐시와 같은 한도의 절반)
+        while self.scaled.len() > (self.max_items / 2).max(4) || self.scaled.values().map(|e| e.bytes).sum::<usize>() > self.max_bytes / 2 {
+            let Some(old) = self.scaled.iter().min_by_key(|(_, e)| e.used).map(|(k, _)| k.clone()) else { break };
+            self.scaled.remove(&old);
+        }
+        Some(tex)
     }
 
     /// `make(가로, 세로, RGBA)`로 텍스처를 만들어 캐시에 넣는다.
@@ -205,6 +279,27 @@ impl<T: Clone> ImgCache<T> {
 }
 
 impl ImgCache<eframe::egui::TextureHandle> {
+    /// 화면 픽셀 `tw × th`로 그릴 텍스처. 원본과 크기가 같거나 더 커지는 경우는 원본(1:1)이고, 줄여 그릴 때는 고품질로 미리 줄여 둔
+    /// 텍스처(선형 보간 없이 그림)다. 줄인 것을 아직 못 만들었으면 이번 프레임만 원본을 쓴다(그리는 쪽이 크기를 보고 알아챈다).
+    pub fn texture_fit(&mut self, ctx: &eframe::egui::Context, db: &Db, hash: &str, tw: u32, th: u32) -> Tex<eframe::egui::TextureHandle> {
+        use eframe::egui::{ColorImage, TextureOptions};
+        let native = self.texture(ctx, db, hash);
+        let Tex::Ready(n) = &native else { return native };
+        let [nw, nh] = n.size();
+        if (tw as usize) >= nw && (th as usize) >= nh {
+            return native; // 1:1
+        }
+        match self.get_scaled(db, hash, tw, th, |w, h, rgba| {
+            ctx.load_texture(format!("img-{hash}@{w}x{h}"), ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba), TextureOptions::NEAREST)
+        }) {
+            Some(t) => Tex::Ready(t),
+            None => {
+                ctx.request_repaint();
+                native
+            }
+        }
+    }
+
     /// egui 텍스처로 돌려준다. 예산 때문에 미룬 그림이 있으면 다음 프레임을 요청한다.
     pub fn texture(&mut self, ctx: &eframe::egui::Context, db: &Db, hash: &str) -> Tex<eframe::egui::TextureHandle> {
         use eframe::egui::{ColorImage, TextureOptions};
@@ -243,32 +338,32 @@ mod tests {
 
     #[test]
     fn process_shrinks_and_keeps_ratio() {
-        let r = process(&png(3200, 1600, |_, _| [10, 20, 30, 255]), "a.png", 1600, 80).unwrap();
+        let r = process(&png(3200, 1600, |_, _| [10, 20, 30, 255]), "a.png", 1600, 80, Mode::Auto).unwrap();
         assert_eq!((r.w, r.h), (1600, 800));
     }
 
     #[test]
     fn process_never_upscales() {
-        let r = process(&png(100, 50, |_, _| [10, 20, 30, 255]), "a.png", 1600, 80).unwrap();
+        let r = process(&png(100, 50, |_, _| [10, 20, 30, 255]), "a.png", 1600, 80, Mode::Auto).unwrap();
         assert_eq!((r.w, r.h), (100, 50));
     }
 
     #[test]
     fn same_pixels_same_hash_any_quality() {
         let src = photo_like(64, 48);
-        let a = process(&src, "a.png", 1600, 60).unwrap();
-        let b = process(&src, "b.png", 1600, 90).unwrap();
+        let a = process(&src, "a.png", 1600, 60, Mode::Auto).unwrap();
+        let b = process(&src, "b.png", 1600, 90, Mode::Auto).unwrap();
         assert_eq!(a.hash, b.hash);
         assert_eq!(a.hash.len(), 16);
         assert!(a.hash.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f')));
         let other = png(64, 48, |x, y| if (x, y) == (0, 0) { [1, 2, 3, 255] } else { [0, 0, 0, 255] });
         let base = png(64, 48, |_, _| [0, 0, 0, 255]);
-        assert_ne!(process(&other, "o.png", 1600, 80).unwrap().hash, process(&base, "o.png", 1600, 80).unwrap().hash);
+        assert_ne!(process(&other, "o.png", 1600, 80, Mode::Auto).unwrap().hash, process(&base, "o.png", 1600, 80, Mode::Auto).unwrap().hash);
     }
 
     #[test]
     fn alpha_survives() {
-        let r = process(&png(40, 40, |_, _| [200, 100, 50, 128]), "a.png", 1600, 80).unwrap();
+        let r = process(&png(40, 40, |_, _| [200, 100, 50, 128]), "a.png", 1600, 80, Mode::Auto).unwrap();
         let (w, h, rgba) = decode_webp(&r.webp).unwrap();
         assert_eq!((w, h), (40, 40));
         assert_eq!(rgba.len(), 40 * 40 * 4);
@@ -278,7 +373,7 @@ mod tests {
     #[test]
     fn lossy_is_smaller_than_png_for_photo_like() {
         let src = photo_like(800, 600);
-        let r = process(&src, "p.png", 1600, 80).unwrap();
+        let r = process(&src, "p.png", 1600, 80, Mode::Auto).unwrap();
         assert!(r.webp.len() < src.len(), "webp {} png {}", r.webp.len(), src.len());
         let (w, h, _) = decode_webp(&r.webp).unwrap();
         assert_eq!((w, h), (800, 600));
@@ -286,14 +381,14 @@ mod tests {
 
     #[test]
     fn bad_input_errors_not_panics() {
-        assert!(process(&[], "a.png", 1600, 80).is_err());
-        assert!(process(b"not an image", "a.png", 1600, 80).is_err());
+        assert!(process(&[], "a.png", 1600, 80, Mode::Auto).is_err());
+        assert!(process(b"not an image", "a.png", 1600, 80, Mode::Auto).is_err());
         let ok = png(64, 64, |_, _| [1, 2, 3, 255]);
-        assert!(process(&ok[..ok.len() / 2], "a.png", 1600, 80).is_err());
+        assert!(process(&ok[..ok.len() / 2], "a.png", 1600, 80, Mode::Auto).is_err());
         // 픽셀 수 한도(1억)를 넘는 크기, 길이가 안 맞는 버퍼
-        assert!(process_rgba(&[], 20_000, 20_000, "a", 1600, 80).is_err());
-        assert!(process_rgba(&[0; 10], 4, 4, "a", 1600, 80).is_err());
-        assert!(process_rgba(&[], 0, 4, "a", 1600, 80).is_err());
+        assert!(process_rgba(&[], 20_000, 20_000, "a", 1600, 80, Mode::Auto).is_err());
+        assert!(process_rgba(&[0; 10], 4, 4, "a", 1600, 80, Mode::Auto).is_err());
+        assert!(process_rgba(&[], 0, 4, "a", 1600, 80, Mode::Auto).is_err());
         assert!(decode_webp(b"junk").is_err());
     }
 
@@ -305,7 +400,7 @@ mod tests {
 
     /// 8×8 그림을 DB에 넣고 해시를 돌려준다(shade마다 다른 그림).
     fn put(db: &crate::db::Db, shade: u8) -> String {
-        let r = process_rgba(&[shade; 8 * 8 * 4], 8, 8, "t", 1600, 80).unwrap();
+        let r = process_rgba(&[shade; 8 * 8 * 4], 8, 8, "t", 1600, 80, Mode::Auto).unwrap();
         db.put_image(&r.hash, &r.webp, r.w, r.h).unwrap();
         r.hash
     }
@@ -355,9 +450,73 @@ mod tests {
 
     #[test]
     fn alt_comes_from_file_name() {
-        let r = process(&png(8, 8, |_, _| [1, 2, 3, 255]), "a]b(c).png", 1600, 80).unwrap();
+        let r = process(&png(8, 8, |_, _| [1, 2, 3, 255]), "a]b(c).png", 1600, 80, Mode::Auto).unwrap();
         assert!(!r.alt.contains(['[', ']', '(', ')']));
         assert!(!r.alt.contains('.'));
         assert_eq!(r.alt, "abc");
+    }
+
+    /// 터미널 캡처 비슷한 그림: 검은 배경에 같은 글자 모양이 반복된다.
+    fn text_like(w: u32, h: u32) -> Vec<u8> {
+        png(w, h, |x, y| {
+            let (cx, cy) = (x % 9, y % 16);
+            let ink = (cy > 3 && cy < 12) && (cx == 2 || cx == 6 || (cy == 7 && cx > 2 && cx < 6)) && (x / 9 + y / 16) % 3 != 0;
+            if ink { [230, 230, 230, 255] } else { [12, 12, 12, 255] }
+        })
+    }
+
+    /// WebP 파일의 첫 조각 이름(손실은 "VP8 ", 무손실은 "VP8L").
+    fn fourcc(webp: &[u8]) -> &[u8] {
+        &webp[12..16]
+    }
+
+    #[test]
+    fn auto_picks_lossless_for_screenshots_and_lossy_for_photos() {
+        let shot = text_like(400, 300);
+        let auto = process(&shot, "s.png", 1600, 80, Mode::Auto).unwrap();
+        assert_eq!(fourcc(&auto.webp), b"VP8L", "글자 캡처는 무손실이어야 한다");
+        // 무손실이라 픽셀이 완전히 같다
+        let src = image::load_from_memory(&shot).unwrap().to_rgba8();
+        let (w, h, px) = decode_webp(&auto.webp).unwrap();
+        assert_eq!((w, h), (400, 300));
+        assert_eq!(px, src.as_raw().to_vec());
+        // 같은 그림을 손실로 하면 더 크거나(또는 흐리다): 자동은 손실 쪽보다 크지 않다(화질 우선 배수 이내)
+        let lossy = process(&shot, "s.png", 1600, 80, Mode::Lossy).unwrap();
+        assert!(auto.webp.len() as f64 <= lossy.webp.len() as f64 * 1.25);
+        // 사진 비슷한 그림은 손실을 쓴다
+        let photo = process(&photo_like(400, 300), "p.png", 1600, 80, Mode::Auto).unwrap();
+        assert_ne!(fourcc(&photo.webp), b"VP8L", "사진은 무손실이 몇 배 커서 손실이어야 한다");
+    }
+
+    #[test]
+    fn forced_modes_are_respected() {
+        let src = photo_like(200, 150);
+        assert_eq!(fourcc(&process(&src, "a.png", 1600, 80, Mode::Lossless).unwrap().webp), b"VP8L");
+        assert_ne!(fourcc(&process(&src, "a.png", 1600, 80, Mode::Lossy).unwrap().webp), b"VP8L");
+        assert_eq!(Mode::from_cfg(0), Mode::Auto);
+        assert_eq!(Mode::from_cfg(1), Mode::Lossy);
+        assert_eq!(Mode::from_cfg(2), Mode::Lossless);
+        assert_eq!(Mode::from_cfg(9), Mode::Auto);
+    }
+
+    #[test]
+    fn scaled_texture_is_made_once_and_reused() {
+        let db = tmp_db("scaled");
+        let r = process_rgba(&vec![200u8; 64 * 48 * 4], 64, 48, "t", 1600, 80, Mode::Auto).unwrap();
+        db.put_image(&r.hash, &r.webp, r.w, r.h).unwrap();
+        let mut c: ImgCache<(u32, u32)> = ImgCache::new();
+        c.begin_frame();
+        let mut made = 0;
+        assert_eq!(c.get_scaled(&db, &r.hash, 32, 24, |w, h, rgba| { made += 1; assert_eq!(rgba.len(), (w * h * 4) as usize); (w, h) }), Some((32, 24)));
+        assert_eq!(c.get_scaled(&db, &r.hash, 32, 24, |_, _, _| panic!("캐시에 있어야 함")), Some((32, 24)));
+        assert_eq!(made, 1);
+        // 다른 목표 크기는 따로 만든다. 예산이 없으면 None
+        c.begin_frame();
+        assert_eq!(c.get_scaled(&db, &r.hash, 16, 12, |w, h, _| (w, h)), Some((16, 12)));
+        assert_eq!(c.get_scaled(&db, &r.hash, 8, 6, |w, h, _| (w, h)), Some((8, 6)));
+        assert_eq!(c.get_scaled(&db, &r.hash, 4, 3, |w, h, _| (w, h)), None);
+        // 없는 그림은 None
+        c.begin_frame();
+        assert_eq!(c.get_scaled(&db, "0123456789abcdef", 4, 3, |w, h, _| (w, h)), None);
     }
 }

@@ -447,11 +447,40 @@ pub struct ImageRef {
 pub const IMAGE_MAX_H: f32 = 700.0;
 pub const IMAGE_PAD: f32 = 8.0;
 
-/// 본문 폭 `max_w`에 맞춰 줄인 표시 크기. 키우지 않고, 높이가 상한을 넘으면 비율대로 더 줄인다. 0 크기는 만들지 않는다.
+/// 화면의 픽셀 배율(`pixels_per_point`). 그림을 원본 픽셀 크기 그대로(그림 한 칸 = 화면 한 칸) 보여 주려고 레이아웃이 안다.
+/// 앱이 매 프레임 `set_ppp`로 알린다(바뀌면 `TextEnv`가 글자 배치 캐시를 비워 줄 높이가 다시 계산된다).
+static PPP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x3F80_0000); // 1.0f32
+
+pub fn set_ppp(v: f32) {
+    PPP.store(v.clamp(0.5, 8.0).to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn ppp() -> f32 {
+    f32::from_bits(PPP.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// 본문 폭 `max_w`에 맞춰 줄인 표시 크기. 키우지 않고(원본 픽셀 크기까지만), 높이가 상한을 넘으면 비율대로 더 줄인다. 0 크기는 만들지 않는다.
 pub fn image_display_size(w: u32, h: u32, max_w: f32) -> (f32, f32) {
+    image_display_size_ppp(w, h, max_w, ppp())
+}
+
+pub fn image_display_size_ppp(w: u32, h: u32, max_w: f32, ppp: f32) -> (f32, f32) {
     let (wf, hf) = (w.max(1) as f32, h.max(1) as f32);
-    let s = (max_w / wf).min(IMAGE_MAX_H / hf).min(1.0);
+    // 원본 픽셀 크기 = 화면 픽셀 크기가 되도록 최대 배율은 1/ppp(논리 픽셀 기준). 이보다 크게 그리면 번진다.
+    let s = (max_w / wf).min(IMAGE_MAX_H / hf).min(1.0 / ppp);
     ((wf * s).max(1.0), (hf * s).max(1.0))
+}
+
+/// 화면에 그릴 그림의 목표 픽셀 크기(가로, 세로): 논리 크기 `pw × ph`에 배율을 곱해 반올림하되 원본 크기를 넘기지 않는다(키우지 않는다).
+/// 줄 높이가 화면 픽셀로 반올림되면서 목표가 원본보다 1픽셀 작게 나오는 경우가 있어, 1픽셀 이내 차이는 원본 크기로 본다
+/// (그대로 줄이면 그림 전체가 한 번 다시 샘플링되어 흐려진다).
+pub fn fit_pixels(pw: f32, ph: f32, ppp: f32, native: (u32, u32)) -> (u32, u32) {
+    let f = |v: f32, n: u32| {
+        let n = n.max(1);
+        let t = (v * ppp).round().max(1.0) as u32;
+        if t + 1 >= n { n } else { t }
+    };
+    (f(pw, native.0), f(ph, native.1))
 }
 
 const IMG_HASH_LEN: usize = 16;
@@ -512,10 +541,15 @@ pub fn parse_image_line(line: &str) -> Option<ImageRef> {
 /// 한 줄에 놓인 이미지들을 폭 `max_w`에 맞추는 공통 배율(키우지 않음, 가장 큰 높이가 상한 이하).
 /// 모두 같은 배율이라 비율이 유지되고, 줄 높이 = 가장 큰 원본 높이 × 배율이다.
 pub fn image_row_scale(dims: &[(u32, u32)], max_w: f32) -> f32 {
+    image_row_scale_ppp(dims, max_w, ppp())
+}
+
+/// `image_row_scale`의 배율 지정판. 최대 배율은 1/ppp라서 배율이 100%가 아니어도 원본 픽셀 크기 그대로(1:1) 그려진다.
+pub fn image_row_scale_ppp(dims: &[(u32, u32)], max_w: f32, ppp: f32) -> f32 {
     let sum_w: f32 = dims.iter().map(|d| d.0.max(1) as f32).sum();
     let max_h = dims.iter().map(|d| d.1.max(1) as f32).fold(1.0, f32::max);
     let avail = max_w - IMAGE_GAP * dims.len().saturating_sub(1) as f32;
-    (avail / sum_w).min(IMAGE_MAX_H / max_h).min(1.0).max(1.0 / max_h.max(sum_w))
+    (avail / sum_w).min(IMAGE_MAX_H / max_h).min(1.0 / ppp).max(1.0 / max_h.max(sum_w))
 }
 
 /// 이미지 줄 한 줄(개행 없음)을 만든다.
@@ -1715,6 +1749,27 @@ mod tests {
     fn image_refs_collects_unique_everywhere() {
         let t = format!("![a](img:{H16} 8x6)\n```\n(img:aaaaaaaaaaaaaaaa)\n```\n글 img:bbbbbbbbbbbbbbbb 끝 ![a](img:{H16} 8x6) img:zz");
         assert_eq!(image_refs(&t), vec![H16.to_string(), "aaaaaaaaaaaaaaaa".to_string(), "bbbbbbbbbbbbbbbb".to_string()]);
+    }
+
+    #[test]
+    fn images_are_drawn_one_to_one_at_any_display_scale() {
+        // 배율 125%(ppp 1.25): 686px 그림은 논리 548.8로 그려야 화면 686픽셀 = 원본과 같다(키워서 번지지 않는다)
+        let (w, h) = image_display_size_ppp(686, 383, 2000.0, 1.25);
+        assert!((w * 1.25 - 686.0).abs() < 0.01 && (h * 1.25 - 383.0).abs() < 0.01);
+        // 100%는 예전과 같다
+        assert_eq!(image_display_size_ppp(800, 600, 400.0, 1.0), (400.0, 300.0));
+        assert_eq!(image_display_size_ppp(100, 100, 400.0, 1.0), (100.0, 100.0));
+        // 줄 배율도 같은 한계(1/ppp)
+        assert!((image_row_scale_ppp(&[(686, 383)], 2000.0, 1.25) - 0.8).abs() < 1e-6);
+        assert_eq!(image_row_scale_ppp(&[(686, 383)], 2000.0, 1.0), 1.0);
+        // 목표 픽셀 크기: 1:1이면 원본 크기, 줄여 그리면 반올림, 원본보다 크게는 안 한다
+        assert_eq!(fit_pixels(548.8, 306.4, 1.25, (686, 383)), (686, 383));
+        assert_eq!(fit_pixels(300.2, 200.4, 1.0, (686, 383)), (300, 200));
+        assert_eq!(fit_pixels(900.0, 900.0, 1.0, (686, 383)), (686, 383));
+        assert_eq!(fit_pixels(0.1, 0.1, 1.0, (686, 383)), (1, 1));
+        // 줄 높이 반올림으로 1픽셀 작게 나온 것(685x382)은 원본 크기로 본다. 2픽셀 이상 작으면 줄이는 것이다
+        assert_eq!(fit_pixels(685.0, 382.0, 1.0, (686, 383)), (686, 383));
+        assert_eq!(fit_pixels(684.0, 381.0, 1.0, (686, 383)), (684, 381));
     }
 
     #[test]

@@ -20,7 +20,7 @@ impl App {
         let mut img_cache: HashMap<PathBuf, Option<(String, u32, u32)>> = HashMap::new();
         let (mut ok, mut failed, mut imgs, mut new_cats) = (0usize, sc.failed, 0usize, 0usize);
         let mut last = None;
-        let (max_side, quality) = (self.cfg.img_max, self.cfg.img_quality);
+        let (max_side, quality, mode) = (self.cfg.img_max, self.cfg.img_quality, crate::img::Mode::from_cfg(self.cfg.img_mode));
         for it in &sc.items {
             // 분류 찾기·만들기(깊이 한도를 넘는 폴더는 마지막 단계에 합친다)
             let dirs: Vec<String> = it.dirs.iter().take(crate::db::MAX_DEPTH.saturating_sub(base.map_or(0, |_| 1))).cloned().collect();
@@ -54,7 +54,7 @@ impl App {
                         .entry(path.to_path_buf())
                         .or_insert_with(|| {
                             let bytes = std::fs::read(path).ok()?;
-                            let p = crate::img::process(&bytes, alt, max_side, quality).ok()?;
+                            let p = crate::img::process(&bytes, alt, max_side, quality, mode).ok()?;
                             db.put_image(&p.hash, &p.webp, p.w, p.h).ok()?;
                             Some((p.hash, p.w, p.h))
                         })

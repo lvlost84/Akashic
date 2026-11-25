@@ -600,7 +600,7 @@ mod tests {
                     [((x * 255 / 800) as u8).saturating_add(n as u8), ((y * 255 / 600) as u8).saturating_add(n as u8), 128, 255]
                 })
                 .collect();
-            let r = crate::img::process_rgba(&rgba, 800, 600, "t", 1600, 80).unwrap();
+            let r = crate::img::process_rgba(&rgba, 800, 600, "t", 1600, 80, crate::img::Mode::Auto).unwrap();
             db.put_image(&r.hash, &r.webp, r.w, r.h).unwrap();
             let id = docs[100];
             let body = format!("그림 {k}\n\n{}\n", crate::md::format_image_line("t", &r.hash, r.w, r.h));

@@ -100,16 +100,16 @@ impl App {
             Some((d, l)) if d == doc => (Some(l), false),
             _ => (self.cursor_line, true),
         };
-        let (max, quality) = (self.cfg.img_max, self.cfg.img_quality);
+        let (max, quality, mode) = (self.cfg.img_max, self.cfg.img_quality, img::Mode::from_cfg(self.cfg.img_mode));
         let (tx, rx) = channel();
         let c = ctx.clone();
         std::thread::spawn(move || {
             let r = match src {
                 ImageSrc::File(p) => {
                     let name = p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                    std::fs::read(&p).map_err(|x| format!("{}: {x}", p.display())).and_then(|b| img::process(&b, &name, max, quality))
+                    std::fs::read(&p).map_err(|x| format!("{}: {x}", p.display())).and_then(|b| img::process(&b, &name, max, quality, mode))
                 }
-                ImageSrc::Rgba { w, h, data } => img::process_rgba(&data, w, h, "붙여넣은 그림", max, quality),
+                ImageSrc::Rgba { w, h, data } => img::process_rgba(&data, w, h, "붙여넣은 그림", max, quality, mode),
             };
             let _ = tx.send(r);
             c.request_repaint();
@@ -235,6 +235,19 @@ impl App {
             if ui.add(egui::Slider::new(&mut self.cfg.img_quality, 60..=95)).changed() {
                 self.graph_cfg_dirty = true; // 슬라이더를 놓은 뒤 저장
             }
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label("저장 방식");
+            let names = ["자동 (글자·스크린샷은 무손실)", "손실 (용량 작게)", "무손실 (항상 선명하게)"];
+            let cur = (self.cfg.img_mode as usize).min(2);
+            egui::ComboBox::from_id_salt("img_mode").selected_text(names[cur]).show_ui(ui, |ui| {
+                for (i, n) in names.iter().enumerate() {
+                    if ui.selectable_value(&mut self.cfg.img_mode, i as u8, *n).changed() {
+                        self.graph_cfg_dirty = true;
+                    }
+                }
+            });
+            ui.label(egui::RichText::new("새로 넣는 그림부터 적용. 모두 WebP라 다른 PC의 아카식도 읽습니다. 자동은 손실·무손실을 둘 다 만들어 작은 쪽(화질 우선)을 씁니다.").small().color(self.theme.dim));
         });
         let stale = STATS.lock().ok().map_or(true, |g| g.as_ref().map_or(true, |s| s.0.elapsed() > Duration::from_secs(2)));
         if stale {

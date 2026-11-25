@@ -154,6 +154,8 @@ pub struct Config {
     /// 이미지를 넣을 때 줄이는 긴 변 최대 크기(px)와 WebP 품질(60~95)
     pub img_max: u32,
     pub img_quality: u32,
+    /// 이미지 저장 방식: 0 자동(스크린샷은 무손실), 1 손실, 2 무손실
+    pub img_mode: u8,
     /// 마지막 동기화 시도의 결과(성공/실패 한 줄)와 그 시각
     pub sync_result: String,
     pub sync_result_at: i64,
@@ -245,6 +247,7 @@ impl Default for Config {
             sync_on_close: true,
             img_max: 1600,
             img_quality: 80,
+            img_mode: 0,
             sync_result: String::new(),
             sync_result_at: 0,
             sync_failed: false,
@@ -2557,7 +2560,7 @@ impl App {
                     .background_color(egui::Color32::TRANSPARENT)
                     .layouter(&mut layouter)
                     .show(ui);
-                let mut imgs = |h: &str| img_cache.texture(&ctx, db_ref, h);
+                let mut imgs = |h: &str, tw: u32, th: u32| img_cache.texture_fit(&ctx, db_ref, h, tw, th);
                 Self::paint_blocks_behind(ui, slot, &out, &blocks, bg, &t, size, hide, cl, find_view, &mut imgs);
                 if let Some(idx) = find_jump {
                     // 찾은 곳이 보이는 영역 가운데쯤 오도록 스크롤한다.
@@ -2889,7 +2892,7 @@ impl App {
 
     /// 편집창 뒤(자리 `slot`)에 바탕과 표·코드 박스·가로선을 깐다. 글자가 아닌 그림만 더한다.
     #[allow(clippy::too_many_arguments)]
-    fn paint_blocks_behind(ui: &egui::Ui, slot: egui::layers::ShapeIdx, out: &egui::text_edit::TextEditOutput, blocks: &[md::Block], bg: egui::Color32, t: &theme::Theme, size: f32, hide: bool, cl: Option<usize>, find: Option<(&[(usize, usize)], usize)>, imgs: &mut dyn FnMut(&str) -> crate::img::Tex<egui::TextureHandle>) {
+    fn paint_blocks_behind(ui: &egui::Ui, slot: egui::layers::ShapeIdx, out: &egui::text_edit::TextEditOutput, blocks: &[md::Block], bg: egui::Color32, t: &theme::Theme, size: f32, hide: bool, cl: Option<usize>, find: Option<(&[(usize, usize)], usize)>, imgs: &mut dyn FnMut(&str, u32, u32) -> crate::img::Tex<egui::TextureHandle>) {
         let origin = out.galley_pos - egui::vec2(out.galley.rect.left(), 0.0);
         let mut shapes = vec![egui::Shape::rect_filled(out.response.rect, egui::CornerRadius::ZERO, bg)];
         let text_rect = egui::Rect::from_min_max(out.text_clip_rect.min, egui::pos2(out.response.rect.right() - 8.0, out.text_clip_rect.max.y));
@@ -3333,6 +3336,8 @@ fn fmt_time(ts: i64) -> String {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // 그림을 원본 픽셀 크기 그대로(1:1) 그리려고 화면 배율을 레이아웃에 알린다(배율이 바뀌면 아래에서 배치 캐시가 비워진다).
+        md::set_ppp(ctx.pixels_per_point());
         // 글자 그리기 환경(색 변환·배율·아틀라스)이 바뀌었으면 앱이 따로 보관한 배치 캐시를 비운다.
         if self.text_env.changed(&ctx) {
             self.galley_cache = None;

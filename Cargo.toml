@@ -1,6 +1,6 @@
 [package]
 name = "akashic"
-version = "2.27.1"
+version = "2.27.2"
 edition = "2024"
 license = "Apache-2.0"
 

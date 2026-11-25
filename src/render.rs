@@ -113,7 +113,7 @@ fn fit(ui: &egui::Ui, text: &str, font: &FontId, color: Color32, maxw: f32) -> A
 /// 편집창 뒤에 깔 그림을 만든다. `hide`가 꺼져 있으면 아무것도 그리지 않는다.
 /// `galley_origin`: galley의 (0,0)이 화면 어디인지. `text_rect`: 글이 놓이는 영역(좌우 끝).
 #[allow(clippy::too_many_arguments)]
-pub fn paint(ui: &egui::Ui, blocks: &[Block], galley: &Galley, galley_origin: Pos2, text_rect: Rect, cl: Option<usize>, t: &Theme, size: f32, hide: bool, imgs: &mut dyn FnMut(&str) -> Tex<egui::TextureHandle>) -> Vec<Shape> {
+pub fn paint(ui: &egui::Ui, blocks: &[Block], galley: &Galley, galley_origin: Pos2, text_rect: Rect, cl: Option<usize>, t: &Theme, size: f32, hide: bool, imgs: &mut dyn FnMut(&str, u32, u32) -> Tex<egui::TextureHandle>) -> Vec<Shape> {
     let mut shapes = Vec::new();
     if !hide || blocks.is_empty() {
         return shapes;
@@ -219,7 +219,9 @@ pub fn paint(ui: &egui::Ui, blocks: &[Block], galley: &Galley, galley_origin: Po
                 let max_h = items.iter().map(|r| r.h.max(1) as f32).fold(1.0, f32::max);
                 let sum_w: f32 = items.iter().map(|r| r.w.max(1) as f32).sum();
                 let gaps = md::IMAGE_GAP * items.len().saturating_sub(1) as f32;
-                let mut s = ((bottom - top - md::IMAGE_PAD).max(1.0) / max_h).min(1.0);
+                // 최대 배율은 1/ppp: 원본 픽셀 한 칸 = 화면 픽셀 한 칸(배율이 100%가 아니어도 번지지 않게)
+                let ppp = ui.ctx().pixels_per_point();
+                let mut s = ((bottom - top - md::IMAGE_PAD).max(1.0) / max_h).min(1.0 / ppp);
                 if sum_w * s + gaps > (right - left).max(1.0) {
                     s = ((right - left - gaps).max(1.0) / sum_w).min(s); // 폭이 어긋났을 때의 안전장치
                 }
@@ -229,9 +231,16 @@ pub fn paint(ui: &egui::Ui, blocks: &[Block], galley: &Galley, galley_origin: Po
                 let rr = CornerRadius::same(4);
                 for r in items {
                     let (pw, ph) = ((r.w.max(1) as f32 * s).max(1.0), (r.h.max(1) as f32 * s).max(1.0));
-                    let rect = Rect::from_min_size(pos2(px(x), px(row_bottom - ph)), egui::vec2(pw, ph));
+                    // 화면 픽셀로 본 목표 크기. 원본과 같으면 1:1, 작으면 앱이 고품질로 미리 줄여 둔 텍스처를 준다.
+                    let (tw, th) = md::fit_pixels(pw, ph, ppp, (r.w, r.h));
+                    let tex_res = imgs(&r.hash, tw, th);
+                    // 목표 크기와 텍스처 크기가 같으면 칸 경계에 맞춘 정수 픽셀 크기로 그려 한 칸씩 정확히 대응시킨다(위치도 픽셀 경계).
+                    let exact = matches!(&tex_res, Tex::Ready(t) if t.size() == [tw as usize, th as usize]);
+                    let (dw, dh) = if exact { (tw as f32 / ppp, th as f32 / ppp) } else { (pw, ph) };
+                    let snap = |v: f32| if exact { (v * ppp).round() / ppp } else { px(v) }; // 정확히 1:1이면 칸 경계(정수 화면 픽셀)에 맞춘다
+                    let rect = Rect::from_min_size(pos2(snap(x), snap(row_bottom - dh)), egui::vec2(dw, dh));
                     x += pw + md::IMAGE_GAP;
-                    match imgs(&r.hash) {
+                    match tex_res {
                         Tex::Ready(tex) => {
                             let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
                             shapes.push(Shape::Rect(egui::epaint::RectShape::filled(rect, rr, Color32::WHITE).with_texture(tex.id(), uv)));

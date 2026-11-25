@@ -208,7 +208,7 @@ impl App {
                             .background_color(egui::Color32::TRANSPARENT)
                             .layouter(&mut layouter)
                             .show(ui);
-                        let mut imgs = |h: &str| img.texture(&ctx2, db, h);
+                        let mut imgs = |h: &str, tw: u32, th: u32| img.texture_fit(&ctx2, db, h, tw, th);
                         Self::paint_blocks_behind(ui, slot, &out, &blocks, bg, &t, size, true, None, None, &mut imgs);
                         // 글자를 직접 눌러 [[문서 링크]]를 따라간다(편집창이 아니라 클릭을 직접 감지)
                         let resp = ui.interact(out.response.rect, egui::Id::new(("ref_click", serial)), Sense::click());
