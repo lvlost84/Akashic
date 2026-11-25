@@ -1100,7 +1100,8 @@ fn url_in_line(line: &str, col: usize) -> Option<String> {
     let mut i = 0;
     while i + 1 < n {
         if ch[i] == '[' && ch[i + 1] == '[' {
-            let close = (i + 2..n.saturating_sub(1)).find(|&k| ch[k] == ']' && ch[k + 1] == ']')?;
+            // 닫히지 않은 `[[`가 있어도 함수 전체를 끝내지 않고 이 줄의 다른 링크 검사로 넘어간다.
+            let Some(close) = (i + 2..n.saturating_sub(1)).find(|&k| ch[k] == ']' && ch[k + 1] == ']') else { break };
             let end = close + 2;
             if col >= i && col <= end {
                 let inner: String = ch[i + 2..close].iter().collect();

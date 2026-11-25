@@ -71,11 +71,13 @@ fn collect_sync(dir: &str) -> (bool, Option<(i64, String)>) {
 }
 
 /// WebDAV 서버 확인(접속·키가 맞는지, 서버의 저장본). 실패하면 접근 불가로 본다.
-fn collect_wd(url: &str, user: &str, pass: &str, key: &str) -> (bool, Option<(i64, String)>) {
+fn collect_wd(url: &str, user: &str, pass: &str, key: &str, doc: bool) -> (bool, Option<(i64, String)>) {
     crate::diag::count("sync_wd_check");
     let r = (|| {
         let k = crate::vault::VaultKey::from_recovery(key).ok()?;
-        let remote = crate::webdav::WebDavRemote::new(url, user.trim(), pass, &k.folder_name()).ok()?;
+        // 문서 단위 동기화는 스냅숏 방식과 다른 폴더를 쓴다.
+        let folder = if doc { super::docsync_ui::doc_folder(&k) } else { k.folder_name() };
+        let remote = crate::webdav::WebDavRemote::new(url, user.trim(), pass, &folder).ok()?;
         crate::vault::read_state(&remote, &k).ok()
     })();
     match r {
@@ -311,6 +313,7 @@ impl App {
         }
         if sync_due {
             let wd = matches!(self.cfg.sync_mode.as_str(), "webdav" | "webdoc");
+            let doc = self.cfg.sync_mode == "webdoc";
             let empty = if wd { self.cfg.wd_url.trim().is_empty() || self.cfg.wd_key.trim().is_empty() } else { self.cfg.sync_dir.trim().is_empty() };
             if empty {
                 // 설정이 없으면 확인할 것이 없으므로 시각만 갱신한다.
@@ -323,7 +326,7 @@ impl App {
                 let (tx, rx) = std::sync::mpsc::channel();
                 let ctx2 = ctx.clone();
                 std::thread::spawn(move || {
-                    let _ = tx.send(if wd { collect_wd(&url, &user, &pass, &key) } else { collect_sync(&dir) });
+                    let _ = tx.send(if wd { collect_wd(&url, &user, &pass, &key, doc) } else { collect_sync(&dir) });
                     ctx2.request_repaint();
                 });
                 self.storage.sync_rx = Some((rx, Instant::now()));

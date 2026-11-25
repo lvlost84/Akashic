@@ -240,6 +240,14 @@ impl Db {
     }
 
     /// 스키마를 최신으로 맞춘다. DB를 통째로 바꿔 넣은 뒤(불러오기)에도 불러야 한다.
+    /// 여러 문장을 한 번에 실행한다. 중간에 실패하면 열려 있는 트랜잭션을 되돌려 이후 쓰기가 미커밋 상태에 갇히지 않게 한다.
+    fn run_tx(&self, sql: &str) -> Res<()> {
+        self.conn.execute_batch(sql).map_err(|x| {
+            let _ = self.conn.execute_batch("ROLLBACK");
+            e(x)
+        })
+    }
+
     pub fn migrate(&self) -> Res<()> {
         self.conn
             .execute_batch("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);")
@@ -255,33 +263,27 @@ impl Db {
             return Err(format!("더 새로운 버전의 DB입니다(스키마 {ver}). 이 프로그램을 업데이트하세요."));
         }
         if ver < 1 {
-            self.conn
-                .execute_batch(SCHEMA_V1)
-                .map_err(e)?;
+            self.run_tx(SCHEMA_V1)?;
         }
         if ver < 2 {
             // v2: 직접 정렬용 docs.pos. 처음 순서는 최근 수정순 순위.
-            self.conn
-                .execute_batch(&format!(
+            self.run_tx(&format!(
                     "BEGIN;
 ALTER TABLE docs ADD COLUMN pos INTEGER;
 UPDATE docs SET pos=r.rn FROM (SELECT id, (ROW_NUMBER() OVER (ORDER BY updated DESC, id DESC)-1)*{POS_GAP} AS rn FROM docs) AS r WHERE r.id=docs.id;
 CREATE INDEX docs_pos ON docs(pos);
 INSERT OR REPLACE INTO meta(key,value) VALUES('schema','2');
 COMMIT;"
-                ))
-                .map_err(e)?;
+            ))?;
         }
         if ver < 3 {
             // v3: 이미지(WebP로 줄인 그림). 본문의 `img:해시`가 가리킨다.
-            self.conn
-                .execute_batch(
+            self.run_tx(
                     "BEGIN;
 CREATE TABLE IF NOT EXISTS images(hash TEXT PRIMARY KEY, webp BLOB NOT NULL, w INTEGER NOT NULL, h INTEGER NOT NULL, created INTEGER NOT NULL);
 INSERT OR REPLACE INTO meta(key,value) VALUES('schema','3');
 COMMIT;",
-                )
-                .map_err(e)?;
+            )?;
         }
         if (1..4).contains(&ver) {
             // 되돌릴 수 없는 승급(옛 버전은 새 스키마를 열지 못함) 직전에 자동 백업. 실패하면 승급하지 않는다.
@@ -315,7 +317,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS {t}_uid ON {t}(uid);
 INSERT OR REPLACE INTO meta(key,value) VALUES('schema','4');
 COMMIT;",
             );
-            self.conn.execute_batch(&sql).map_err(e)?;
+            self.run_tx(&sql)?;
         }
         // 첨부 파일: 스키마 번호를 올리지 않고 표만 더한다(옛 버전은 이 표를 모른 채 그대로 열 수 있다).
         self.conn

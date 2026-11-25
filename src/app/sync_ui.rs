@@ -397,12 +397,12 @@ impl App {
         self.graph_stale = true;
         self.fs_invalidate(true); // 상태바의 DB 크기·저장본 정보를 다시 읽는다
         // 현재 문서를 다시 연다(없어졌으면 비움)
-        if let Some(id) = self.cur {
+        // cur를 먼저 비워야 open_doc의 flush가 화면에 남은 옛 본문을 새 DB에 되써 넣지 않는다.
+        if let Some(id) = self.cur.take() {
             self.last_edit = None;
             if matches!(self.db.get_doc(id), Ok(Some(_))) {
                 self.open_doc(id, false);
             } else {
-                self.cur = None;
                 self.cur_trashed = false;
                 self.title.clear();
                 self.body.clear();

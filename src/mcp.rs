@@ -458,14 +458,9 @@ pub fn start_http(port: u16, token: String, db_path: PathBuf, write: Arc<AtomicB
     listener.set_nonblocking(true).map_err(|e| e.to_string())?;
     let stop = Arc::new(AtomicBool::new(false));
     let st = stop.clone();
+    // 저장소를 못 열면 서버가 켜진 것처럼 보이지 않도록 스레드를 띄우기 전에 열어 오류를 돌려준다.
+    let db = Db::open(&db_path).map_err(|x| format!("MCP 저장소를 열 수 없습니다: {x}"))?;
     let thread = std::thread::spawn(move || {
-        let db = match Db::open(&db_path) {
-            Ok(d) => d,
-            Err(x) => {
-                crate::diag::log(&format!("MCP(HTTP): 저장소를 열 수 없음: {x}"));
-                return;
-            }
-        };
         let mut srv = Server::new(db, Box::new(move || write.load(Ordering::Relaxed)));
         while !st.load(Ordering::Relaxed) {
             match listener.accept() {

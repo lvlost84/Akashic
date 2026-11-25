@@ -3,9 +3,9 @@ use super::*;
 use sha2::{Digest, Sha256};
 
 /// 바로 열면 실행·설치될 수 있는 형식. 열지 않고 탐색기에서 위치만 보여 준다.
-const RISKY: [&str; 31] = [
+const RISKY: &[&str] = &[
     "exe", "com", "bat", "cmd", "scr", "msi", "msp", "ps1", "psm1", "vbs", "vbe", "js", "jse", "wsf", "wsh", "hta", "lnk", "reg", "dll", "jar", "cpl", "pif", "gadget", "inf", "sys", "application", "appx",
-    "msix", "url", "scf", "mht",
+    "msix", "url", "scf", "mht", "py", "pyw", "rdp", "msc", "chm", "jnlp", "sct", "wsc", "ps1xml", "psc1", "xll", "vb", "mhtml",
 ];
 
 pub fn is_risky(name: &str) -> bool {

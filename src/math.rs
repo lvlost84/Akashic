@@ -208,9 +208,14 @@ pub fn parse(src: &str) -> Option<Node> {
 
 /// 빈 줄도 허용하는 한 줄 파싱(`\\`·`&`로 쪼갠 조각용).
 fn parse_row(src: &str) -> Option<Node> {
+    parse_row_at(src, 0)
+}
+
+/// `depth`부터 시작하는 파싱(n제곱근 차수처럼 안쪽에서 다시 읽을 때 깊이를 이어 가려고).
+fn parse_row_at(src: &str, depth: usize) -> Option<Node> {
     let chars: Vec<char> = src.chars().collect();
     let mut p = P { c: &chars, i: 0 };
-    let row = p.row(0)?;
+    let row = p.row(depth)?;
     if p.i != chars.len() {
         return None;
     }
@@ -394,6 +399,10 @@ impl P<'_> {
     }
     /// 인자 하나: `{...}` 묶음이거나 낱글자/명령 하나.
     fn arg(&mut self, depth: usize) -> Option<Node> {
+        // `\hat\hat\hat…`처럼 중괄호 없이 명령이 이어지면 row()를 거치지 않으므로 여기서도 깊이를 막는다(스택 오버플로 방지).
+        if depth > MAX_DEPTH {
+            return None;
+        }
         self.skip_ws();
         match self.peek()? {
             '{' => {
@@ -535,7 +544,10 @@ impl P<'_> {
                     }
                     let src: String = self.c[start..self.i].iter().collect();
                     self.i += 1;
-                    let index = parse(&src)?;
+                    let index = match parse_row_at(&src, depth + 1)? {
+                        Node::Row(r) if r.is_empty() => return None,
+                        n => n,
+                    };
                     return Some(Node::Root(Box::new(index), Box::new(self.arg(depth + 1)?)));
                 }
                 Some(Node::Sqrt(Box::new(self.arg(depth + 1)?)))
@@ -1723,5 +1735,15 @@ mod tests {
         let a = height_em(&n);
         let b = layout(&n, &mut |_, _| 3.0);
         assert!((a - (b.asc + b.desc)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn deep_command_chains_do_not_overflow_stack() {
+        // 중괄호 없이 이어지는 명령·중첩 n제곱근도 깊이 제한에 걸려 None이 된다(스택 오버플로로 앱이 죽지 않는다).
+        assert!(parse(&"\\hat".repeat(5000)).is_none());
+        assert!(parse(&"\\frac".repeat(5000)).is_none());
+        let nested = "\\sqrt[".repeat(3000) + "x" + &"]{y}".repeat(3000);
+        assert!(parse(&nested).is_none());
+        assert!(parse(r"\sqrt[3]{x}").is_some());
     }
 }

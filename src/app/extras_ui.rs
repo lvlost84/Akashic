@@ -49,9 +49,11 @@ impl App {
 
     pub(super) fn new_from_template(&mut self, i: usize) {
         let Some((name, body)) = self.cfg.templates.get(i).cloned() else { return };
-        let title = if name == TODAY_TPL { chrono::Local::now().format("%Y-%m-%d").to_string() } else { String::new() };
-        let body = Self::fill_vars(&body, &title);
-        self.create_filled(&title, &body);
+        if name == TODAY_TPL {
+            return self.today_note(); // 같은 날 노트가 이미 있으면 새로 만들지 않고 연다
+        }
+        let body = Self::fill_vars(&body, "");
+        self.create_filled("", &body);
     }
 
     /// 지금 열린 문서를 템플릿으로 저장한다(이름은 문서 제목, 같은 이름이면 덮어씀).

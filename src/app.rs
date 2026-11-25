@@ -309,6 +309,11 @@ impl Config {
                     match crate::secret::unprotect(v) {
                         Some(p) => *v = p,
                         None => {
+                            // 이 PC에서 풀 수 없는 값을 비운 채 저장하면 원래 암호문이 영영 사라지므로, 덮어쓰기 전에 원본을 한 번 보관한다.
+                            let keep = path.with_extension("unreadable.json");
+                            if !keep.exists() {
+                                let _ = std::fs::copy(&path, &keep);
+                            }
                             v.clear();
                             SECRET_UNREADABLE.store(true, std::sync::atomic::Ordering::Relaxed);
                         }
@@ -583,6 +588,8 @@ pub struct App {
     stats: status_ui::DocStats,
     storage: status_ui::StorageInfo,
     last_saved_ts: i64,
+    /// 저장하지 못한 채 닫기를 한 번 막았는지(두 번째 닫기는 그대로 닫는다)
+    close_warned: bool,
     /// 마지막으로 쓰기 로그를 본 파일에 병합한 시각
     last_merge: Instant,
     /// 마지막 병합 시각(표시용, epoch 초)
@@ -758,6 +765,7 @@ impl App {
             stats: status_ui::DocStats::unset(),
             storage: Default::default(),
             last_saved_ts: 0,
+            close_warned: false,
             last_merge: Instant::now(),
             last_merge_ts: 0,
             pos_cache: (usize::MAX, 0, 1, 1),
@@ -3404,7 +3412,13 @@ impl eframe::App for App {
         self.merge_tick(&ctx);
         // 닫을 때 저장
         if ctx.input(|i| i.viewport().close_requested()) {
-            self.flush();
+            // 저장에 실패했으면 한 번은 닫기를 막아 편집 내용을 지키고, 다시 닫으면 그대로 닫는다(저장이 계속 안 돼도 갇히지 않도록).
+            if !self.flush() && !self.close_warned {
+                self.close_warned = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.say("저장하지 못해 닫지 않았습니다. 다시 닫으면 편집 내용이 사라집니다");
+                return;
+            }
             if let Some(c) = self.cur {
                 let _ = self.db.delete_empty(c);
             }

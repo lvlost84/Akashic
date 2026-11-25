@@ -97,7 +97,8 @@ pub fn split_front_matter(text: &str) -> (Meta, &str) {
 /// Notion이 이름 끝에 붙이는 32자리 id(` 0123…`)를 뗀다.
 pub fn clean_name(s: &str) -> String {
     let t = s.trim_end();
-    if t.len() > 33 {
+    // 한글 등 여러 바이트 글자의 한가운데를 자르면 패닉하므로 글자 경계일 때만 본다.
+    if t.len() > 33 && t.is_char_boundary(t.len() - 32) {
         let (head, id) = t.split_at(t.len() - 32);
         if head.ends_with(' ') && id.chars().all(|c| c.is_ascii_hexdigit()) {
             return head.trim_end().to_string();
@@ -270,6 +271,8 @@ mod tests {
     fn notion_ids_are_stripped() {
         assert_eq!(clean_name("회의록 0123456789abcdef0123456789abcdef"), "회의록");
         assert_eq!(clean_name("그냥 이름"), "그냥 이름");
+        // 33바이트를 넘는 한글 이름: 끝에서 32바이트 지점이 글자 중간이어도 패닉하지 않는다
+        assert_eq!(clean_name("회의록 자료 정리 최종본 파일 이름"), "회의록 자료 정리 최종본 파일 이름");
         assert_eq!(clean_name("0123456789abcdef0123456789abcdef"), "0123456789abcdef0123456789abcdef");
     }
 
