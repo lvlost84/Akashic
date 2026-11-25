@@ -24,6 +24,8 @@ pub struct Item {
 
 #[derive(Default)]
 pub struct Scan {
+    /// 가져오려고 고른 폴더. 이 밖의 그림 파일은 읽지 않는다.
+    pub root: PathBuf,
     pub items: Vec<Item>,
     /// 이름(소문자) → 그림 파일(Obsidian의 ![[그림.png]]를 찾는 데 씀)
     pub images: HashMap<String, PathBuf>,
@@ -117,7 +119,7 @@ pub fn is_image(p: &Path) -> bool {
 
 /// 폴더를 훑는다. `decode`는 파일 바이트를 글로 바꾼다(CP949 처리 등). 점(.)으로 시작하는 폴더(.obsidian 등)는 건너뛴다.
 pub fn scan(root: &Path, decode: &dyn Fn(&[u8]) -> String) -> Scan {
-    let mut out = Scan::default();
+    let mut out = Scan { root: root.to_path_buf(), ..Scan::default() };
     walk(root, &mut vec![], &mut out, decode, 0);
     out.items.sort_by(|a, b| (&a.dirs, &a.title).cmp(&(&b.dirs, &b.title)));
     out
@@ -166,6 +168,14 @@ fn walk(dir: &Path, dirs: &mut Vec<String>, out: &mut Scan, decode: &dyn Fn(&[u8
     }
 }
 
+/// 파일이 가져오는 폴더 안에 있는가. 절대 경로나 `../`로 폴더 밖의 그림을 읽어 오지 못하게 한다(링크 따라가기도 풀어서 비교).
+fn inside_root(path: &Path, root: &Path) -> bool {
+    match (path.canonicalize(), root.canonicalize()) {
+        (Ok(p), Ok(r)) => p.starts_with(r),
+        _ => false,
+    }
+}
+
 fn pct_decode(s: &str) -> String {
     let b = s.as_bytes();
     let mut o = Vec::with_capacity(b.len());
@@ -209,6 +219,7 @@ fn image_line(line: &str) -> Option<(String, String, bool)> {
 /// 파일 경로는 문서 폴더 기준 → 없으면 위키형은 `images`에서 이름으로 찾는다. 바꾸지 못한 줄은 그대로 둔다.
 pub fn rewrite_image_lines(
     body: &str,
+    root: &Path,
     src_dir: &Path,
     images: &HashMap<String, PathBuf>,
     resolve: &mut dyn FnMut(&str, &Path) -> Option<(String, u32, u32)>,
@@ -229,7 +240,7 @@ pub fn rewrite_image_lines(
                         path = p.clone();
                     }
                 }
-                if path.is_file() && is_image(&path) {
+                if path.is_file() && is_image(&path) && inside_root(&path, root) {
                     if let Some((hash, w, h)) = resolve(&alt, &path) {
                         new = Some(format!("![{}](img:{hash} {w}x{h})", alt.replace(['[', ']'], "")));
                     }
@@ -286,7 +297,7 @@ mod tests {
         imgs.insert("w.png".to_string(), dir.join("sub").join("w.png"));
         let body = "a\n![사진](my%20pic.png)\n![[w.png]]\n![웹](https://x/y.png)\n![없음](no.png)\n글 ![인라인](my%20pic.png) 중간\n";
         let mut n = 0;
-        let out = rewrite_image_lines(body, &dir, &imgs, &mut |_, _| {
+        let out = rewrite_image_lines(body, &dir, &dir, &imgs, &mut |_, _| {
             n += 1;
             Some((format!("{:016x}", n), 10, 20))
         });
@@ -295,6 +306,25 @@ mod tests {
             "a\n![사진](img:0000000000000001 10x20)\n![w](img:0000000000000002 10x20)\n![웹](https://x/y.png)\n![없음](no.png)\n글 ![인라인](my%20pic.png) 중간\n"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn images_outside_the_import_folder_are_left_alone() {
+        let top = std::env::temp_dir().join(format!("aks-imp-out-{}", std::process::id()));
+        let root = top.join("vault");
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::write(top.join("secret.png"), b"x").unwrap();
+        std::fs::write(root.join("in.png"), b"x").unwrap();
+        let abs = top.join("secret.png").to_string_lossy().replace('\\', "/");
+        let body = format!("![밖](../../secret.png)\n![절대]({abs})\n![안](../in.png)\n");
+        let mut n = 0;
+        let out = rewrite_image_lines(&body, &root, &root.join("a"), &HashMap::new(), &mut |_, _| {
+            n += 1;
+            Some((format!("{:016x}", n), 1, 1))
+        });
+        assert_eq!(out, format!("![밖](../../secret.png)\n![절대]({abs})\n![안](img:0000000000000001 1x1)\n"));
+        assert_eq!(n, 1);
+        let _ = std::fs::remove_dir_all(&top);
     }
 
     #[test]

@@ -49,7 +49,7 @@ impl App {
             }
             let body = if it.body.contains("![") {
                 let db = &self.db;
-                crate::import::rewrite_image_lines(&it.body, &it.src_dir, &sc.images, &mut |alt, path| {
+                crate::import::rewrite_image_lines(&it.body, &sc.root, &it.src_dir, &sc.images, &mut |alt, path| {
                     let r = img_cache
                         .entry(path.to_path_buf())
                         .or_insert_with(|| {
