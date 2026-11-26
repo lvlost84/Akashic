@@ -1,0 +1,86 @@
+# Gitea Actions용 릴리스 워크플로(.github/workflows/release.yml의 Gitea 판).
+# Gitea는 .gitea/workflows가 있으면 그쪽만 읽는다. 버전 태그(v2.0.1 등)를 올리면 빌드해서 Gitea 릴리스에 Akashic.exe + SHA256SUMS 등을 올린다.
+#
+# 실행 환경: Windows PC에 act_runner를 설치하고 라벨 `windows`로 등록한 "호스트 모드" 러너.
+#   그 PC에 Rust(MSVC 툴체인)·Visual Studio Build Tools·Windows SDK(rc.exe)·Git이 있어야 한다. 설정 방법은 docs/gitea-actions-설정.md.
+# GitHub 판과 다른 점: windows-latest → windows 라벨, gh 명령 → Gitea API(curl.exe/Invoke-RestMethod), rust-cache → 고정 target 폴더.
+name: release
+on:
+  push:
+    branches: [main]
+    # 문서(.md)만 바뀐 푸시는 빌드하지 않는다. 태그 푸시에는 경로 조건이 적용되지 않아 릴리스는 항상 돈다.
+    paths-ignore: ["**.md"]
+    tags: ["v*"]
+jobs:
+  build:
+    runs-on: windows
+    defaults:
+      run:
+        shell: powershell   # Windows 기본 PowerShell 5.1(러너 PC에 pwsh가 없어도 되도록)
+    env:
+      # 실행마다 작업 폴더가 새로 만들어지므로, 라이브러리 빌드 결과를 PC에 남겨 두어 다음 빌드를 빠르게 한다.
+      CARGO_TARGET_DIR: C:\act-cache\akashic-target
+    steps:
+      - uses: actions/checkout@v4
+      - name: 태그와 Cargo.toml 버전이 같은지 확인
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          $tag = "${{ github.ref_name }}".TrimStart('v')
+          $ver = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          if ($tag -ne $ver) { throw "태그($tag)와 Cargo.toml 버전($ver)이 다릅니다" }
+      - name: 시험
+        run: cargo test --release
+      - name: 빌드
+        env:
+          AKASHIC_REPO: ${{ github.repository }}
+        run: cargo build --release
+      - name: 올릴 파일 만들기
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "$env:CARGO_TARGET_DIR\release\akashic.exe" dist/Akashic.exe
+          $h = (Get-FileHash dist/Akashic.exe -Algorithm SHA256).Hash.ToLower()
+          [IO.File]::WriteAllText("$PWD\dist\SHA256SUMS", "$h  Akashic.exe", (New-Object Text.UTF8Encoding($false)))
+          if (Test-Path THIRD-PARTY-LICENSES.md) { Copy-Item THIRD-PARTY-LICENSES.md dist/THIRD-PARTY-LICENSES.md }
+      - name: MCP 번들(.mcpb) 준비
+        # 번들 버전은 mcpb/version.txt다. 같은 버전의 번들이 이미 올라간 릴리스가 있으면 그 파일을 그대로 내려받아 첨부하고,
+        # 없을 때만(MCP 도구가 바뀌어 버전을 올렸을 때) 방금 빌드한 exe로 새로 만든다. 실패해도 exe 릴리스는 계속 만든다.
+        if: startsWith(github.ref, 'refs/tags/v')
+        continue-on-error: true
+        env:
+          TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
+          API: ${{ github.server_url }}/api/v1/repos/${{ github.repository }}
+        run: |
+          $ver = (Get-Content mcpb/version.txt -Raw).Trim()
+          $name = "akashic-$ver.mcpb"
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $h = @{ Authorization = "token $env:TOKEN" }
+          $releases = Invoke-RestMethod -Headers $h -Uri "$env:API/releases?limit=50"
+          foreach ($r in $releases) {
+            $a = $r.assets | Where-Object { $_.name -eq $name } | Select-Object -First 1
+            if ($a) {
+              Invoke-WebRequest -Headers $h -Uri $a.browser_download_url -OutFile "dist/$name"
+              Write-Host "이전 릴리스 $($r.tag_name) 의 $name 을 그대로 첨부합니다"
+              break
+            }
+          }
+          if (-not (Test-Path "dist/$name")) {
+            ./mcpb/pack.ps1 -SkipBuild
+            Copy-Item "out/$name" "dist/$name"
+            Write-Host "$name 을 새로 만들었습니다"
+          }
+      - name: 릴리스 만들기
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
+          API: ${{ github.server_url }}/api/v1/repos/${{ github.repository }}
+        run: |
+          $h = @{ Authorization = "token $env:TOKEN" }
+          $body = @{ tag_name = "${{ github.ref_name }}"; name = "아카식 ${{ github.ref_name }}"; body = "자동 빌드한 릴리스입니다. 받은 Akashic.exe는 SHA256SUMS로 확인할 수 있습니다."; draft = $false; prerelease = $false } | ConvertTo-Json
+          $rel = Invoke-RestMethod -Method Post -Headers $h -ContentType "application/json; charset=utf-8" -Body ([Text.Encoding]::UTF8.GetBytes($body)) -Uri "$env:API/releases"
+          foreach ($f in Get-ChildItem dist -File) {
+            $n = [Uri]::EscapeDataString($f.Name)
+            curl.exe --fail -sS -H "Authorization: token $env:TOKEN" -F "attachment=@$($f.FullName)" "$env:API/releases/$($rel.id)/assets?name=$n"
+            if ($LASTEXITCODE -ne 0) { throw "$($f.Name) 업로드 실패" }
+            Write-Host "올림: $($f.Name)"
+          }
